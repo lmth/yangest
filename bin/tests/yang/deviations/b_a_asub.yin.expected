@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<submodule name="asub"
+        xmlns="urn:ietf:params:xml:ns:yang:yin:1"
+        xmlns:a=""
+        xmlns:b1="urn:b">
+  <belongs-to module="a">
+    <prefix value="a"/>
+  </belongs-to>
+  <import module="b">
+    <prefix value="b1"/>
+  </import>
+  <deviation target-node="/b1:x/b1:u">
+    <deviate value="not-supported"/>
+  </deviation>
+</submodule>
+<module name="a"
+        xmlns="urn:ietf:params:xml:ns:yang:yin:1"
+        xmlns:a="urn:a"
+        xmlns:b="urn:b">
+  <namespace uri="urn:a"/>
+  <prefix value="a"/>
+  <import module="b">
+    <prefix value="b"/>
+  </import>
+  <include module="asub"/>
+  <container name="x"/>
+  <augment target-node="/x">
+    <list name="bar">
+      <key value="foo"/>
+      <leaf name="foo">
+        <type name="int32"/>
+      </leaf>
+      <leaf name="bar">
+        <type name="int32"/>
+        <mandatory value="true"/>
+      </leaf>
+      <leaf name="baz">
+        <type name="string"/>
+      </leaf>
+    </list>
+  </augment>
+  <deviation target-node="/b:x">
+    <deviate value="replace">
+      <config value="false"/>
+    </deviate>
+  </deviation>
+  <deviation target-node="/b:x/b:r">
+    <deviate value="replace">
+      <mandatory value="false"/>
+      <type name="uint32">
+        <range value="0..1"/>
+      </type>
+    </deviate>
+  </deviation>
+  <deviation target-node="/x">
+    <deviate value="replace">
+      <config value="false"/>
+    </deviate>
+  </deviation>
+  <deviation target-node="/x/bar/baz">
+    <deviate value="not-supported"/>
+  </deviation>
+</module>
+<module name="b"
+        xmlns="urn:ietf:params:xml:ns:yang:yin:1"
+        xmlns:b="urn:b">
+  <namespace uri="urn:b"/>
+  <prefix value="b"/>
+  <container name="x">
+    <leaf name="r">
+      <type name="string"/>
+      <mandatory value="true"/>
+    </leaf>
+    <leaf name="u">
+      <type name="string"/>
+    </leaf>
+  </container>
+</module>

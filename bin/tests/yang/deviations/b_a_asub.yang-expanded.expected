@@ -1,0 +1,47 @@
+module asub {
+  belongs-to a {
+    prefix a;
+  }
+
+  import b {
+    prefix b1;
+  }
+}
+
+module a {
+  namespace "urn:a";
+  prefix a;
+
+  import b {
+    prefix b;
+  }
+  include asub;
+
+  container x {
+    config false;
+    list bar {
+      key "foo";
+      leaf foo {
+        type int32;
+      }
+      leaf bar {
+        type int32;
+        mandatory true;
+      }
+    }
+  }
+}
+
+module b {
+  namespace "urn:b";
+  prefix b;
+
+  container x {
+    config false;
+    leaf r {
+      type uint32 {
+        range "0..1";
+      }
+    }
+  }
+}

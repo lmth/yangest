@@ -540,7 +540,7 @@ fn snapshot_any_must_tree() {
     snapshot("any_must", &["-f", "tree", "any.yang"], "any.tree.expected");
 }
 
-// ── yang-format snapshots — raw AST baseline before plugin rearchitecting ──
+// ── yang-format snapshots ─────────────────────────────────────────────────
 
 #[test]
 fn snapshot_groupings_a_yang() {
@@ -555,6 +555,56 @@ fn snapshot_refine_yang() {
 #[test]
 fn snapshot_deviations_b_yang() {
     snapshot("deviations", &["-f", "yang", "b.yang"], "b.yang.expected");
+}
+
+/// Multi-module yang: submodule + two primary modules in one invocation.
+#[test]
+fn snapshot_deviations_b_a_asub_yang() {
+    snapshot(
+        "deviations",
+        &["-f", "yang", "b.yang", "a.yang", "asub.yang"],
+        "b_a_asub.yang.expected",
+    );
+}
+
+// ── yang-expanded snapshots ───────────────────────────────────────────────
+
+/// Single module: groupings fully inlined, deviations applied.
+#[test]
+fn snapshot_groupings_a_yang_expanded() {
+    snapshot(
+        "groupings",
+        &["-f", "yang-expanded", "a.yang"],
+        "a.yang-expanded.expected",
+    );
+}
+
+/// Multi-module yang-expanded: deviations applied across all three modules.
+#[test]
+fn snapshot_deviations_b_a_asub_yang_expanded() {
+    snapshot(
+        "deviations",
+        &["-f", "yang-expanded", "b.yang", "a.yang", "asub.yang"],
+        "b_a_asub.yang-expanded.expected",
+    );
+}
+
+// ── yin snapshots ─────────────────────────────────────────────────────────
+
+/// Single module emitted as YIN XML.
+#[test]
+fn snapshot_groupings_a_yin() {
+    snapshot("groupings", &["-f", "yin", "a.yang"], "a.yin.expected");
+}
+
+/// Multi-module yin: three modules in one invocation produce one XML stream.
+#[test]
+fn snapshot_deviations_b_a_asub_yin() {
+    snapshot(
+        "deviations",
+        &["-f", "yin", "b.yang", "a.yang", "asub.yang"],
+        "b_a_asub.yin.expected",
+    );
 }
 
 // ── new fixtures: if-feature ──────────────────────────────────────────────

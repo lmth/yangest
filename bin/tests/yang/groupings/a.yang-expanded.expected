@@ -1,0 +1,10 @@
+module a {
+  namespace "urn:a";
+  prefix a;
+
+  container ospf {
+    leaf external-out {
+      type boolean;
+    }
+  }
+}

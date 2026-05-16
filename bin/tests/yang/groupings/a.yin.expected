@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module name="a"
+        xmlns="urn:ietf:params:xml:ns:yang:yin:1"
+        xmlns:a="urn:a">
+  <namespace uri="urn:a"/>
+  <prefix value="a"/>
+  <grouping name="EXTERNAL-OUT">
+    <leaf name="external-out">
+      <type name="boolean"/>
+    </leaf>
+  </grouping>
+  <grouping name="AREA-TABLE">
+    <grouping name="AREA-CONTENT">
+      <uses name="EXTERNAL-OUT"/>
+    </grouping>
+    <uses name="AREA-CONTENT"/>
+  </grouping>
+  <container name="ospf">
+    <uses name="AREA-TABLE"/>
+  </container>
+</module>
