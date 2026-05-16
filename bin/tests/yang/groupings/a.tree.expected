@@ -1,0 +1,3 @@
+module: a
+  +--rw ospf
+     +--rw external-out?   boolean

@@ -1,0 +1,7 @@
+
+module: simple
+  +--rw servers
+     +--rw server* [name]
+        +--rw name    int16
+        +--rw ip?     inet:ip-address
+        +--rw port?   inet:port-number

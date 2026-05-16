@@ -1,0 +1,10 @@
+[package]
+name = "yangest-plugin-yang"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Magnus Thoäng <magnusthoang@gmail.com>"]
+
+[dependencies]
+inventory = "0.3"
+yangest-core = { path = "../../core" }

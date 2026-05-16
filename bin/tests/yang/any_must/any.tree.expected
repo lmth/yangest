@@ -1,0 +1,4 @@
+module: any
+  +--rw foo?   int32
+  +--rw bar?      <anyxml>
+  +--rw baz?      <anydata>

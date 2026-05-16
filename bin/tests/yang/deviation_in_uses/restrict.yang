@@ -1,0 +1,15 @@
+module restrict {
+  namespace "urn:restrict";
+  prefix r;
+
+  import groupmod { prefix gm; }
+
+  deviation "/gm:server/gm:address/gm:protocol" {
+    deviate replace {
+      default "udp";
+    }
+  }
+  deviation "/gm:server/gm:address/gm:port" {
+    deviate not-supported;
+  }
+}

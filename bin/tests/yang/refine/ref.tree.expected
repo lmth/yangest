@@ -1,0 +1,5 @@
+module: ref
+  +--rw a!
+     +--rw b?   string
+     +--ro c?   string
+     +--rw d*   string

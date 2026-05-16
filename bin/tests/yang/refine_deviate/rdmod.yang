@@ -1,0 +1,31 @@
+module rdmod {
+  namespace "urn:rdmod";
+  prefix rd;
+
+  grouping settings-grp {
+    container settings {
+      leaf timeout {
+        type uint32;
+        default 30;
+      }
+      leaf retries {
+        type uint8;
+        mandatory true;
+      }
+      leaf mode {
+        type string;
+        default "normal";
+      }
+    }
+  }
+
+  uses settings-grp {
+    refine "settings/timeout" {
+      default 60;
+    }
+    refine "settings/retries" {
+      mandatory false;
+      default 3;
+    }
+  }
+}

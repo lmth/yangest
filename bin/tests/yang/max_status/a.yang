@@ -1,0 +1,28 @@
+module a {
+  namespace "urn:a";
+  prefix a;
+
+  identity foo {
+    status deprecated;
+    description "deprecated identity";
+  }
+  identity bar {
+    status obsolete;
+    description "obsolete identity";
+  }
+
+  leaf foo {
+    status deprecated;
+    type string;
+    description "deprecated leaf";
+  }
+  leaf bar {
+    status obsolete;
+    type string;
+    description "obsolete leaf";
+  }
+  leaf baz {
+    type string;
+    description "current leaf";
+  }
+}

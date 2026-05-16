@@ -1,0 +1,38 @@
+module base {
+  namespace "urn:base";
+  prefix base;
+
+  feature advanced;
+  feature experimental;
+  feature combo {
+    if-feature "advanced";
+  }
+
+  container config {
+    leaf basic-setting {
+      type string;
+    }
+    leaf advanced-setting {
+      if-feature "advanced";
+      type uint32;
+    }
+    container advanced-block {
+      if-feature "advanced";
+      leaf inner {
+        type string;
+      }
+    }
+    leaf experimental-leaf {
+      if-feature "experimental";
+      type boolean;
+    }
+    leaf combined {
+      if-feature "advanced and experimental";
+      type string;
+    }
+    leaf combo-leaf {
+      if-feature "combo";
+      type string;
+    }
+  }
+}

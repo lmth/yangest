@@ -1,0 +1,10 @@
+
+module: a
+  +--ro x
+     +--ro bar* [foo]
+        +--ro foo    int32
+        +--ro bar    int32
+
+module: b
+  +--ro x
+     +--ro r?   uint32

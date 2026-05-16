@@ -1,0 +1,6 @@
+
+module: groupmod
+  +--rw server
+     +--rw address
+        +--rw ip?         string
+        +--rw protocol?   string

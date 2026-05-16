@@ -1,0 +1,5 @@
+
+module: rdmod
+  +--rw settings
+     +--rw timeout?   uint32
+     +--rw retries?   uint8

@@ -1,0 +1,26 @@
+[package]
+name = "yangest"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Magnus Thoäng <magnusthoang@gmail.com>"]
+
+[[bin]]
+name = "yangest"
+path = "src/main.rs"
+
+[dependencies]
+yangest-core = { path = "../core" }
+yangest-plugin-tree = { path = "../plugins/tree" }
+yangest-plugin-depend = { path = "../plugins/depend" }
+yangest-plugin-yang = { path = "../plugins/yang" }
+yangest-plugin-yin = { path = "../plugins/yin" }
+yangest-plugin-swagger = { path = "../plugins/swagger" }
+clap = { version = "4.6.1", features = ["derive"] }
+inventory = "0.3"
+rayon = "1.12.0"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+# integration tests use the binary via CARGO_BIN_EXE_yangest

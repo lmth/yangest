@@ -1,0 +1,20 @@
+module: parent
+  +--rw parent-container
+  |  +--rw r:test-list* [test-key]
+  |     +--rw r:test-key    string
+  |     +--rw r:dummy?      uint16
+  +--rw parent-container-2
+     +--rw r:test-list* [test-key]
+        +--rw r:test-key    string
+        +--rw r:dummy?      uint16
+
+module: small6
+
+  augment /parent:parent-container:
+    +--rw test-list* [test-key]
+       +--rw test-key    string
+       +--rw dummy?      uint16
+  augment /parent:parent-container-2:
+    +--rw test-list* [test-key]
+       +--rw test-key    string
+       +--rw dummy?      uint16

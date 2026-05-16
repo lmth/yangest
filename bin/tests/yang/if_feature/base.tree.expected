@@ -1,0 +1,9 @@
+module: base
+  +--rw config
+     +--rw basic-setting?       string
+     +--rw advanced-setting?    uint32
+     +--rw advanced-block
+     |  +--rw inner?   string
+     +--rw experimental-leaf?   boolean
+     +--rw combined?            string
+     +--rw combo-leaf?          string

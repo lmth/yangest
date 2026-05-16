@@ -1,0 +1,15 @@
+module override {
+  namespace "urn:override";
+  prefix ov;
+
+  import rdmod { prefix rd; }
+
+  deviation "/rd:settings/rd:timeout" {
+    deviate replace {
+      default 120;
+    }
+  }
+  deviation "/rd:settings/rd:mode" {
+    deviate not-supported;
+  }
+}

@@ -1,0 +1,23 @@
+module groupmod {
+  namespace "urn:groupmod";
+  prefix gm;
+
+  grouping address-grp {
+    container address {
+      leaf ip {
+        type string;
+      }
+      leaf port {
+        type uint16;
+      }
+      leaf protocol {
+        type string;
+        default "tcp";
+      }
+    }
+  }
+
+  container server {
+    uses address-grp;
+  }
+}

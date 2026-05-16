@@ -1,0 +1,19 @@
+yangest
+Copyright 2026 Magnus Thoäng
+
+This product was developed independently and does not contain any source
+code derived from yanger (https://github.com/mbj4668/yanger).
+
+yangest is designed to be a compatible companion to yanger — it accepts the
+same YANG input, supports the same output formats, and uses the same extension
+and deviation mechanisms — but is a from-scratch Rust implementation.
+
+Acknowledgement
+---------------
+yanger is an extensible YANG validator written by Martin Björklund at
+Tail-f Systems AB. It is the reference implementation against which
+yangest's output is verified. yanger is copyright Tail-f Systems AB
+and is licensed under the Apache License, Version 2.0.
+
+    https://github.com/mbj4668/yanger
+    https://www.apache.org/licenses/LICENSE-2.0

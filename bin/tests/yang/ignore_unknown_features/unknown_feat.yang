@@ -1,0 +1,17 @@
+module unknown-feat {
+  yang-version 1.1;
+  namespace "urn:unknown-feat";
+  prefix uf;
+
+  feature local-feat;
+
+  container with-local {
+    if-feature local-feat;
+    leaf x { type string; }
+  }
+
+  container with-local-prefixed {
+    if-feature uf:local-feat;
+    leaf y { type string; }
+  }
+}

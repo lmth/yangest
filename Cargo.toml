@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "core",
+    "plugins/tree",
+    "plugins/depend",
+    "plugins/yang",
+    "plugins/yin",
+    "plugins/swagger",
+    "bin",
+]
+resolver = "2"

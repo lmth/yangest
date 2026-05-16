@@ -1,0 +1,5 @@
+
+module: list
+  +--rw foo* [bar baz]
+     +--rw bar       string
+     +--rw foobar?   string

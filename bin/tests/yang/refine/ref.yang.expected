@@ -1,0 +1,47 @@
+module ref {
+  namespace "urn:ref";
+  prefix r;
+
+  extension foo;
+
+  grouping g {
+    container a {
+      leaf b {
+        type string;
+        default "hej";
+        must '../c';
+      }
+      leaf c {
+        type string;
+        mandatory true;
+        reference "orig";
+      }
+      leaf-list d {
+        type string;
+        max-elements 4;
+      }
+    }
+  }
+
+  uses g {
+    refine "a" {
+      presence "x";
+    }
+    refine "a/b" {
+      default "hopp";
+      must '../d';
+      r:foo;
+    }
+    refine "a/c" {
+      mandatory false;
+      config false;
+      reference "hoppa";
+    }
+    refine "a/d" {
+      min-elements 2;
+      max-elements 10;
+      description
+        "hej";
+    }
+  }
+}

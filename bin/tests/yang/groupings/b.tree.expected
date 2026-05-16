@@ -1,0 +1,5 @@
+module: b
+  +--rw q
+     +--rw xx
+        +--rw uu
+        +--rw vv
