@@ -11,7 +11,7 @@ use yangest_core::compiler::{
     AugmentEntry, CompiledModule, ExpansionCtx, ModuleRegistry, PathStep, SchemaNode,
     SchemaNodeKind, Status, expand_children,
 };
-use yangest_core::plugin::Plugin;
+use yangest_core::plugin::{EmitState, Plugin};
 
 // ── Public plugin struct ──────────────────────────────────────────────────────
 
@@ -63,6 +63,7 @@ impl Plugin for TreePlugin {
         module: &Arc<CompiledModule>,
         registry: &ModuleRegistry,
         ctx: &ExpansionCtx<'_>,
+        _state: &mut EmitState,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
         let all_top = module.children(ctx);

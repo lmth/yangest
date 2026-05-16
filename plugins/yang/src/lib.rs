@@ -19,7 +19,7 @@ use std::sync::Arc;
 use yangest_core::ast::{BuiltInKeyword, Keyword, Stmt};
 use yangest_core::compiler::{CompiledModule, ExpansionCtx, ModuleRegistry};
 
-use yangest_core::plugin::Plugin;
+use yangest_core::plugin::{EmitState, Plugin};
 
 pub struct YangPlugin;
 
@@ -33,6 +33,7 @@ impl Plugin for YangPlugin {
         module: &Arc<CompiledModule>,
         _registry: &ModuleRegistry,
         _ctx: &ExpansionCtx<'_>,
+        _state: &mut EmitState,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
         print_stmt(&module.stmt, 0, None, out)

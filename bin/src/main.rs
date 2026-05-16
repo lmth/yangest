@@ -90,6 +90,12 @@ struct Cli {
     #[arg(long, value_name = "INPAT=>OUTPAT", conflicts_with_all = ["output_file", "output_dir"])]
     outputs: Option<String>,
 
+    /// Maximum number of modules to emit in parallel when writing per-module
+    /// output files (--output-dir or --outputs).  Defaults to the number of
+    /// logical CPUs.  Set to 1 to disable parallel emission.
+    #[arg(short = 'j', long, value_name = "N")]
+    jobs: Option<usize>,
+
     #[arg(value_name = "FILE", required_unless_present = "bundle")]
     inputs: Vec<PathBuf>,
 }
@@ -405,7 +411,12 @@ fn main() {
             }
         },
     };
-    let expansion_ctx = {
+
+    // Build a fresh ExpansionCtx for one emission task.
+    // Each parallel worker gets its own instance because ExpansionCtx holds a
+    // per-call RefCell cache that is !Sync.  Construction is cheap: the ctx
+    // only borrows the shared read-only registry and feature sets.
+    let make_ctx = || {
         let mut ctx = ExpansionCtx::new(&reg, &enabled_features);
         if let Some(ms) = max_status {
             ctx = ctx.with_max_status(ms);
@@ -422,7 +433,23 @@ fn main() {
         .filter_map(|k| reg.modules.get(k).cloned())
         .collect();
 
+    // Build a rayon thread pool sized to --jobs (default: logical CPUs).
+    let n_jobs = cli.jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_jobs)
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("yangest: failed to build thread pool: {e}");
+            std::process::exit(1);
+        });
+
     if let Some((in_pat, out_pat)) = output_pattern {
+        // Pre-create all output directories before going parallel to avoid
+        // races on create_dir_all for modules sharing a parent directory.
         for module in &display_modules {
             let basename = module
                 .source_path
@@ -440,18 +467,31 @@ fn main() {
                     }
                 }
             }
-            let file = match std::fs::File::create(&out_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("yangest: cannot write '{}': {}", out_path.display(), e);
-                    std::process::exit(1);
-                }
-            };
-            let mut writer = BufWriter::new(file);
-            if let Err(e) = plugin.emit(&[module.clone()], &reg, &expansion_ctx, &mut writer) {
-                eprintln!("yangest: emit error for '{}': {}", module.key.name, e);
-            }
         }
+        pool.install(|| {
+            display_modules.par_iter().for_each(|module| {
+                let basename = module
+                    .source_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("{}.yang", module.key.name));
+                let out_path = apply_output_pattern(&basename, &in_pat, &out_pat)
+                    .unwrap_or_else(|| PathBuf::from(format!("{}.{}", module.key.name, plugin.extension())));
+                let file = match std::fs::File::create(&out_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("yangest: cannot write '{}': {}", out_path.display(), e);
+                        return;
+                    }
+                };
+                let mut writer = BufWriter::new(file);
+                let ctx = make_ctx();
+                if let Err(e) = plugin.emit(&[module.clone()], &reg, &ctx, &mut writer) {
+                    eprintln!("yangest: emit error for '{}': {}", module.key.name, e);
+                }
+            });
+        });
     } else if let Some(ref outfile) = cli.output_file {
         let file = match std::fs::File::create(outfile) {
             Ok(f) => f,
@@ -461,7 +501,7 @@ fn main() {
             }
         };
         let mut writer = BufWriter::new(file);
-        if let Err(e) = plugin.emit(&display_modules, &reg, &expansion_ctx, &mut writer) {
+        if let Err(e) = plugin.emit(&display_modules, &reg, &make_ctx(), &mut writer) {
             eprintln!("yangest: emit error: {}", e);
         }
     } else if let Some(ref dir) = cli.output_dir {
@@ -474,24 +514,27 @@ fn main() {
             std::process::exit(1);
         }
         let ext = plugin.extension();
-        for module in &display_modules {
-            let filename = format!("{}.{}", module.key.name, ext);
-            let file = match std::fs::File::create(dir.join(&filename)) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("yangest: cannot write '{}': {}", filename, e);
-                    std::process::exit(1);
+        pool.install(|| {
+            display_modules.par_iter().for_each(|module| {
+                let filename = format!("{}.{}", module.key.name, ext);
+                let file = match std::fs::File::create(dir.join(&filename)) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("yangest: cannot write '{}': {}", filename, e);
+                        return;
+                    }
+                };
+                let mut writer = BufWriter::new(file);
+                let ctx = make_ctx();
+                if let Err(e) = plugin.emit(&[module.clone()], &reg, &ctx, &mut writer) {
+                    eprintln!("yangest: emit error for '{}': {}", module.key.name, e);
                 }
-            };
-            let mut writer = BufWriter::new(file);
-            if let Err(e) = plugin.emit(&[module.clone()], &reg, &expansion_ctx, &mut writer) {
-                eprintln!("yangest: emit error for '{}': {}", module.key.name, e);
-            }
-        }
+            });
+        });
     } else {
         let stdout = io::stdout();
         let mut out = BufWriter::new(stdout.lock());
-        if let Err(e) = plugin.emit(&display_modules, &reg, &expansion_ctx, &mut out) {
+        if let Err(e) = plugin.emit(&display_modules, &reg, &make_ctx(), &mut out) {
             eprintln!("yangest: emit error: {}", e);
         }
     }

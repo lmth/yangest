@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use clap::{Arg, ArgMatches};
 use yangest_core::compiler::{CompiledModule, ExpansionCtx, ModuleRegistry};
-use yangest_core::plugin::Plugin;
+use yangest_core::plugin::{EmitState, Plugin};
 
 /// Options for the depend plugin (equivalent to yanger's `--depend-*` flags).
 #[derive(Debug, Clone, Default)]
@@ -179,6 +179,7 @@ impl Plugin for DependPlugin {
         module: &Arc<CompiledModule>,
         registry: &ModuleRegistry,
         _ctx: &ExpansionCtx<'_>,
+        _state: &mut EmitState,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
         let target = if let Some(t) = &self.options.target {

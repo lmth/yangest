@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Magnus Thoäng
 //! The `Plugin` trait — implemented by all output format plugins.
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -8,6 +10,53 @@ use clap::{Arg, ArgMatches};
 
 use crate::compiler::{CompiledModule, ExpansionCtx, ModuleRegistry};
 use crate::grammar::ExtensionGrammar;
+
+/// Per-primary-module mutable state storage for plugin authors.
+///
+/// The framework creates one `EmitState` per `emit_module` call and discards
+/// it afterwards, so state never leaks between modules — even in parallel
+/// emission mode where multiple `emit_module` calls run concurrently.
+///
+/// Plugin authors store their own typed state using [`get_or_insert`]:
+///
+/// ```rust,ignore
+/// #[derive(Default)]
+/// struct MyState { seen: HashSet<String> }
+///
+/// fn emit_module(&self, module, registry, ctx, state: &mut EmitState, out) {
+///     let s: &mut MyState = state.get_or_insert::<MyState>();
+///     s.seen.insert(module.key.name.clone());
+/// }
+/// ```
+///
+/// Multiple plugins coexist without collision because each type occupies its
+/// own [`TypeId`]-keyed slot.
+///
+/// [`get_or_insert`]: EmitState::get_or_insert
+pub struct EmitState {
+    map: HashMap<TypeId, Box<dyn Any + Send>>,
+}
+
+impl EmitState {
+    /// Create a new, empty state map.
+    pub fn new() -> Self {
+        EmitState { map: HashMap::new() }
+    }
+
+    /// Return a mutable reference to the plugin's state value of type `T`,
+    /// inserting `T::default()` if none has been stored yet.
+    pub fn get_or_insert<T: Any + Send + Default>(&mut self) -> &mut T {
+        self.map
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()))
+            .downcast_mut::<T>()
+            .expect("EmitState: type mismatch — should never happen")
+    }
+}
+
+impl Default for EmitState {
+    fn default() -> Self { Self::new() }
+}
 
 /// Identifies a YANG extension statement by module name and local name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,7 +231,7 @@ pub trait Plugin: Send + Sync {
     /// Emit output for all user modules in display order.
     ///
     /// The default implementation calls [`emit_module`] for each module,
-    /// separated by a blank line.
+    /// separated by a blank line, with a fresh [`EmitState`] per module.
     fn emit(
         &self,
         modules: &[Arc<CompiledModule>],
@@ -196,7 +245,7 @@ pub trait Plugin: Send + Sync {
                 writeln!(out)?;
             }
             first = false;
-            self.emit_module(module, registry, ctx, out)?;
+            self.emit_module(module, registry, ctx, &mut EmitState::new(), out)?;
         }
         Ok(())
     }
@@ -205,11 +254,16 @@ pub trait Plugin: Send + Sync {
     ///
     /// Per-module plugins override this; all-at-once plugins override
     /// [`emit`] instead and leave this as a no-op.
+    ///
+    /// `state` is a fresh [`EmitState`] created by the framework for this
+    /// module.  Use [`EmitState::get_or_insert`] to store typed mutable state
+    /// without needing `&mut self` or interior mutability on the plugin struct.
     fn emit_module(
         &self,
         _module: &Arc<CompiledModule>,
         _registry: &ModuleRegistry,
         _ctx: &ExpansionCtx<'_>,
+        _state: &mut EmitState,
         _out: &mut dyn Write,
     ) -> std::io::Result<()> {
         Ok(())
