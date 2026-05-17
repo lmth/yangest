@@ -3,8 +3,8 @@
 //! AST-level annotation index.
 //!
 //! Scans annotation modules for plugin-declared *module-selector* extensions
-//! (e.g. `tailf:annotate-module`) and their nested *statement-selector*
-//! extensions (e.g. `tailf:annotate-statement`), then builds a per-module
+//! (e.g. `acme:annotate-module`) and their nested *statement-selector*
+//! extensions (e.g. `acme:annotate-statement`), then builds a per-module
 //! patch set.  Each patch is applied to the target module's raw [`Stmt`] tree
 //! **before** [`compile_module`] is called, making injected statements visible
 //! to type resolution, grouping instantiation, and constraint checking.

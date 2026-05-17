@@ -153,7 +153,7 @@ Declare entries as a module-level static and return them from `overlay_extension
 ```rust
 static ANN_EXTS: &[OverlayExtension] = &[
     OverlayExtension {
-        module: "tailf-common",
+        module: "acme-ext",
         name: "annotate",
         source_plugin: "my-plugin",
     },
@@ -170,7 +170,7 @@ statements in overlay modules that target **source-level AST statements** — gr
 typedefs, and the module statement itself — by selector string rather than by schema-node
 path.
 
-This is the mechanism used by `tailf:annotate-module` / `tailf:annotate-statement`. The
+This is the mechanism used by extensions like `acme:annotate-module` / `acme:annotate-statement`. The
 overlay is applied *before* compilation, directly modifying the `ast::Stmt` tree. It is
 intended for statements that have no schema-node identity at compile time.
 
@@ -185,12 +185,12 @@ pub struct ExtensionId {
 pub struct AstOverlayDescriptor {
     /// Extension that selects the *target module* by name.
     /// Its argument value must be the unqualified YANG module name.
-    /// Example: `tailf:annotate-module "ietf-interfaces"`
+    /// Example: `acme:annotate-module "ietf-interfaces"`
     pub module_selector_ext: ExtensionId,
 
     /// Extension that selects a statement *within* that module by selector string.
     /// Selector syntax: `"keyword"` or `"keyword[name='value']"`.
-    /// Example: `tailf:annotate-statement "grouping[name='interface']"`
+    /// Example: `acme:annotate-statement "grouping[name='interface']"`
     pub stmt_selector_ext: ExtensionId,
 }
 ```
@@ -200,8 +200,8 @@ Declare entries as a module-level static and return them from `ast_overlay_exten
 ```rust
 static AST_ANN_DESCS: &[AstOverlayDescriptor] = &[
     AstOverlayDescriptor {
-        module_selector_ext: ExtensionId { module: "tailf-common", name: "annotate-module" },
-        stmt_selector_ext:   ExtensionId { module: "tailf-common", name: "annotate-statement" },
+        module_selector_ext: ExtensionId { module: "acme-ext", name: "annotate-module" },
+        stmt_selector_ext:   ExtensionId { module: "acme-ext", name: "annotate-statement" },
     },
 ];
 fn ast_overlay_extensions(&self) -> &'static [AstOverlayDescriptor] { AST_ANN_DESCS }
@@ -440,7 +440,7 @@ Describes the grammar of a YANG extension statement understood by a plugin:
 
 ```rust
 pub struct ExtensionGrammar {
-    pub module:   &'static str,      // e.g. "tailf-common"
+    pub module:   &'static str,      // e.g. "acme-ext"
     pub name:     &'static str,      // e.g. "callpoint"
     pub parents:  Vec<GrammarParent>, // valid parent statement kinds; empty = any
     pub arg_type: Option<ArgType>,   // None = no argument

@@ -136,7 +136,7 @@ annotation_modules = [
 
 Annotation overlay files that are applied to their target nodes at expansion
 time but are not themselves included in the output.  An annotation module
-contains plugin-declared extension statements (e.g. a `tailf:annotate`-style
+contains plugin-declared extension statements (e.g. an `acme:annotate`-style
 extension) whose argument is an absolute schema-node path; the extension's body
 sub-statements are injected into the target node's extension list when the node
 is expanded.

@@ -2512,8 +2512,8 @@ fn annotation_leaf_targets_module(
 /// The target module name was resolved from the deviating module's imports at
 /// devindex build time, so no registry lookup or prefix-string comparison is
 /// needed.  Using the pre-resolved name is also correct when many modules share
-/// the same self-declared prefix letter (e.g. all Cisco-IOS-XE submodules use
-/// `prefix ios`).
+/// the same self-declared prefix letter (e.g. all submodules of a suite may use
+/// the same short prefix string).
 fn deviation_targets_module(deviation: &PendingDeviation, key: &ModuleKey) -> bool {
     match &deviation.target_module_name {
         // Prefix resolved to a known module: only apply to that module.
@@ -3277,7 +3277,7 @@ fn collect_applied_deviations(key: &ModuleKey, dev_index: &DeviationIndex) -> Ap
                     return true;
                 }
                 // Also check the last prefix-qualified step: a deviation path like
-                // `/ios-sm:netconf-yang/cisco-ia:cisco-ia` targets `cisco-ia`, not `ios-sm`.
+                // `/mod-a:container/mod-b:leaf` targets `mod-b`, not `mod-a`.
                 let mut ignored = Vec::new();
                 if let Some(path) = parse_path_internal(&d.target_path, true, &d.pos, &mut ignored)
                 {

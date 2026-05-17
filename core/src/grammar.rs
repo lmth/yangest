@@ -38,7 +38,7 @@ use crate::ast::BuiltInKeyword;
 /// Describes the grammar of one YANG extension keyword.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtensionGrammar {
-    /// Resolved module name that defines the extension (e.g. `"tailf-common"`).
+    /// Resolved module name that defines the extension (e.g. `"acme-ext"`).
     pub module: &'static str,
     /// Local extension name (e.g. `"callpoint"`).
     pub name: &'static str,
@@ -84,8 +84,8 @@ pub enum GrammarKeyword {
     },
     /// Wildcard: matches any extension sub-statement (any `prefix:local` keyword),
     /// regardless of which module or local name it has.
-    /// Useful for extension containers like `tailf:annotate` that are documented
-    /// as accepting "any tailf statement".
+    /// Useful for extension containers like `acme:annotate` that are documented
+    /// as accepting "any acme statement".
     AnyExtension,
     /// Wildcard: matches any YANG built-in sub-statement keyword.
     AnyBuiltIn,

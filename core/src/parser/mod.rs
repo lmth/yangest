@@ -797,9 +797,9 @@ module foo {
     #[test]
     fn parse_unquoted_arg_with_bracket_predicate() {
         // RFC 7950 §6.1.3: single-quote is not a stop character for unquoted
-        // strings.  tailf:annotate-statement uses this syntax to target
+        // strings.  acme:annotate-statement uses this syntax to target
         // specific grouping/list instances by name.
-        let src = r#"tailf:annotate-statement "grouping[name='foo']" { tailf:info "x"; }"#;
+        let src = r#"acme:annotate-statement "grouping[name='foo']" { acme:info "x"; }"#;
         let (stmts, errors) = parse_yang(src, file());
         assert!(errors.is_empty(), "errors: {:?}", errors);
         assert_eq!(stmts[0].arg_str(), "grouping[name='foo']");

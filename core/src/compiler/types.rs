@@ -115,7 +115,7 @@ pub struct WhenExpr {
 /// An extension statement applied to a schema node or module during compilation.
 #[derive(Debug, Clone)]
 pub struct ExtensionInstance {
-    /// The resolved module name of the extension (e.g. `"tailf-common"`).
+    /// The resolved module name of the extension (e.g. `"acme-ext"`).
     pub module: String,
     /// The local extension name (e.g. `"callpoint"`).
     pub name: String,

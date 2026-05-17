@@ -70,7 +70,7 @@ struct Cli {
 
     /// Apply plugin-declared annotations from FILE without emitting output for
     /// it (may be repeated).  Annotation modules contain extension statements
-    /// (e.g. `tailf:annotate`) that target schema nodes by path.
+    /// (e.g. `acme:annotate`) that target schema nodes by path.
     #[arg(long = "annotation-module", value_name = "FILE")]
     annotation_modules: Vec<PathBuf>,
 

@@ -232,8 +232,8 @@ fn resolve_ext_instances(
 /// Returns the prefix of the deepest (last) prefix-qualified path step, if any.
 ///
 /// Using the deepest prefix correctly identifies the target module even when the path
-/// crosses module boundaries, e.g. `/ios-sm:netconf-yang/cisco-ia:cisco-ia/...`
-/// targets `cisco-ia`, not `ios-sm`.
+/// crosses module boundaries, e.g. `/mod-a:container/mod-b:leaf/...`
+/// targets `mod-b`, not `mod-a`.
 fn extract_first_prefix(path: &str) -> Option<String> {
     path.trim_start_matches('/')
         .split('/')
