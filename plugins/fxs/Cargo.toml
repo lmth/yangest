@@ -1,0 +1,22 @@
+[package]
+name = "yangest-plugin-fxs"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Reorder the HashDict section to match yanger's exact Erlang dict fold order,
+# enabling byte-for-byte identical FXS output.  This is a cosmetic/compatibility
+# feature only — the HashDict is a proper key-value map and functions correctly
+# regardless of entry order.  Disable to drop the ~800-line genie/ module and
+# its associated ordering logic.
+default = ["yanger-compat-hash-order"]
+yanger-compat-hash-order = []
+
+[dependencies]
+yangest-core = { path = "../../core" }
+clap = { version = "4", default-features = false, features = ["std"] }
+eetf = "0.11"
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+md-5 = "0.10"
+num-bigint = "0.4"
+inventory = "0.3"
