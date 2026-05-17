@@ -62,6 +62,15 @@ pub trait Plugin: Send + Sync {
 
     fn yang_grammar(&self) -> &'static [ExtensionGrammar] { &[] }
 
+    fn prepare_bundle(
+        &self,
+        _modules: &[Arc<CompiledModule>],
+        _registry: &ModuleRegistry,
+        _ctx: &ExpansionCtx<'_>,
+    ) -> BundleState {
+        BundleState::new()
+    }
+
     fn emit(
         &self,
         modules: &[Arc<CompiledModule>],
@@ -69,11 +78,12 @@ pub trait Plugin: Send + Sync {
         ctx: &ExpansionCtx<'_>,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
+        let bundle = self.prepare_bundle(modules, registry, ctx);
         let mut first = true;
         for module in modules {
             if !first { writeln!(out)?; }
             first = false;
-            self.emit_module(module, registry, ctx, out)?;
+            self.emit_module(module, registry, ctx, &bundle, &mut EmitState::new(), out)?;
         }
         Ok(())
     }
@@ -83,6 +93,8 @@ pub trait Plugin: Send + Sync {
         _module: &Arc<CompiledModule>,
         _registry: &ModuleRegistry,
         _ctx: &ExpansionCtx<'_>,
+        _bundle: &BundleState,
+        _state: &mut EmitState,
         _out: &mut dyn Write,
     ) -> std::io::Result<()> {
         Ok(())
@@ -207,11 +219,25 @@ before compilation begins. The compiler uses the merged grammar registry to vali
 extension usage and collect `ExtensionInstance` values on schema nodes. See the
 `ExtensionGrammar` section below for the full type description.
 
+### `prepare_bundle`
+
+Called exactly once, before any per-module emission (and before parallel workers
+are spawned). Returns a [`BundleState`](#bundlestate) that is wrapped in an `Arc`
+and passed as the `bundle` argument to every `emit_module` call.
+
+Use this hook to pre-compute data that is derived from the full registry or the
+complete module list — for example, a namespace cache built by iterating all
+modules — when computing it once here avoids repeated work inside `emit_module`.
+
+The default implementation returns an empty `BundleState`; plugins with nothing
+global to pre-compute do not need to override this.
+
 ### `emit`
 
 Called once with the full ordered list of display modules and an `ExpansionCtx`. The
-default implementation iterates the list and calls `emit_module` for each, separated by
-a blank line. This is the correct behaviour for all per-module formats.
+default implementation calls `prepare_bundle` once, then iterates the list and calls
+`emit_module` for each module, separated by a blank line, with a fresh `EmitState`
+per module. This is the correct behaviour for all per-module formats.
 
 Override `emit` directly only for *all-at-once* formats that need to see all modules
 simultaneously before producing any output. The swagger plugin does this because a
@@ -229,6 +255,13 @@ up any module that was reachable from the display set. The `ctx` object carries 
 expansion configuration (enabled features, max-status, deviation overlays) and is
 needed whenever the plugin traverses the compiled tree via `module.children(ctx)` or
 `node.children(ctx)` (see `ExpansionCtx` below).
+
+`bundle` is the read-only `BundleState` produced by `prepare_bundle`. Use
+`bundle.get::<T>()` to retrieve pre-computed data.
+
+`state` is a fresh `EmitState` created for this module call. Use
+`state.get_or_insert::<T>()` to keep mutable per-module scratch state without
+`&mut self` or interior mutability on the plugin struct.
 
 ---
 
@@ -261,6 +294,8 @@ The fully compiled representation of one YANG module.
 | `errors` | `Vec<YError>` | Compilation errors for this module. |
 | `extensions` | `Vec<ExtensionInstance>` | Extension statements declared at module level. |
 | `pmap` | `PMap` | Type-keyed extension map for plugin-private per-module state (see below). |
+| `set_pdata<T>` | method | Store a `Send + Sync` value of type `T` into the module's pdata slot. |
+| `pdata<T>` | method | Retrieve a reference to the previously stored value of type `T`, or `None`. |
 
 ### `SchemaNode`
 
@@ -475,6 +510,87 @@ Note that `pmap` is deliberately **not cloned** when `SchemaNode` is cloned (e.g
 augment groups are assembled). Private state therefore does not carry over into
 secondary copies of a node.
 
+### `BundleState`
+
+Bundle-level shared state produced once by `prepare_bundle` and passed read-only to
+every `emit_module` call. Values stored here must be `Send + Sync` because the map
+may be shared across parallel workers.
+
+```rust
+// In prepare_bundle:
+let mut bundle = BundleState::new();
+let data: &mut MyBundleData = bundle.get_or_insert::<MyBundleData>();
+data.ns_cache.insert("ietf-inet-types".into(), "urn:ietf:params:xml:ns:yang:ietf-inet-types".into());
+bundle
+
+// In emit_module:
+if let Some(data) = bundle.get::<MyBundleData>() {
+    // read data.ns_cache …
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `get_or_insert::<T>() -> &mut T` | Insert `T::default()` if absent; return a mutable reference. Call during `prepare_bundle`. |
+| `get::<T>() -> Option<&T>` | Return a shared reference to a previously inserted value. Call during `emit_module`. |
+
+### `EmitState`
+
+Per-module mutable scratch storage, created fresh for every `emit_module` call.
+Values need only be `Send` (not `Sync`).
+
+```rust
+#[derive(Default)]
+struct MyState { counter: u32 }
+
+fn emit_module(&self, module, registry, ctx, bundle, state: &mut EmitState, out) {
+    let s: &mut MyState = state.get_or_insert::<MyState>();
+    s.counter += 1;
+    // …
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `get_or_insert::<T>() -> &mut T` | Insert `T::default()` if absent; return a mutable reference. |
+
+### `AppliedDeviations` and `AppliedAnnotations`
+
+The compiler stores which deviation modules and annotation modules were applied to
+each primary module in the module's pdata slot. Retrieve them with `pdata`:
+
+```rust
+use yangest_core::compiler::{AppliedDeviations, AppliedAnnotations};
+
+// Each entry is (deviating_module_name, Option<revision>)
+if let Some(devs) = module.pdata::<AppliedDeviations>() {
+    for (name, rev) in &devs.0 {
+        eprintln!("  deviated by: {name}");
+    }
+}
+if let Some(anns) = module.pdata::<AppliedAnnotations>() {
+    for (name, rev, _prefix_map) in &anns.0 {
+        eprintln!("  annotated by: {name}");
+    }
+}
+```
+
+### `find_child_in_raw`
+
+```rust
+pub fn find_child_in_raw(
+    target_name: &str,
+    raw: &[SchemaNode],
+    overlay: &NodeOverlayMap,
+    ctx: &ExpansionCtx<'_>,
+) -> Option<SchemaNode>
+```
+
+An early-termination variant of child expansion: stops as soon as the first visible
+child with `name == target_name` is found, lazily expanding `uses` groupings only as
+needed. Useful for navigating augment target paths step-by-step in large modules
+without the O(n) cost of a full `children(ctx)` expansion.
+
 ---
 
 ## 4. Creating a plugin crate
@@ -508,7 +624,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use yangest_core::compiler::{CompiledModule, ExpansionCtx, ModuleRegistry};
-use yangest_core::plugin::{Plugin, PluginRegistration};
+use yangest_core::plugin::{BundleState, EmitState, Plugin, PluginRegistration};
 
 pub struct MyPlugin;
 
@@ -520,6 +636,8 @@ impl Plugin for MyPlugin {
         module: &Arc<CompiledModule>,
         _registry: &ModuleRegistry,
         ctx: &ExpansionCtx<'_>,
+        _bundle: &BundleState,
+        _state: &mut EmitState,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
         writeln!(out, "# {}", module.key.name)?;

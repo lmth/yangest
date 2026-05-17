@@ -10,10 +10,10 @@ use crate::grammar::GrammarRegistry;
 
 use super::expansion::attach_schema_path;
 use super::{
-    AugmentEntry, CompiledModule, ExpansionCtx, ExtensionInstance, Feature, Grouping, Identity,
-    IfFeatureExpr, LocalAugmentEntry, ModuleRegistry, MustExpr, NodeOverlay, NodeOverlayMap,
-    OrderedBy, PathStep, PrefixMap, SchemaNode, SchemaNodeKind, SchemaPath, Status, Typedef,
-    UsesOverlay, WhenExpr, YangVersion,
+    AppliedAnnotations, AppliedDeviations, AugmentEntry, CompiledModule, ExpansionCtx,
+    ExtensionInstance, Feature, Grouping, Identity, IfFeatureExpr, LocalAugmentEntry,
+    ModuleRegistry, MustExpr, NodeOverlay, NodeOverlayMap, OrderedBy, PathStep, PrefixMap,
+    SchemaNode, SchemaNodeKind, SchemaPath, Status, Typedef, UsesOverlay, WhenExpr, YangVersion,
 };
 use indexmap::IndexMap;
 
@@ -291,7 +291,7 @@ pub fn compile_module(
         &mut module_errors,
     );
 
-    CompiledModule {
+    let mut compiled = CompiledModule {
         key: key.clone(),
         yang_version,
         namespace,
@@ -312,7 +312,10 @@ pub fn compile_module(
         includes,
         source_path: None,
         grouping_children,
-    }
+    };
+    compiled.set_pdata(collect_applied_deviations(key, dev_index));
+    compiled.set_pdata(collect_applied_annotations(key, ann_index));
+    compiled
 }
 
 fn parse_yang_version(stmt: &Stmt, module_errors: &mut Vec<YError>) -> YangVersion {
@@ -1793,6 +1796,47 @@ fn child_path(parent_path: &[PathStep], module_prefix: &str, name: &str) -> Sche
     path
 }
 
+/// Find a named child in a raw node list with early termination, expanding
+/// `Uses` groupings lazily as needed.
+///
+/// This is an early-termination variant of [`expand_children`]: it stops as
+/// soon as the first visible child with `name == target_name` is found rather
+/// than expanding all children.  Useful for navigating augment target paths
+/// step-by-step in large modules without the O(n) cost of full expansion.
+pub fn find_child_in_raw(
+    target_name: &str,
+    raw: &[SchemaNode],
+    overlay: &NodeOverlayMap,
+    ctx: &ExpansionCtx<'_>,
+) -> Option<SchemaNode> {
+    let empty_overlay = NodeOverlayMap::new();
+    for node in raw {
+        match &node.kind {
+            SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay } => {
+                let expanded = expand_uses_lazy(
+                    grouping,
+                    source_module_name.as_deref(),
+                    uses_overlay,
+                    &node.module_prefix,
+                    &node.module_name,
+                    &empty_overlay,
+                    ctx,
+                );
+                if let Some(found) = find_child_in_raw(target_name, &expanded, overlay, ctx) {
+                    return Some(found);
+                }
+            }
+            _ => {
+                if node.name == target_name && node_visible(node, ctx) {
+                    return Some(node.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+
 fn node_visible(node: &SchemaNode, ctx: &ExpansionCtx<'_>) -> bool {
     if let Some(max_status) = ctx.max_status {
         if node.status > max_status {
@@ -2256,6 +2300,10 @@ fn propagate_uses_constraints(
     inherited_when: &[WhenExpr],
     inherited_if_features: &[IfFeatureExpr],
 ) {
+    // Per RFC 7950 Section 7.13.2, when a "uses" has a "when" expression it is
+    // added only to the TOP-LEVEL schema nodes of the expanded grouping — NOT
+    // recursively to their descendants.  Yanger's expand_uses applies WhenL
+    // only to `Grouping#grouping.children` (one level).
     if !inherited_when.is_empty() {
         let mut combined = inherited_when.to_vec();
         combined.extend(node.when.clone());
@@ -2267,26 +2315,31 @@ fn propagate_uses_constraints(
         node.if_features = combined;
     }
 
+    // Recurse for if_features only (pass empty slice for when).
+    // Propagating if_features recursively enables node_visible pruning in
+    // expand_children when features are selectively enabled, which is critical
+    // for performance with large module sets.  The when constraint is
+    // deliberately NOT propagated further (top-level only per RFC 7950).
     match &mut node.kind {
         SchemaNodeKind::Container { children, .. }
         | SchemaNodeKind::List { children, .. }
         | SchemaNodeKind::Case { children }
         | SchemaNodeKind::Notification { children, .. } => {
             for child in children {
-                propagate_uses_constraints(child, inherited_when, inherited_if_features);
+                propagate_uses_constraints(child, &[], inherited_if_features);
             }
         }
         SchemaNodeKind::Choice { cases, .. } => {
             for case in cases {
-                propagate_uses_constraints(case, inherited_when, inherited_if_features);
+                propagate_uses_constraints(case, &[], inherited_if_features);
             }
         }
         SchemaNodeKind::Rpc { input, output, .. } | SchemaNodeKind::Action { input, output } => {
             for child in input {
-                propagate_uses_constraints(child, inherited_when, inherited_if_features);
+                propagate_uses_constraints(child, &[], inherited_if_features);
             }
             for child in output {
-                propagate_uses_constraints(child, inherited_when, inherited_if_features);
+                propagate_uses_constraints(child, &[], inherited_if_features);
             }
         }
         SchemaNodeKind::Leaf { .. }
@@ -3208,6 +3261,76 @@ fn emit_error(
 
 fn is_ident_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':')
+}
+
+/// Collect the deviation modules that were applied to `key` during this compilation.
+///
+/// Returns an [`AppliedDeviations`] value ready to be stored with
+/// [`CompiledModule::set_pdata`].
+fn collect_applied_deviations(key: &ModuleKey, dev_index: &DeviationIndex) -> AppliedDeviations {
+    let mut result: Vec<(String, Option<String>)> = dev_index
+        .by_deviating_module
+        .iter()
+        .filter_map(|(dev_key, deviations)| {
+            let targets_us = deviations.iter().any(|d| {
+                if deviation_targets_module(d, key) {
+                    return true;
+                }
+                // Also check the last prefix-qualified step: a deviation path like
+                // `/ios-sm:netconf-yang/cisco-ia:cisco-ia` targets `cisco-ia`, not `ios-sm`.
+                let mut ignored = Vec::new();
+                if let Some(path) = parse_path_internal(&d.target_path, true, &d.pos, &mut ignored)
+                {
+                    if let Some(last) = path.last() {
+                        if let Some(ref pfx) = last.prefix {
+                            if let Some(mod_name) = d.prefix_map.get(pfx) {
+                                if mod_name == &key.name {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            });
+            if targets_us {
+                Some((dev_key.name.clone(), dev_key.revision.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    result.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    AppliedDeviations(result)
+}
+
+/// Collect the annotation modules that were applied to `key` during this compilation.
+///
+/// Returns an [`AppliedAnnotations`] value ready to be stored with
+/// [`CompiledModule::set_pdata`].
+fn collect_applied_annotations(
+    key: &ModuleKey,
+    ann_index: &AnnotationIndex,
+) -> AppliedAnnotations {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    if let Some(pending) = ann_index.by_target_module.get(&key.name) {
+        for ann in pending {
+            if seen.insert(ann.from_module.name.clone()) {
+                let prefix_map: PrefixMap = ann
+                    .prefix_map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                result.push((
+                    ann.from_module.name.clone(),
+                    ann.from_module.revision.clone(),
+                    prefix_map,
+                ));
+            }
+        }
+    }
+    AppliedAnnotations(result)
 }
 
 #[cfg(test)]

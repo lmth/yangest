@@ -179,6 +179,7 @@ impl Plugin for DependPlugin {
         module: &Arc<CompiledModule>,
         registry: &ModuleRegistry,
         _ctx: &ExpansionCtx<'_>,
+        _bundle: &yangest_core::plugin::BundleState,
         _state: &mut EmitState,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {

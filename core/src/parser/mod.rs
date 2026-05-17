@@ -242,41 +242,45 @@ impl<'a> Parser<'a> {
 
     /// Strip common leading whitespace from a multi-line double-quoted string
     /// per RFC 7950 §6.1.3 (trim leading spaces up to the column of the
-    /// opening quote on continuation lines, then trim trailing whitespace).
+    /// opening quote on continuation lines).  Additionally, trailing whitespace
+    /// is stripped from all interior lines (before a newline) to match confdc's
+    /// normalisation behaviour; trailing whitespace on the final line is
+    /// preserved.
     fn normalize_double_quoted(s: &str, indent: usize) -> String {
         let lines: Vec<&str> = s.split('\n').collect();
         if lines.len() <= 1 {
             return s.to_string();
         }
-        // First line is not trimmed.
-        let first = lines[0].to_string();
-        let rest: Vec<String> = lines[1..]
+        let last_idx = lines.len() - 1;
+        let result: Vec<String> = lines
             .iter()
-            .map(|line| {
-                // Remove up to `indent` leading spaces/tabs
+            .enumerate()
+            .map(|(i, line)| {
                 let mut stripped = *line;
-                let mut removed = 0;
-                while removed < indent {
-                    if stripped.starts_with(' ') {
-                        stripped = &stripped[1..];
-                        removed += 1;
-                    } else if stripped.starts_with('\t') {
-                        // A tab counts as one character toward the indent
-                        stripped = &stripped[1..];
-                        removed += 1;
-                    } else {
-                        break;
+                if i > 0 {
+                    // Remove up to `indent` leading spaces/tabs on continuation lines.
+                    let mut removed = 0;
+                    while removed < indent {
+                        if stripped.starts_with(' ') {
+                            stripped = &stripped[1..];
+                            removed += 1;
+                        } else if stripped.starts_with('\t') {
+                            stripped = &stripped[1..];
+                            removed += 1;
+                        } else {
+                            break;
+                        }
                     }
                 }
-                stripped.to_string()
+                // Strip trailing whitespace from all interior lines; preserve it on the last.
+                if i < last_idx {
+                    stripped.trim_end().to_string()
+                } else {
+                    stripped.to_string()
+                }
             })
             .collect();
-        // Trim trailing whitespace from last line
-        let mut all: Vec<String> = std::iter::once(first).chain(rest).collect();
-        if let Some(last) = all.last_mut() {
-            *last = last.trim_end().to_string();
-        }
-        all.join("\n")
+        result.join("\n")
     }
 
     // ── Tokenizer ─────────────────────────────────────────────────────────────

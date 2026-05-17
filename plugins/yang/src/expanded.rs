@@ -17,7 +17,7 @@ use yangest_core::compiler::{
     CompiledModule, ExpansionCtx, ExtensionInstance, IfFeatureExpr, ModuleRegistry, MustExpr,
     OrderedBy, SchemaNode, SchemaNodeKind, Status, WhenExpr,
 };
-use yangest_core::plugin::{EmitState, Plugin};
+use yangest_core::plugin::{BundleState, EmitState, Plugin};
 
 use crate::{escape_dq, format_arg, kwd_class, kwd_with_trailing_nl, print_stmt,
             write_hanging_string, KwdClass};
@@ -38,6 +38,7 @@ impl Plugin for YangExpandedPlugin {
         module: &Arc<CompiledModule>,
         _registry: &ModuleRegistry,
         ctx: &ExpansionCtx<'_>,
+        _bundle: &BundleState,
         _state: &mut EmitState,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {

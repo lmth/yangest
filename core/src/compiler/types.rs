@@ -338,6 +338,23 @@ pub type NodeOverlayMap = HashMap<SchemaPath, NodeOverlay>;
 
 pub type PrefixMap = indexmap::IndexMap<String, String>;
 
+/// The deviation modules that were applied to this module during compilation.
+///
+/// Stored via [`CompiledModule::set_pdata`] during compilation.
+/// Each entry is `(module_name, revision)` — revision is `None` when unspecified.
+///
+/// Retrieved by plugins with `module.pdata::<AppliedDeviations>()`.
+pub struct AppliedDeviations(pub Vec<(String, Option<String>)>);
+
+/// The annotation modules that were applied to this module during compilation.
+///
+/// Stored via [`CompiledModule::set_pdata`] during compilation.
+/// Each entry is `(module_name, revision, prefix_map)` where `prefix_map` maps
+/// prefix → module_name for all imports declared in the annotation module.
+///
+/// Retrieved by plugins with `module.pdata::<AppliedAnnotations>()`.
+pub struct AppliedAnnotations(pub Vec<(String, Option<String>, PrefixMap)>);
+
 pub struct CompiledModule {
     pub key: ModuleKey,
     pub yang_version: YangVersion,
@@ -369,8 +386,30 @@ pub struct CompiledModule {
     pub grouping_children: HashMap<String, Arc<Vec<SchemaNode>>>,
 }
 
+impl CompiledModule {
+    /// Store compile-phase data keyed by type `T`.
+    ///
+    /// Intended for use inside `compile_module` (or any post-compile step) to attach
+    /// typed data that plugins can retrieve later via [`pdata`](Self::pdata).
+    /// Overwrites any previously stored value of the same type.
+    pub fn set_pdata<T: Any + Send + Sync>(&mut self, val: T) {
+        self.pmap.insert(TypeId::of::<T>(), Box::new(val));
+    }
+
+    /// Retrieve compile-phase data of type `T` previously stored with [`set_pdata`](Self::set_pdata).
+    ///
+    /// Returns `None` if no value of that type has been stored.
+    pub fn pdata<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.pmap.get(&TypeId::of::<T>())?.downcast_ref()
+    }
+}
+
 pub struct ModuleRegistry {
     pub modules: IndexMap<ModuleKey, Arc<CompiledModule>>,
+    /// Fast name-only lookup: module name → most-recently-inserted revision.
+    /// Populated by [`insert`](Self::insert); used by [`resolve_import`](Self::resolve_import)
+    /// for the common revision-less case.
+    name_index: HashMap<String, Arc<CompiledModule>>,
     /// Extension grammar rules registered by plugins before compilation.
     pub grammar: GrammarRegistry,
     pub flags: CompilationFlags,
@@ -380,6 +419,7 @@ impl Default for ModuleRegistry {
     fn default() -> Self {
         Self {
             modules: IndexMap::new(),
+            name_index: HashMap::new(),
             grammar: GrammarRegistry::new(),
             flags: CompilationFlags::default(),
         }
@@ -392,6 +432,7 @@ impl ModuleRegistry {
     }
 
     pub fn insert(&mut self, module: Arc<CompiledModule>) {
+        self.name_index.insert(module.key.name.clone(), Arc::clone(&module));
         self.modules.insert(module.key.clone(), module);
     }
 
@@ -414,14 +455,12 @@ impl ModuleRegistry {
             }
         }
 
-        let latest = ModuleKey::latest(name);
-        if let Some(module) = self.modules.get(&latest) {
+        // Fast path: O(1) name-only lookup via index.
+        if let Some(module) = self.name_index.get(name) {
             return Some(Arc::clone(module));
         }
 
-        self.modules
-            .iter()
-            .find_map(|(key, module)| (key.name == name).then(|| Arc::clone(module)))
+        None
     }
 
     /// Returns true if any module in the registry has a non-empty overlay

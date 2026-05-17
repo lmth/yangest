@@ -229,10 +229,14 @@ fn resolve_ext_instances(
 ///
 /// `"/ifs:interfaces/ifs:interface"` → `Some("ifs")`
 /// `"/interfaces/interface"` → `None`
+/// Returns the prefix of the deepest (last) prefix-qualified path step, if any.
+///
+/// Using the deepest prefix correctly identifies the target module even when the path
+/// crosses module boundaries, e.g. `/ios-sm:netconf-yang/cisco-ia:cisco-ia/...`
+/// targets `cisco-ia`, not `ios-sm`.
 fn extract_first_prefix(path: &str) -> Option<String> {
-    let path = path.trim_start_matches('/');
-    let first_step = path.split('/').next()?;
-    first_step
-        .find(':')
-        .map(|colon| first_step[..colon].to_string())
+    path.trim_start_matches('/')
+        .split('/')
+        .filter_map(|step| step.find(':').map(|colon| step[..colon].to_string()))
+        .last()
 }
