@@ -11,7 +11,7 @@ use std::sync::Arc;
 use yangest_core::ast::{BuiltInKeyword, Keyword, Stmt};
 use yangest_core::compiler::{CompiledModule, ExpansionCtx, ModuleRegistry};
 
-use yangest_core::plugin::{EmitState, Plugin};
+use yangest_core::plugin::{BundleState, EmitState, Plugin};
 
 pub struct YinPlugin;
 
@@ -27,9 +27,10 @@ impl Plugin for YinPlugin {
         ctx: &ExpansionCtx<'_>,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
+        let bundle = self.prepare_bundle(modules, registry, ctx);
         writeln!(out, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
         for module in modules {
-            self.emit_module(module, registry, ctx, &mut EmitState::new(), out)?;
+            self.emit_module(module, registry, ctx, &bundle, &mut EmitState::new(), out)?;
         }
         Ok(())
     }
@@ -39,6 +40,7 @@ impl Plugin for YinPlugin {
         module: &Arc<CompiledModule>,
         registry: &ModuleRegistry,
         _ctx: &ExpansionCtx<'_>,
+        _bundle: &BundleState,
         _state: &mut EmitState,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {

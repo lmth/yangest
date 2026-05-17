@@ -11,6 +11,66 @@ use clap::{Arg, ArgMatches};
 use crate::compiler::{CompiledModule, ExpansionCtx, ModuleRegistry};
 use crate::grammar::ExtensionGrammar;
 
+/// Bundle-level shared state computed once before any per-module emission.
+///
+/// Created by [`Plugin::prepare_bundle`] before the per-module loop starts and
+/// shared (via `Arc`) across all parallel `emit_module` calls.  Because it is
+/// shared, values stored here must be `Send + Sync` and the map itself is
+/// immutable after `prepare_bundle` returns.
+///
+/// Plugin authors insert typed entries during `prepare_bundle` and retrieve
+/// them (read-only) inside `emit_module`:
+///
+/// ```rust,ignore
+/// #[derive(Default)]
+/// struct MyBundleData { ns_cache: HashMap<String, String> }
+///
+/// fn prepare_bundle(&self, modules, registry, ctx) -> BundleState {
+///     let mut bundle = BundleState::new();
+///     let data = bundle.get_or_insert::<MyBundleData>();
+///     for m in registry.modules.values() {
+///         data.ns_cache.insert(m.key.name.clone(), m.namespace.clone());
+///     }
+///     bundle
+/// }
+///
+/// fn emit_module(&self, module, registry, ctx, bundle, state, out) {
+///     if let Some(data) = bundle.get::<MyBundleData>() {
+///         // use data.ns_cache …
+///     }
+/// }
+/// ```
+pub struct BundleState {
+    map: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+}
+
+impl BundleState {
+    /// Create a new, empty bundle state map.
+    pub fn new() -> Self {
+        BundleState { map: HashMap::new() }
+    }
+
+    /// Return a mutable reference to the value of type `T`, inserting
+    /// `T::default()` if none is present.  Call this during `prepare_bundle`.
+    pub fn get_or_insert<T: Any + Send + Sync + Default>(&mut self) -> &mut T {
+        self.map
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()))
+            .downcast_mut::<T>()
+            .expect("BundleState: type mismatch — should never happen")
+    }
+
+    /// Return a shared reference to the value of type `T`, or `None` if it
+    /// was never inserted.  Call this during `emit_module`.
+    pub fn get<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.map.get(&TypeId::of::<T>())?.downcast_ref::<T>()
+    }
+}
+
+impl Default for BundleState {
+    fn default() -> Self { Self::new() }
+}
+
 /// Per-primary-module mutable state storage for plugin authors.
 ///
 /// The framework creates one `EmitState` per `emit_module` call and discards
@@ -23,7 +83,7 @@ use crate::grammar::ExtensionGrammar;
 /// #[derive(Default)]
 /// struct MyState { seen: HashSet<String> }
 ///
-/// fn emit_module(&self, module, registry, ctx, state: &mut EmitState, out) {
+/// fn emit_module(&self, module, registry, ctx, bundle, state: &mut EmitState, out) {
 ///     let s: &mut MyState = state.get_or_insert::<MyState>();
 ///     s.seen.insert(module.key.name.clone());
 /// }
@@ -228,10 +288,59 @@ pub trait Plugin: Send + Sync {
         &[]
     }
 
+    /// Compute bundle-level shared state once, before any per-module emission.
+    ///
+    /// Called exactly once before the per-module loop (or before any parallel
+    /// workers are spawned).  The returned [`BundleState`] is wrapped in an
+    /// `Arc` and passed as `bundle` to every [`emit_module`] call, including
+    /// parallel ones, so values stored here must be `Send + Sync`.
+    ///
+    /// Use this hook to pre-compute data that is:
+    /// - **Derived from the full registry or all modules** (e.g. a namespace
+    ///   cache built by iterating `registry.modules`), and
+    /// - **Expensive enough to matter** when processing hundreds of modules in
+    ///   parallel — computing it once here avoids the O(n²) cost of rebuilding
+    ///   it inside every `emit_module` call.
+    ///
+    /// The default implementation returns an empty [`BundleState`]; plugins
+    /// with nothing global to pre-compute do not need to override this.
+    ///
+    /// ```rust,ignore
+    /// #[derive(Default)]
+    /// struct MyBundle { ns_map: HashMap<String, String> }
+    ///
+    /// fn prepare_bundle(
+    ///     &self,
+    ///     _modules: &[Arc<CompiledModule>],
+    ///     registry: &ModuleRegistry,
+    ///     _ctx: &ExpansionCtx<'_>,
+    /// ) -> BundleState {
+    ///     let mut bundle = BundleState::new();
+    ///     let data = bundle.get_or_insert::<MyBundle>();
+    ///     for m in registry.modules.values() {
+    ///         data.ns_map.insert(m.key.name.clone(), m.namespace.clone());
+    ///     }
+    ///     bundle
+    /// }
+    /// ```
+    ///
+    /// [`emit_module`]: Plugin::emit_module
+    fn prepare_bundle(
+        &self,
+        _modules: &[Arc<CompiledModule>],
+        _registry: &ModuleRegistry,
+        _ctx: &ExpansionCtx<'_>,
+    ) -> BundleState {
+        BundleState::new()
+    }
+
     /// Emit output for all user modules in display order.
     ///
-    /// The default implementation calls [`emit_module`] for each module,
-    /// separated by a blank line, with a fresh [`EmitState`] per module.
+    /// The default implementation calls [`prepare_bundle`] once, then
+    /// [`emit_module`] for each module (separated by a blank line) with a
+    /// fresh [`EmitState`] per module.
+    ///
+    /// [`prepare_bundle`]: Plugin::prepare_bundle
     fn emit(
         &self,
         modules: &[Arc<CompiledModule>],
@@ -239,13 +348,14 @@ pub trait Plugin: Send + Sync {
         ctx: &ExpansionCtx<'_>,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
+        let bundle = self.prepare_bundle(modules, registry, ctx);
         let mut first = true;
         for module in modules {
             if !first {
                 writeln!(out)?;
             }
             first = false;
-            self.emit_module(module, registry, ctx, &mut EmitState::new(), out)?;
+            self.emit_module(module, registry, ctx, &bundle, &mut EmitState::new(), out)?;
         }
         Ok(())
     }
@@ -255,6 +365,10 @@ pub trait Plugin: Send + Sync {
     /// Per-module plugins override this; all-at-once plugins override
     /// [`emit`] instead and leave this as a no-op.
     ///
+    /// `bundle` is shared (read-only) state produced by [`prepare_bundle`]
+    /// before the per-module loop.  Use [`BundleState::get`] to retrieve
+    /// typed data pre-computed for the whole bundle.
+    ///
     /// `state` is a fresh [`EmitState`] created by the framework for this
     /// module.  Use [`EmitState::get_or_insert`] to store typed mutable state
     /// without needing `&mut self` or interior mutability on the plugin struct.
@@ -263,6 +377,7 @@ pub trait Plugin: Send + Sync {
         _module: &Arc<CompiledModule>,
         _registry: &ModuleRegistry,
         _ctx: &ExpansionCtx<'_>,
+        _bundle: &BundleState,
         _state: &mut EmitState,
         _out: &mut dyn Write,
     ) -> std::io::Result<()> {

@@ -1793,6 +1793,47 @@ fn child_path(parent_path: &[PathStep], module_prefix: &str, name: &str) -> Sche
     path
 }
 
+/// Find a named child in a raw node list with early termination, expanding
+/// `Uses` groupings lazily as needed.
+///
+/// This is an early-termination variant of [`expand_children`]: it stops as
+/// soon as the first visible child with `name == target_name` is found rather
+/// than expanding all children.  Useful for navigating augment target paths
+/// step-by-step in large modules without the O(n) cost of full expansion.
+pub fn find_child_in_raw(
+    target_name: &str,
+    raw: &[SchemaNode],
+    overlay: &NodeOverlayMap,
+    ctx: &ExpansionCtx<'_>,
+) -> Option<SchemaNode> {
+    let empty_overlay = NodeOverlayMap::new();
+    for node in raw {
+        match &node.kind {
+            SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay } => {
+                let expanded = expand_uses_lazy(
+                    grouping,
+                    source_module_name.as_deref(),
+                    uses_overlay,
+                    &node.module_prefix,
+                    &node.module_name,
+                    &empty_overlay,
+                    ctx,
+                );
+                if let Some(found) = find_child_in_raw(target_name, &expanded, overlay, ctx) {
+                    return Some(found);
+                }
+            }
+            _ => {
+                if node.name == target_name && node_visible(node, ctx) {
+                    return Some(node.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+
 fn node_visible(node: &SchemaNode, ctx: &ExpansionCtx<'_>) -> bool {
     if let Some(max_status) = ctx.max_status {
         if node.status > max_status {
@@ -2256,6 +2297,10 @@ fn propagate_uses_constraints(
     inherited_when: &[WhenExpr],
     inherited_if_features: &[IfFeatureExpr],
 ) {
+    // Per RFC 7950 Section 7.13.2, when a "uses" has a "when" expression it is
+    // added only to the TOP-LEVEL schema nodes of the expanded grouping — NOT
+    // recursively to their descendants.  Yanger's expand_uses applies WhenL
+    // only to `Grouping#grouping.children` (one level).
     if !inherited_when.is_empty() {
         let mut combined = inherited_when.to_vec();
         combined.extend(node.when.clone());
@@ -2267,26 +2312,31 @@ fn propagate_uses_constraints(
         node.if_features = combined;
     }
 
+    // Recurse for if_features only (pass empty slice for when).
+    // Propagating if_features recursively enables node_visible pruning in
+    // expand_children when features are selectively enabled, which is critical
+    // for performance with large module sets.  The when constraint is
+    // deliberately NOT propagated further (top-level only per RFC 7950).
     match &mut node.kind {
         SchemaNodeKind::Container { children, .. }
         | SchemaNodeKind::List { children, .. }
         | SchemaNodeKind::Case { children }
         | SchemaNodeKind::Notification { children, .. } => {
             for child in children {
-                propagate_uses_constraints(child, inherited_when, inherited_if_features);
+                propagate_uses_constraints(child, &[], inherited_if_features);
             }
         }
         SchemaNodeKind::Choice { cases, .. } => {
             for case in cases {
-                propagate_uses_constraints(case, inherited_when, inherited_if_features);
+                propagate_uses_constraints(case, &[], inherited_if_features);
             }
         }
         SchemaNodeKind::Rpc { input, output, .. } | SchemaNodeKind::Action { input, output } => {
             for child in input {
-                propagate_uses_constraints(child, inherited_when, inherited_if_features);
+                propagate_uses_constraints(child, &[], inherited_if_features);
             }
             for child in output {
-                propagate_uses_constraints(child, inherited_when, inherited_if_features);
+                propagate_uses_constraints(child, &[], inherited_if_features);
             }
         }
         SchemaNodeKind::Leaf { .. }

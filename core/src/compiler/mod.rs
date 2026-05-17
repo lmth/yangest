@@ -9,6 +9,6 @@ mod compile;
 mod expansion;
 mod types;
 
-pub use compile::{compile_module, expand_children};
+pub use compile::{compile_module, expand_children, find_child_in_raw};
 pub use expansion::ExpansionCtx;
 pub use types::*;

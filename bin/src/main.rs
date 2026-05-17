@@ -14,7 +14,7 @@ use yangest_core::ast::{self, ModuleKey};
 use yangest_core::compiler::{ExpansionCtx, ModuleRegistry, compile_module};
 use yangest_core::depgraph::DepGraph;
 use yangest_core::devindex::DeviationIndex;
-use yangest_core::plugin::{AstOverlayDescriptor, OverlayExtension, Plugin, PluginRegistration};
+use yangest_core::plugin::{AstOverlayDescriptor, EmitState, OverlayExtension, Plugin, PluginRegistration};
 
 mod bundle;
 
@@ -447,6 +447,11 @@ fn main() {
             std::process::exit(1);
         });
 
+    // Call prepare_bundle once before any emission (sequential, no parallelism
+    // constraints).  The result is Arc'd so it can be shared across parallel workers.
+    let bundle_ctx = make_ctx();
+    let bundle = Arc::new(plugin.prepare_bundle(&display_modules, &reg, &bundle_ctx));
+
     if let Some((in_pat, out_pat)) = output_pattern {
         // Pre-create all output directories before going parallel to avoid
         // races on create_dir_all for modules sharing a parent directory.
@@ -487,7 +492,7 @@ fn main() {
                 };
                 let mut writer = BufWriter::new(file);
                 let ctx = make_ctx();
-                if let Err(e) = plugin.emit(&[module.clone()], &reg, &ctx, &mut writer) {
+                if let Err(e) = plugin.emit_module(module, &reg, &ctx, &bundle, &mut EmitState::new(), &mut writer) {
                     eprintln!("yangest: emit error for '{}': {}", module.key.name, e);
                 }
             });
@@ -526,7 +531,7 @@ fn main() {
                 };
                 let mut writer = BufWriter::new(file);
                 let ctx = make_ctx();
-                if let Err(e) = plugin.emit(&[module.clone()], &reg, &ctx, &mut writer) {
+                if let Err(e) = plugin.emit_module(module, &reg, &ctx, &bundle, &mut EmitState::new(), &mut writer) {
                     eprintln!("yangest: emit error for '{}': {}", module.key.name, e);
                 }
             });

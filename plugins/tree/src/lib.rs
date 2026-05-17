@@ -11,7 +11,7 @@ use yangest_core::compiler::{
     AugmentEntry, CompiledModule, ExpansionCtx, ModuleRegistry, PathStep, SchemaNode,
     SchemaNodeKind, Status, expand_children,
 };
-use yangest_core::plugin::{EmitState, Plugin};
+use yangest_core::plugin::{BundleState, EmitState, Plugin};
 
 // ── Public plugin struct ──────────────────────────────────────────────────────
 
@@ -63,6 +63,7 @@ impl Plugin for TreePlugin {
         module: &Arc<CompiledModule>,
         registry: &ModuleRegistry,
         ctx: &ExpansionCtx<'_>,
+        _bundle: &BundleState,
         _state: &mut EmitState,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
