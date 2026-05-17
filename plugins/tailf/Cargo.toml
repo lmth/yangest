@@ -1,8 +1,0 @@
-[package]
-name = "yangest-plugin-tailf"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-inventory = "0.3"
-yangest-core = { path = "../../core" }

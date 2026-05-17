@@ -6,9 +6,6 @@ members = [
     "plugins/yang",
     "plugins/yin",
     "plugins/swagger",
-    "plugins/tailf",
-    "plugins/fxs",
     "bin",
-    "tools/fxs-print",
 ]
 resolver = "2"
