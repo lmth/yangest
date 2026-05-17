@@ -10,10 +10,10 @@ use crate::grammar::GrammarRegistry;
 
 use super::expansion::attach_schema_path;
 use super::{
-    AugmentEntry, CompiledModule, ExpansionCtx, ExtensionInstance, Feature, Grouping, Identity,
-    IfFeatureExpr, LocalAugmentEntry, ModuleRegistry, MustExpr, NodeOverlay, NodeOverlayMap,
-    OrderedBy, PathStep, PrefixMap, SchemaNode, SchemaNodeKind, SchemaPath, Status, Typedef,
-    UsesOverlay, WhenExpr, YangVersion,
+    AppliedAnnotations, AppliedDeviations, AugmentEntry, CompiledModule, ExpansionCtx,
+    ExtensionInstance, Feature, Grouping, Identity, IfFeatureExpr, LocalAugmentEntry,
+    ModuleRegistry, MustExpr, NodeOverlay, NodeOverlayMap, OrderedBy, PathStep, PrefixMap,
+    SchemaNode, SchemaNodeKind, SchemaPath, Status, Typedef, UsesOverlay, WhenExpr, YangVersion,
 };
 use indexmap::IndexMap;
 
@@ -291,7 +291,7 @@ pub fn compile_module(
         &mut module_errors,
     );
 
-    CompiledModule {
+    let mut compiled = CompiledModule {
         key: key.clone(),
         yang_version,
         namespace,
@@ -312,7 +312,10 @@ pub fn compile_module(
         includes,
         source_path: None,
         grouping_children,
-    }
+    };
+    compiled.set_pdata(collect_applied_deviations(key, dev_index));
+    compiled.set_pdata(collect_applied_annotations(key, ann_index));
+    compiled
 }
 
 fn parse_yang_version(stmt: &Stmt, module_errors: &mut Vec<YError>) -> YangVersion {
@@ -3258,6 +3261,76 @@ fn emit_error(
 
 fn is_ident_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':')
+}
+
+/// Collect the deviation modules that were applied to `key` during this compilation.
+///
+/// Returns an [`AppliedDeviations`] value ready to be stored with
+/// [`CompiledModule::set_pdata`].
+fn collect_applied_deviations(key: &ModuleKey, dev_index: &DeviationIndex) -> AppliedDeviations {
+    let mut result: Vec<(String, Option<String>)> = dev_index
+        .by_deviating_module
+        .iter()
+        .filter_map(|(dev_key, deviations)| {
+            let targets_us = deviations.iter().any(|d| {
+                if deviation_targets_module(d, key) {
+                    return true;
+                }
+                // Also check the last prefix-qualified step: a deviation path like
+                // `/ios-sm:netconf-yang/cisco-ia:cisco-ia` targets `cisco-ia`, not `ios-sm`.
+                let mut ignored = Vec::new();
+                if let Some(path) = parse_path_internal(&d.target_path, true, &d.pos, &mut ignored)
+                {
+                    if let Some(last) = path.last() {
+                        if let Some(ref pfx) = last.prefix {
+                            if let Some(mod_name) = d.prefix_map.get(pfx) {
+                                if mod_name == &key.name {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            });
+            if targets_us {
+                Some((dev_key.name.clone(), dev_key.revision.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    result.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    AppliedDeviations(result)
+}
+
+/// Collect the annotation modules that were applied to `key` during this compilation.
+///
+/// Returns an [`AppliedAnnotations`] value ready to be stored with
+/// [`CompiledModule::set_pdata`].
+fn collect_applied_annotations(
+    key: &ModuleKey,
+    ann_index: &AnnotationIndex,
+) -> AppliedAnnotations {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    if let Some(pending) = ann_index.by_target_module.get(&key.name) {
+        for ann in pending {
+            if seen.insert(ann.from_module.name.clone()) {
+                let prefix_map: PrefixMap = ann
+                    .prefix_map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                result.push((
+                    ann.from_module.name.clone(),
+                    ann.from_module.revision.clone(),
+                    prefix_map,
+                ));
+            }
+        }
+    }
+    AppliedAnnotations(result)
 }
 
 #[cfg(test)]

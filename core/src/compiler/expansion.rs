@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::compile::expand_children;
+use super::compile::{expand_children, find_child_in_raw};
 use super::{
     CompiledModule, Grouping, IfFeatureExpr, ModuleRegistry, NodeOverlayMap, PathStep, SchemaNode,
     SchemaNodeKind, SchemaPath, Status,
@@ -41,6 +41,13 @@ pub struct ExpansionCtx<'a> {
     /// (deviations targeting nodes inside `uses` expansions).
     /// When false, `expand_children` skips all per-node path allocation.
     pub has_any_overlay: bool,
+    /// When true, modules that have NO entries in `enabled_features` are treated as
+    /// unrestricted (all their features enabled).  This supports bundle mode where
+    /// `enabled_features` lists only modules that need restriction; all others are
+    /// implicitly unrestricted.
+    /// When false (default / CLI `--feature` mode), `enabled_features` is a strict
+    /// global whitelist.
+    pub unlisted_modules_enabled: bool,
 }
 
 impl<'a> ExpansionCtx<'a> {
@@ -56,6 +63,7 @@ impl<'a> ExpansionCtx<'a> {
             max_status: None,
             cache: RefCell::new(HashMap::new()),
             has_any_overlay: registry.has_any_overlay(),
+            unlisted_modules_enabled: false,
         }
     }
 
@@ -70,6 +78,15 @@ impl<'a> ExpansionCtx<'a> {
         self
     }
 
+    /// Enable the "unlisted modules are unrestricted" mode (bundle semantics).
+    ///
+    /// In this mode, modules that have no entries in `enabled_features` are treated
+    /// as unrestricted (all their features enabled), rather than as fully disabled.
+    pub fn with_unlisted_modules_enabled(mut self) -> Self {
+        self.unlisted_modules_enabled = true;
+        self
+    }
+
     /// Convenience: all features enabled (no filtering).
     pub fn all_features(registry: &'a ModuleRegistry) -> Self {
         static EMPTY: std::sync::OnceLock<HashSet<(String, String)>> = std::sync::OnceLock::new();
@@ -78,12 +95,25 @@ impl<'a> ExpansionCtx<'a> {
 
     /// Returns true when the named feature is enabled.
     ///
-    /// Both sets empty ⟹ all features enabled.  Non-empty ⟹ explicit whitelist:
-    /// a feature is enabled when it appears in the qualified set as `(module, name)`
-    /// OR in `global_features` as a bare name.
+    /// Both sets empty ⟹ all features enabled.  Non-empty ⟹ behaviour depends on mode:
+    ///
+    /// - Default (CLI mode, `unlisted_modules_enabled = false`): strict whitelist.
+    ///   A feature is enabled only when its `(module, name)` pair is in `enabled_features`
+    ///   OR its name is in `global_features`.
+    ///
+    /// - Bundle mode (`unlisted_modules_enabled = true`): partial restriction.
+    ///   Modules that have NO entries in `enabled_features` are unrestricted (all features
+    ///   enabled).  Only modules that appear in `enabled_features` are restricted to their
+    ///   listed features.
     pub fn feature_enabled(&self, module_name: &str, feature_name: &str) -> bool {
         if self.enabled_features.is_empty() && self.global_features.is_empty() {
             return true;
+        }
+        if self.unlisted_modules_enabled {
+            // Bundle mode: modules with no entries in enabled_features are unrestricted.
+            if !self.enabled_features.iter().any(|(m, _)| m == module_name) {
+                return true;
+            }
         }
         if self.global_features.contains(feature_name) {
             return true;
@@ -104,11 +134,7 @@ impl<'a> ExpansionCtx<'a> {
                 if self.enabled_features.is_empty() && self.global_features.is_empty() {
                     return true;
                 }
-                if self.global_features.contains(feat.as_str()) {
-                    return true;
-                }
-                self.enabled_features
-                    .contains(&(module_name.clone(), feat.clone()))
+                self.feature_enabled(module_name, feat)
             }
             IfFeatureExpr::Not(inner) => !self.eval_if_feature(inner, own_module),
             IfFeatureExpr::And(a, b) => {
@@ -145,6 +171,18 @@ impl<'a> ExpansionCtx<'a> {
 
 impl CompiledModule {
     pub fn children(&self, ctx: &ExpansionCtx<'_>) -> Vec<SchemaNode> {
+        // Fast path: no deviation overlay on this module — skip path tracking.
+        if self.overlay.is_empty() {
+            let empty_overlay = NodeOverlayMap::new();
+            return expand_children(
+                &self.children,
+                &self.prefix,
+                &self.key.name,
+                &empty_overlay,
+                &[],
+                ctx,
+            );
+        }
         expand_children(
             &self.children,
             &self.prefix,
@@ -153,6 +191,14 @@ impl CompiledModule {
             &[],
             ctx,
         )
+    }
+
+    /// Find a named top-level child with early termination, expanding Uses as needed.
+    ///
+    /// Unlike [`children`](Self::children) which expands all children, this stops as
+    /// soon as the target name is found.  Use for step-by-step path navigation.
+    pub fn find_child(&self, name: &str, ctx: &ExpansionCtx<'_>) -> Option<SchemaNode> {
+        find_child_in_raw(name, &self.children, &self.overlay, ctx)
     }
 }
 
@@ -218,7 +264,7 @@ impl SchemaNode {
         self.expand_named_io(raw, "output", ctx)
     }
 
-    fn raw_children(&self) -> Option<&[SchemaNode]> {
+    pub fn raw_children(&self) -> Option<&[SchemaNode]> {
         match &self.kind {
             SchemaNodeKind::Container { children, .. }
             | SchemaNodeKind::List { children, .. }
@@ -227,6 +273,45 @@ impl SchemaNode {
             SchemaNodeKind::Choice { cases, .. } => Some(cases),
             _ => None,
         }
+    }
+
+    /// Find a named child with early termination, expanding Uses groupings as needed.
+    ///
+    /// Unlike [`children`](Self::children) which expands all children into a Vec, this
+    /// stops as soon as the target name is found.  Use for step-by-step path navigation
+    /// where only a single child is needed per level.
+    pub fn find_child(&self, name: &str, ctx: &ExpansionCtx<'_>) -> Option<SchemaNode> {
+        let raw = self.raw_children()?;
+        let empty_overlay = NodeOverlayMap::new();
+        if !ctx.has_any_overlay {
+            return find_child_in_raw(name, raw, &empty_overlay, ctx);
+        }
+        let overlay_owner = ctx.registry.resolve_import(&self.module_name, None);
+        let overlay = overlay_owner
+            .as_ref()
+            .map(|m| &m.overlay)
+            .unwrap_or(&empty_overlay);
+        find_child_in_raw(name, raw, overlay, ctx)
+    }
+
+    /// Find a named child in the RPC/action input, expanding Uses as needed.
+    pub fn find_input_child(&self, name: &str, ctx: &ExpansionCtx<'_>) -> Option<SchemaNode> {
+        let raw = match &self.kind {
+            SchemaNodeKind::Rpc { input, .. } | SchemaNodeKind::Action { input, .. } => input,
+            _ => return None,
+        };
+        let empty_overlay = NodeOverlayMap::new();
+        find_child_in_raw(name, raw, &empty_overlay, ctx)
+    }
+
+    /// Find a named child in the RPC/action output, expanding Uses as needed.
+    pub fn find_output_child(&self, name: &str, ctx: &ExpansionCtx<'_>) -> Option<SchemaNode> {
+        let raw = match &self.kind {
+            SchemaNodeKind::Rpc { output, .. } | SchemaNodeKind::Action { output, .. } => output,
+            _ => return None,
+        };
+        let empty_overlay = NodeOverlayMap::new();
+        find_child_in_raw(name, raw, &empty_overlay, ctx)
     }
 
     fn expand_named_io(
