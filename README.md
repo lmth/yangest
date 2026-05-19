@@ -1,9 +1,8 @@
 # yangest
 
 **yangest** is a parallel YANG schema compiler and multi-format converter.
-It accepts the same YANG input as [yanger](https://github.com/mbj4668/yanger),
-supports the same output formats and extension mechanisms, and is intended as a
-compatible companion to it — not a replacement or a fork.
+It is embarrassingly similar to [yanger](https://github.com/mbj4668/yanger), in that it
+supports the same output formats and extension mechanisms.
 
 Where yangest differs is in how it handles large module collections. Rather than
 processing one module at a time (which causes repeated re-parsing of shared
