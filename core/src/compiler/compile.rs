@@ -5,15 +5,17 @@ use std::sync::Arc;
 
 use crate::annindex::{AnnotationIndex, PendingAnnotation};
 use crate::ast::{BuiltInKeyword, ErrorCode, Keyword, Level, ModuleKey, Pos, Stmt, YError};
+use crate::astannindex::AstAnnotationIndex;
 use crate::devindex::{DeviationIndex, PendingDeviation};
 use crate::grammar::GrammarRegistry;
 
 use super::expansion::attach_schema_path;
 use super::{
-    AppliedAnnotations, AppliedDeviations, AugmentEntry, CompiledModule, ExpansionCtx,
-    ExtensionInstance, Feature, Grouping, Identity, IfFeatureExpr, LocalAugmentEntry,
-    ModuleRegistry, MustExpr, NodeOverlay, NodeOverlayMap, OrderedBy, PathStep, PrefixMap,
-    SchemaNode, SchemaNodeKind, SchemaPath, Status, Typedef, UsesOverlay, WhenExpr, YangVersion,
+    AppliedAnnotations, AppliedDeviations, AugmentEntry, CompilationFlags, CompiledModule,
+    ExpansionCtx, ExtensionInstance, Feature, Grouping, Identity, IfFeatureExpr,
+    LocalAugmentEntry, ModuleRegistry, MustExpr, NodeOverlay, NodeOverlayMap, OrderedBy,
+    OverlayKey, PathStep, PrefixMap, SchemaNode, SchemaNodeKind, SchemaPath, Status, Typedef,
+    UsesOverlay, WhenExpr, YangVersion,
 };
 use indexmap::IndexMap;
 
@@ -27,6 +29,14 @@ struct NodeCommon {
     description: Option<String>,
     reference: Option<String>,
     extensions: Vec<ExtensionInstance>,
+    /// True if the `status` statement appears in the substmts before the first
+    /// True if the `status` statement appears before certain vendor-specific meta
+    /// extensions in declaration order. Used by emit plugins for output ordering.
+    status_before_ext_meta: bool,
+    /// True if the `status` statement appears in the substmts before the `units`
+    /// statement. yanger's `get_simple` prepends items, so last-declared item
+    /// appears first: when status is declared before units, units ends up first.
+    units_before_status: bool,
 }
 
 struct IfFeatureParser<'a> {
@@ -63,6 +73,7 @@ pub fn compile_module(
     registry: &ModuleRegistry,
     dev_index: &DeviationIndex,
     ann_index: &AnnotationIndex,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> CompiledModule {
     let mut module_errors = Vec::new();
 
@@ -127,6 +138,7 @@ pub fn compile_module(
         yang_version,
         &prefix,
         &prefix_map,
+        &registry.flags,
         &mut module_errors,
     );
     let mut groupings =
@@ -212,12 +224,14 @@ pub fn compile_module(
             let compiled = compile_schema_children(
                 &body_stmts,
                 key,
+                &grouping.definer_module_name,
                 yang_version,
                 &grouping.def_own_prefix,
                 eff_prefix_map_ref,
                 registry,
                 &groupings,
                 &mut Vec::new(), // ignore grouping-body parse errors here
+                ast_ann_index,
             );
             (name.clone(), Arc::new(compiled))
         })
@@ -226,12 +240,14 @@ pub fn compile_module(
     let mut children = compile_schema_children(
         &stmt.substmts,
         key,
+        key.name.as_str(),
         yang_version,
         &prefix,
         &prefix_map,
         registry,
         &groupings,
         &mut module_errors,
+        ast_ann_index,
     );
 
     let all_augments = collect_augments(
@@ -243,6 +259,7 @@ pub fn compile_module(
         registry,
         &groupings,
         &mut module_errors,
+        ast_ann_index,
     );
 
     // Partition augments into self-augments (targeting own nodes) and external ones.
@@ -274,9 +291,11 @@ pub fn compile_module(
     apply_annotations(
         key,
         &mut children,
+        &mut augments,
         ann_index,
         &mut module_errors,
         &mut overlay,
+        &grouping_children,
     );
 
     // Collect module-level extension instances (direct sub-stmts of the module statement).
@@ -399,6 +418,7 @@ fn collect_typedefs(
     yang_version: YangVersion,
     own_prefix: &str,
     prefix_map: &PrefixMap,
+    flags: &CompilationFlags,
     module_errors: &mut Vec<YError>,
 ) -> IndexMap<String, Typedef> {
     let mut typedefs = IndexMap::new();
@@ -416,6 +436,18 @@ fn collect_typedefs(
             prefix_map,
             module_errors,
         );
+        let opaque_type_name = flags.opaque_type_extension.as_ref().and_then(|(ext_mod, ext_name)| {
+            typedef.substmts.iter().find_map(|sub| match &sub.keyword {
+                Keyword::Extension { module, name }
+                    if module == ext_mod && name == ext_name =>
+                {
+                    sub.arg.clone()
+                }
+                Keyword::ExtensionPrefixed { name, .. } if name == ext_name => sub.arg.clone(),
+                _ => None,
+            })
+        });
+        let has_opaque_type = opaque_type_name.is_some();
         typedefs.insert(
             name.clone(),
             Typedef {
@@ -425,6 +457,23 @@ fn collect_typedefs(
                 default: opt_substmt_arg(typedef, BuiltInKeyword::Default),
                 status: parse_status(typedef, module_errors),
                 description: opt_substmt_arg(typedef, BuiltInKeyword::Description),
+                ext_info: flags.typedef_info_extension.as_ref().and_then(|(ext_mod, ext_name)| {
+                    typedef.substmts.iter().find_map(|sub| {
+                        match &sub.keyword {
+                            Keyword::Extension { module, name }
+                                if module == ext_mod && name == ext_name =>
+                            {
+                                sub.arg.clone()
+                            }
+                            Keyword::ExtensionPrefixed { name, .. } if name == ext_name => {
+                                sub.arg.clone()
+                            }
+                            _ => None,
+                        }
+                    })
+                }),
+                has_opaque_type,
+                opaque_type_name,
             },
         );
     }
@@ -469,6 +518,7 @@ fn collect_groupings_from_stmts<'a>(
                 def_prefix_map: prefix_map.clone(),
                 def_own_prefix: own_prefix.to_string(),
                 definer_module_name: module_name.to_string(),
+                scope_groupings: None,
             },
         );
     }
@@ -575,6 +625,7 @@ fn collect_augments(
     registry: &ModuleRegistry,
     local_groupings: &IndexMap<String, Grouping>,
     module_errors: &mut Vec<YError>,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> Vec<AugmentEntry> {
     let mut augments = Vec::new();
     let ignore_unknown = registry.flags.ignore_unknown_features;
@@ -590,21 +641,35 @@ fn collect_augments(
             continue;
         };
 
-        let nodes = compile_schema_children(
+        let mut nodes = compile_schema_children(
             &augment.substmts,
             key,
+            key.name.as_str(),
             yang_version,
             own_prefix,
             prefix_map,
             registry,
             local_groupings,
             module_errors,
+            ast_ann_index,
         );
+
+        // Apply augment-level status to all compiled nodes (RFC 6020 §7.15):
+        // "This argument defines the status of all definitions added by this augment."
+        let aug_status = augment
+            .get_substmt(BuiltInKeyword::Status)
+            .map(|s| parse_status_arg(s, module_errors))
+            .unwrap_or(Status::Current);
+        if aug_status != Status::Current {
+            for node in &mut nodes {
+                apply_augment_status(node, aug_status);
+            }
+        }
 
         augments.push(AugmentEntry {
             target_path,
             nodes,
-            when: collect_when_exprs(augment, own_prefix, prefix_map, module_errors),
+            when: collect_when_exprs(augment, own_prefix, prefix_map, key.name.as_str(), module_errors),
             if_features: collect_if_features(
                 augment,
                 own_prefix,
@@ -613,6 +678,7 @@ fn collect_augments(
                 module_errors,
                 ignore_unknown,
             ),
+            status: aug_status,
         });
     }
 
@@ -645,12 +711,14 @@ fn inline_augment_into(
 fn compile_schema_children(
     stmts: &[Stmt],
     key: &ModuleKey,
+    source_module_name: &str,
     yang_version: YangVersion,
     own_prefix: &str,
     prefix_map: &PrefixMap,
     registry: &ModuleRegistry,
     local_groupings: &IndexMap<String, Grouping>,
     module_errors: &mut Vec<YError>,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> Vec<SchemaNode> {
     let mut nodes = Vec::new();
 
@@ -674,6 +742,14 @@ fn compile_schema_children(
         merged = {
             let mut m = local_groupings.clone();
             m.extend(inline_groupings);
+            // Store the effective groupings on each inline grouping so that the fallback
+            // expansion path (in expand_uses_lazy) can resolve sibling groupings.
+            let scope_arc = Arc::new(m.clone());
+            for (_, g) in m.iter_mut() {
+                if g.scope_groupings.is_none() {
+                    g.scope_groupings = Some(Arc::clone(&scope_arc));
+                }
+            }
             m
         };
         &merged
@@ -695,12 +771,14 @@ fn compile_schema_children(
                 if let Some(node) = compile_schema_node(
                     stmt,
                     key,
+                    source_module_name,
                     yang_version,
                     own_prefix,
                     prefix_map,
                     registry,
                     effective_groupings,
                     module_errors,
+                    ast_ann_index,
                 ) {
                     nodes.push(node);
                 }
@@ -715,6 +793,7 @@ fn compile_schema_children(
                     registry,
                     effective_groupings,
                     module_errors,
+                    ast_ann_index,
                 ) {
                     nodes.push(node);
                 }
@@ -726,6 +805,71 @@ fn compile_schema_children(
     nodes
 }
 
+/// Collect the statuses of groupings directly referenced by `uses` in a node's children,
+/// following the same recursive behavior as yanger_fxs's `get_simple`/`recurse_grouping`:
+/// when a grouping itself contains `uses` stmts, recurse into those groupings and collect
+/// their statuses too (using the current module's local groupings for resolution).
+fn collect_uses_grouping_statuses(
+    kind: &SchemaNodeKind,
+    local_groupings: &IndexMap<String, Grouping>,
+) -> Vec<Status> {
+    let children = match kind {
+        SchemaNodeKind::Container { children, .. }
+        | SchemaNodeKind::List { children, .. }
+        | SchemaNodeKind::Case { children }
+        | SchemaNodeKind::Notification { children, .. } => children.as_slice(),
+        SchemaNodeKind::Choice { cases, .. } => cases.as_slice(),
+        SchemaNodeKind::Rpc { input, output, .. } | SchemaNodeKind::Action { input, output } => {
+            let mut statuses = Vec::new();
+            for child in input.iter().chain(output.iter()) {
+                if let SchemaNodeKind::Uses { grouping, was_unprefixed, .. } = &child.kind {
+                    if *was_unprefixed {
+                        collect_grouping_uses_statuses(grouping, local_groupings, &mut statuses);
+                    }
+                }
+            }
+            return statuses;
+        }
+        _ => return Vec::new(),
+    };
+    let mut statuses = Vec::new();
+    for child in children.iter() {
+        if let SchemaNodeKind::Uses { grouping, was_unprefixed, .. } = &child.kind {
+            if *was_unprefixed {
+                collect_grouping_uses_statuses(grouping, local_groupings, &mut statuses);
+            }
+        }
+    }
+    statuses
+}
+
+/// Recursively collect non-current statuses from a grouping and any `uses` it contains.
+/// Mirrors yanger_fxs `get_simple` recursion: adds the grouping's own status (if non-current),
+/// then recurses into any prefix-less `uses` stmts within the grouping body.
+fn collect_grouping_uses_statuses(
+    grouping: &Grouping,
+    local_groupings: &IndexMap<String, Grouping>,
+    statuses: &mut Vec<Status>,
+) {
+    if grouping.status != Status::Current {
+        statuses.push(grouping.status);
+    }
+    // Recurse into the grouping's body: find nested uses stmts and collect their statuses.
+    for sub in &grouping.stmt.substmts {
+        if sub.keyword.is_builtin(BuiltInKeyword::Uses) {
+            let uses_arg = sub.arg.as_deref().unwrap_or("");
+            let (prefix, name) = split_prefixed_name(uses_arg);
+            // Only recurse into prefix-less uses (same-module groupings), mirroring yanger's
+            // `recurse_grouping` which skips NCS and cross-module groupings.
+            if prefix.is_none() {
+                if let Some(nested) = local_groupings.get(&name) {
+                    collect_grouping_uses_statuses(nested, local_groupings, statuses);
+                }
+            }
+        }
+    }
+}
+
 fn compile_uses_node(
     uses_stmt: &Stmt,
     key: &ModuleKey,
@@ -735,6 +879,7 @@ fn compile_uses_node(
     registry: &ModuleRegistry,
     local_groupings: &IndexMap<String, Grouping>,
     module_errors: &mut Vec<YError>,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> Option<SchemaNode> {
     let ignore_unknown = registry.flags.ignore_unknown_features;
     let uses_arg = uses_stmt.arg.as_deref().unwrap_or("");
@@ -767,17 +912,19 @@ fn compile_uses_node(
         let nodes = compile_schema_children(
             &augment.substmts,
             key,
+            key.name.as_str(),
             yang_version,
             own_prefix,
             prefix_map,
             registry,
             local_groupings,
             module_errors,
+            ast_ann_index,
         );
         local_augments.push(LocalAugmentEntry {
             target_path: target_path.into_iter().map(|step| step.name).collect(),
             nodes,
-            when: collect_when_exprs(augment, own_prefix, prefix_map, module_errors),
+            when: collect_when_exprs(augment, own_prefix, prefix_map, key.name.as_str(), module_errors),
             if_features: collect_if_features(
                 augment,
                 own_prefix,
@@ -793,8 +940,11 @@ fn compile_uses_node(
         name: "__uses__".to_string(),
         module_name: key.name.clone(),
         module_prefix: own_prefix.to_string(),
+        origin_module: key.name.clone(),
         pos: uses_stmt.pos.clone(),
         status: Status::Current,
+        status_before_ext_meta: false,
+        units_before_status: false,
         config: None,
         when: Vec::new(),
         if_features: Vec::new(),
@@ -804,13 +954,14 @@ fn compile_uses_node(
         kind: SchemaNodeKind::Uses {
             grouping: Arc::new(grouping),
             source_module_name,
+            was_unprefixed: grouping_prefix.is_none(),
             overlay: UsesOverlay {
                 refine_stmts: uses_stmt
                     .get_substmts(BuiltInKeyword::Refine)
                     .cloned()
                     .collect(),
                 local_augments,
-                when: collect_when_exprs(uses_stmt, own_prefix, prefix_map, module_errors),
+                when: collect_when_exprs(uses_stmt, own_prefix, prefix_map, key.name.as_str(), module_errors),
                 if_features: collect_if_features(
                     uses_stmt,
                     own_prefix,
@@ -821,6 +972,7 @@ fn compile_uses_node(
                 ),
             },
         },
+        uses_grouping_statuses: Vec::new(),
         pmap: HashMap::new(),
     })
 }
@@ -828,21 +980,24 @@ fn compile_uses_node(
 fn compile_schema_node(
     stmt: &Stmt,
     key: &ModuleKey,
+    source_module_name: &str,
     yang_version: YangVersion,
     own_prefix: &str,
     prefix_map: &PrefixMap,
     registry: &ModuleRegistry,
     local_groupings: &IndexMap<String, Grouping>,
     module_errors: &mut Vec<YError>,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> Option<SchemaNode> {
     let common = compile_node_common(
         stmt,
         own_prefix,
-        &key.name,
+        source_module_name,
         prefix_map,
         &registry.grammar,
         module_errors,
         registry.flags.ignore_unknown_features,
+        &registry.flags.meta_extensions,
     );
 
     let kind = match builtin_keyword(stmt)? {
@@ -851,14 +1006,16 @@ fn compile_schema_node(
             children: compile_schema_children(
                 &stmt.substmts,
                 key,
+                source_module_name,
                 yang_version,
                 own_prefix,
                 prefix_map,
                 registry,
                 local_groupings,
                 module_errors,
+                ast_ann_index,
             ),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, module_errors),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
         },
         BuiltInKeyword::Leaf => SchemaNodeKind::Leaf {
             type_stmt: compile_type_stmt(stmt, yang_version, own_prefix, prefix_map, module_errors),
@@ -866,7 +1023,7 @@ fn compile_schema_node(
             default: opt_substmt_arg(stmt, BuiltInKeyword::Default),
             mandatory: opt_bool_substmt(stmt, BuiltInKeyword::Mandatory, module_errors)
                 .unwrap_or(false),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, module_errors),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
         },
         BuiltInKeyword::LeafList => SchemaNodeKind::LeafList {
             type_stmt: compile_type_stmt(stmt, yang_version, own_prefix, prefix_map, module_errors),
@@ -879,7 +1036,7 @@ fn compile_schema_node(
                 .unwrap_or(0),
             max_elements: opt_max_elements(stmt, module_errors),
             ordered_by: opt_ordered_by(stmt, module_errors).unwrap_or(OrderedBy::System),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, module_errors),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
         },
         BuiltInKeyword::List => SchemaNodeKind::List {
             key: parse_key_stmt(stmt.get_substmt(BuiltInKeyword::Key)),
@@ -890,18 +1047,20 @@ fn compile_schema_node(
             children: compile_schema_children(
                 &stmt.substmts,
                 key,
+                source_module_name,
                 yang_version,
                 own_prefix,
                 prefix_map,
                 registry,
                 local_groupings,
                 module_errors,
+                ast_ann_index,
             ),
             min_elements: opt_u64_substmt(stmt, BuiltInKeyword::MinElements, module_errors)
                 .unwrap_or(0),
             max_elements: opt_max_elements(stmt, module_errors),
             ordered_by: opt_ordered_by(stmt, module_errors).unwrap_or(OrderedBy::System),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, module_errors),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
         },
         BuiltInKeyword::Choice => SchemaNodeKind::Choice {
             default: opt_substmt_arg(stmt, BuiltInKeyword::Default),
@@ -910,93 +1069,107 @@ fn compile_schema_node(
             cases: compile_choice_cases(
                 stmt,
                 key,
+                source_module_name,
                 yang_version,
                 own_prefix,
                 prefix_map,
                 registry,
                 local_groupings,
                 module_errors,
+                ast_ann_index,
             ),
         },
         BuiltInKeyword::Case => SchemaNodeKind::Case {
             children: compile_schema_children(
                 &stmt.substmts,
                 key,
+                source_module_name,
                 yang_version,
                 own_prefix,
                 prefix_map,
                 registry,
                 local_groupings,
                 module_errors,
+                ast_ann_index,
             ),
         },
         BuiltInKeyword::Rpc => SchemaNodeKind::Rpc {
             input: compile_io_block(
                 stmt.get_substmt(BuiltInKeyword::Input),
                 key,
+                source_module_name,
                 yang_version,
                 own_prefix,
                 prefix_map,
                 registry,
                 local_groupings,
                 module_errors,
+                ast_ann_index,
             ),
             output: compile_io_block(
                 stmt.get_substmt(BuiltInKeyword::Output),
                 key,
+                source_module_name,
                 yang_version,
                 own_prefix,
                 prefix_map,
                 registry,
                 local_groupings,
                 module_errors,
+                ast_ann_index,
             ),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, module_errors),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
         },
         BuiltInKeyword::Action => SchemaNodeKind::Action {
             input: compile_io_block(
                 stmt.get_substmt(BuiltInKeyword::Input),
                 key,
+                source_module_name,
                 yang_version,
                 own_prefix,
                 prefix_map,
                 registry,
                 local_groupings,
                 module_errors,
+                ast_ann_index,
             ),
             output: compile_io_block(
                 stmt.get_substmt(BuiltInKeyword::Output),
                 key,
+                source_module_name,
                 yang_version,
                 own_prefix,
                 prefix_map,
                 registry,
                 local_groupings,
                 module_errors,
+                ast_ann_index,
             ),
         },
         BuiltInKeyword::Notification => SchemaNodeKind::Notification {
             children: compile_schema_children(
                 &stmt.substmts,
                 key,
+                source_module_name,
                 yang_version,
                 own_prefix,
                 prefix_map,
                 registry,
                 local_groupings,
                 module_errors,
+                ast_ann_index,
             ),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, module_errors),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
         },
         BuiltInKeyword::AnyXml => SchemaNodeKind::AnyXml {
             mandatory: opt_bool_substmt(stmt, BuiltInKeyword::Mandatory, module_errors)
                 .unwrap_or(false),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, module_errors),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
         },
         BuiltInKeyword::AnyData => SchemaNodeKind::AnyData {
             mandatory: opt_bool_substmt(stmt, BuiltInKeyword::Mandatory, module_errors)
                 .unwrap_or(false),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, module_errors),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
         },
         _ => return None,
     };
@@ -1005,14 +1178,18 @@ fn compile_schema_node(
         name: common.name,
         module_name: key.name.clone(),
         module_prefix: own_prefix.to_string(),
+        origin_module: source_module_name.to_string(),
         pos: common.pos,
         status: common.status,
+        status_before_ext_meta: common.status_before_ext_meta,
+        units_before_status: common.units_before_status,
         config: common.config,
         when: common.when,
         if_features: common.if_features,
         description: common.description,
         reference: common.reference,
         extensions: common.extensions,
+        uses_grouping_statuses: collect_uses_grouping_statuses(&kind, local_groupings),
         kind,
         pmap: HashMap::new(),
     })
@@ -1021,12 +1198,14 @@ fn compile_schema_node(
 fn compile_choice_cases(
     stmt: &Stmt,
     key: &ModuleKey,
+    source_module_name: &str,
     yang_version: YangVersion,
     own_prefix: &str,
     prefix_map: &PrefixMap,
     registry: &ModuleRegistry,
     local_groupings: &IndexMap<String, Grouping>,
     module_errors: &mut Vec<YError>,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> Vec<SchemaNode> {
     let mut cases = Vec::new();
 
@@ -1036,12 +1215,14 @@ fn compile_choice_cases(
                 if let Some(case_node) = compile_schema_node(
                     sub,
                     key,
+                    source_module_name,
                     yang_version,
                     own_prefix,
                     prefix_map,
                     registry,
                     local_groupings,
                     module_errors,
+                    ast_ann_index,
                 ) {
                     cases.push(case_node);
                 }
@@ -1064,18 +1245,21 @@ fn compile_choice_cases(
                         registry,
                         local_groupings,
                         module_errors,
+                        ast_ann_index,
                     )
                     .into_iter()
                     .collect(),
                     _ => compile_schema_node(
                         sub,
                         key,
+                        source_module_name,
                         yang_version,
                         own_prefix,
                         prefix_map,
                         registry,
                         local_groupings,
                         module_errors,
+                        ast_ann_index,
                     )
                     .into_iter()
                     .collect(),
@@ -1086,8 +1270,11 @@ fn compile_choice_cases(
                     name: case_name,
                     module_name: key.name.clone(),
                     module_prefix: own_prefix.to_string(),
+                    origin_module: source_module_name.to_string(),
                     pos: sub.pos.clone(),
                     status: Status::Current,
+                    status_before_ext_meta: false,
+                    units_before_status: false,
                     config: None,
                     when: Vec::new(),
                     if_features: Vec::new(),
@@ -1095,6 +1282,7 @@ fn compile_choice_cases(
                     reference: None,
                     extensions: Vec::new(),
                     kind: SchemaNodeKind::Case { children },
+                    uses_grouping_statuses: Vec::new(),
                     pmap: HashMap::new(),
                 });
             }
@@ -1108,23 +1296,27 @@ fn compile_choice_cases(
 fn compile_io_block(
     stmt: Option<&Stmt>,
     key: &ModuleKey,
+    source_module_name: &str,
     yang_version: YangVersion,
     own_prefix: &str,
     prefix_map: &PrefixMap,
     registry: &ModuleRegistry,
     local_groupings: &IndexMap<String, Grouping>,
     module_errors: &mut Vec<YError>,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> Vec<SchemaNode> {
     stmt.map(|io| {
         compile_schema_children(
             &io.substmts,
             key,
+            source_module_name,
             yang_version,
             own_prefix,
             prefix_map,
             registry,
             local_groupings,
             module_errors,
+            ast_ann_index,
         )
     })
     .unwrap_or_default()
@@ -1133,11 +1325,12 @@ fn compile_io_block(
 fn compile_node_common(
     stmt: &Stmt,
     own_prefix: &str,
-    own_module_name: &str,
+    source_module_name: &str,
     prefix_map: &PrefixMap,
     grammar: &GrammarRegistry,
     module_errors: &mut Vec<YError>,
     ignore_unknown: bool,
+    meta_extensions: &[(String, String)],
 ) -> NodeCommon {
     let extensions =
         collect_extension_instances(stmt, own_prefix, prefix_map, grammar, module_errors);
@@ -1146,11 +1339,11 @@ fn compile_node_common(
         pos: stmt.pos.clone(),
         status: parse_status(stmt, module_errors),
         config: opt_bool_substmt(stmt, BuiltInKeyword::Config, module_errors),
-        when: collect_when_exprs(stmt, own_prefix, prefix_map, module_errors),
+        when: collect_when_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors),
         if_features: collect_if_features(
             stmt,
             own_prefix,
-            own_module_name,
+            source_module_name,
             prefix_map,
             module_errors,
             ignore_unknown,
@@ -1158,10 +1351,89 @@ fn compile_node_common(
         description: opt_substmt_arg(stmt, BuiltInKeyword::Description),
         reference: opt_substmt_arg(stmt, BuiltInKeyword::Reference),
         extensions,
+        status_before_ext_meta: compute_status_before_ext_meta(stmt, own_prefix, prefix_map, meta_extensions),
+        units_before_status: compute_units_before_status(stmt),
     }
 }
 
-/// Collect and validate extension sub-statements from `stmt` into `ExtensionInstance` values.
+/// Return `true` if the `status` statement appears in `stmt`'s substmts before the first
+/// occurrence of any extension listed in `meta_extensions`. Emit plugins use this to
+/// determine output ordering when a prepend-based strategy is employed.
+fn compute_status_before_ext_meta(
+    stmt: &Stmt,
+    own_prefix: &str,
+    prefix_map: &PrefixMap,
+    meta_extensions: &[(String, String)],
+) -> bool {
+    if meta_extensions.is_empty() {
+        return false;
+    }
+    let mut status_idx: Option<usize> = None;
+    let mut first_meta_idx: Option<usize> = None;
+    for (i, sub) in stmt.substmts.iter().enumerate() {
+        match &sub.keyword {
+            Keyword::BuiltIn(BuiltInKeyword::Status) => {
+                if status_idx.is_none() {
+                    status_idx = Some(i);
+                }
+            }
+            Keyword::ExtensionPrefixed { prefix, name } => {
+                let mod_name = if prefix == own_prefix {
+                    prefix.as_str()
+                } else {
+                    prefix_map.get(prefix.as_str()).map(|s| s.as_str()).unwrap_or(prefix.as_str())
+                };
+                if meta_extensions.iter().any(|(m, n)| m == mod_name && n == name)
+                    && first_meta_idx.is_none()
+                {
+                    first_meta_idx = Some(i);
+                }
+            }
+            Keyword::Extension { module, name } => {
+                if meta_extensions.iter().any(|(m, n)| m == module && n == name)
+                    && first_meta_idx.is_none()
+                {
+                    first_meta_idx = Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    match (status_idx, first_meta_idx) {
+        (Some(s), Some(m)) => s < m,
+        _ => false,
+    }
+}
+
+/// Returns true if the `status` statement is declared before the `units` statement
+/// in `stmt`'s substmts.  yanger_fxs processes substmts in declaration order using
+/// prepend (cons), so last-declared items end up first in the output CsExtra list.
+/// When status is declared before units, units ends up first in the output.
+fn compute_units_before_status(stmt: &Stmt) -> bool {
+    let mut status_idx: Option<usize> = None;
+    let mut units_idx: Option<usize> = None;
+    for (i, sub) in stmt.substmts.iter().enumerate() {
+        match &sub.keyword {
+            Keyword::BuiltIn(BuiltInKeyword::Status) => {
+                if status_idx.is_none() {
+                    status_idx = Some(i);
+                }
+            }
+            Keyword::BuiltIn(BuiltInKeyword::Units) => {
+                if units_idx.is_none() {
+                    units_idx = Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    match (status_idx, units_idx) {
+        (Some(s), Some(u)) => s < u, // status declared first → units first in reversed output
+        _ => false, // no status or no units → ordering doesn't matter
+    }
+}
+
+
 ///
 /// Each sub-statement whose keyword is an extension (prefixed or resolved) is resolved to its
 /// module name via `prefix_map` and stored as an `ExtensionInstance`.  If the extension has a
@@ -1206,6 +1478,7 @@ fn collect_extension_instances(
             name,
             arg: sub.arg.clone(),
             substmts: sub.substmts.clone(),
+            pos: sub.pos.clone(),
         });
     }
 
@@ -1392,6 +1665,7 @@ fn collect_module_extensions(
             name,
             arg: sub.arg.clone(),
             substmts: sub.substmts.clone(),
+            pos: sub.pos.clone(),
         });
     }
 
@@ -1657,10 +1931,11 @@ fn collect_when_exprs(
     stmt: &Stmt,
     own_prefix: &str,
     prefix_map: &PrefixMap,
+    source_module_name: &str,
     module_errors: &mut Vec<YError>,
 ) -> Vec<WhenExpr> {
     stmt.get_substmts(BuiltInKeyword::When)
-        .map(|when| compile_when_expr(when, own_prefix, prefix_map, module_errors))
+        .map(|when| compile_when_expr(when, own_prefix, prefix_map, source_module_name, module_errors))
         .collect()
 }
 
@@ -1668,6 +1943,7 @@ fn compile_when_expr(
     stmt: &Stmt,
     own_prefix: &str,
     prefix_map: &PrefixMap,
+    source_module_name: &str,
     module_errors: &mut Vec<YError>,
 ) -> WhenExpr {
     let xpath = stmt.arg.clone().unwrap_or_default();
@@ -1676,6 +1952,9 @@ fn compile_when_expr(
         xpath,
         description: opt_substmt_arg(stmt, BuiltInKeyword::Description),
         reference: opt_substmt_arg(stmt, BuiltInKeyword::Reference),
+        source_module: source_module_name.to_string(),
+        source_revision: None,
+        non_local: false,
     }
 }
 
@@ -1683,10 +1962,12 @@ fn collect_must_exprs(
     stmt: &Stmt,
     own_prefix: &str,
     prefix_map: &PrefixMap,
+    source_module_name: &str,
     module_errors: &mut Vec<YError>,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> Vec<MustExpr> {
     stmt.get_substmts(BuiltInKeyword::Must)
-        .map(|must| compile_must_expr(must, own_prefix, prefix_map, module_errors))
+        .map(|must| compile_must_expr(must, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index))
         .collect()
 }
 
@@ -1694,15 +1975,47 @@ fn compile_must_expr(
     stmt: &Stmt,
     own_prefix: &str,
     prefix_map: &PrefixMap,
+    source_module_name: &str,
     module_errors: &mut Vec<YError>,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> MustExpr {
     let xpath = stmt.arg.clone().unwrap_or_default();
     validate_xpath(&xpath, own_prefix, prefix_map, &stmt.pos, module_errors);
+    // Check if this must statement was injected from an annotation module (annotate-module +
+    // annotate-statement). If so, the stmt's source file differs from the target module file,
+    // and ast_ann_index.module_key_for_file() returns the annotation module's key.
+    let (source_module, source_revision) =
+        match ast_ann_index.module_key_for_file(stmt.pos.orig_file()) {
+            Some(ann_key) => (ann_key.name.clone(), ann_key.revision.clone()),
+            None => (source_module_name.to_string(), None),
+        };
+    // Collect explicit `tailf:dependency` sub-statements. These provide explicit dependency
+    // paths that are merged with the XPath-derived deps (or replace them when
+    // `tailf:override-auto-dependencies` is also present).
+    let explicit_deps: Vec<String> = stmt
+        .substmts
+        .iter()
+        .filter(|sub| {
+            resolve_kw(&sub.keyword, own_prefix, source_module_name, prefix_map)
+                .map(|(_, name)| name == "dependency")
+                .unwrap_or(false)
+        })
+        .filter_map(|sub| sub.arg.clone())
+        .collect();
+    let override_auto_deps = stmt.substmts.iter().any(|sub| {
+        resolve_kw(&sub.keyword, own_prefix, source_module_name, prefix_map)
+            .map(|(_, name)| name == "override-auto-dependencies")
+            .unwrap_or(false)
+    });
     MustExpr {
         xpath,
         error_message: opt_substmt_arg(stmt, BuiltInKeyword::ErrorMessage),
         error_app_tag: opt_substmt_arg(stmt, BuiltInKeyword::ErrorAppTag),
         description: opt_substmt_arg(stmt, BuiltInKeyword::Description),
+        source_module,
+        source_revision,
+        explicit_deps,
+        override_auto_deps,
     }
 }
 
@@ -1740,6 +2053,7 @@ pub fn expand_children(
             SchemaNodeKind::Uses {
                 grouping,
                 source_module_name,
+                was_unprefixed: _,
                 overlay: uses_overlay,
             } => {
                 let expanded = expand_uses_lazy(
@@ -1761,8 +2075,8 @@ pub fn expand_children(
                 ));
             }
             _ => {
-                if !ctx.has_any_overlay {
-                    // Fast path: no overlay anywhere — skip per-node path allocation,
+                if !ctx.has_any_overlay || overlay.is_empty() {
+                    // Fast path: no overlay applicable — skip per-node path allocation,
                     // overlay lookup, and schema_path pmap insert.
                     let materialized = node.clone();
                     if node_visible(&materialized, ctx) {
@@ -1770,14 +2084,16 @@ pub fn expand_children(
                     }
                 } else {
                     let mut materialized = node.clone();
-                    let node_path =
-                        child_path(parent_path, &materialized.module_prefix, &materialized.name);
-                    if !apply_overlay_entry(&mut materialized, overlay.get(&node_path)) {
+                    let overlay_key =
+                        child_overlay_key(parent_path, &materialized.name);
+                    if !apply_overlay_entry(&mut materialized, overlay.get(&overlay_key)) {
                         continue;
                     }
                     if !node_visible(&materialized, ctx) {
                         continue;
                     }
+                    let node_path =
+                        child_path(parent_path, &materialized.module_prefix, &materialized.name);
                     attach_schema_path(&mut materialized, node_path);
                     result.push(materialized);
                 }
@@ -1787,6 +2103,140 @@ pub fn expand_children(
     result
 }
 
+/// Like [`expand_children`] but skips the if-feature visibility check, including
+/// feature-gated nodes in the result.  Used for collecting enum types from all nodes
+/// (matching yanger_fxs's `add_enumeration_types` which walks the full #sn{} tree
+/// regardless of if-feature state).
+pub fn expand_children_all(
+    raw: &[SchemaNode],
+    overlay: &NodeOverlayMap,
+    ctx: &ExpansionCtx<'_>,
+) -> Vec<SchemaNode> {
+    let mut result = Vec::with_capacity(raw.len());
+    for node in raw {
+        match &node.kind {
+            SchemaNodeKind::Uses {
+                grouping,
+                source_module_name,
+                was_unprefixed: _,
+                overlay: uses_overlay,
+            } => {
+                let expanded = expand_uses_lazy(
+                    grouping,
+                    source_module_name.as_deref(),
+                    uses_overlay,
+                    &node.module_prefix,
+                    &node.module_name,
+                    overlay,
+                    ctx,
+                );
+                result.extend(expand_children_all(&expanded, overlay, ctx));
+            }
+            _ => {
+                // Include the node regardless of if-feature evaluation.
+                // Nodes with `not-supported` deviations are still excluded.
+                let mut materialized = node.clone();
+                if ctx.has_any_overlay && !overlay.is_empty() {
+                    let overlay_key = child_overlay_key(&[], &materialized.name);
+                    if !apply_overlay_entry(&mut materialized, overlay.get(&overlay_key)) {
+                        continue;
+                    }
+                }
+                result.push(materialized);
+            }
+        }
+    }
+    result
+}
+
+/// Like [`expand_children`] but also collects all nodes (including feature-gated ones)
+/// in a single pass.  Returns `(enabled, all)` where `enabled` is filtered by if-feature
+/// visibility and `all` includes every non-`not-supported` node regardless of if-features.
+///
+/// Use this in place of calling `expand_children` + `expand_children_all` separately to
+/// avoid expanding Uses groupings twice (even if cached, the node cloning is repeated).
+pub fn expand_children_and_all(
+    raw: &[SchemaNode],
+    own_prefix: &str,
+    module_name: &str,
+    overlay: &NodeOverlayMap,
+    parent_path: &[PathStep],
+    ctx: &ExpansionCtx<'_>,
+) -> (Vec<SchemaNode>, Vec<SchemaNode>) {
+    let _ = (own_prefix, module_name);
+    let mut enabled: Vec<SchemaNode> = Vec::with_capacity(raw.len());
+    let mut all: Vec<SchemaNode> = Vec::with_capacity(raw.len());
+    for node in raw {
+        match &node.kind {
+            SchemaNodeKind::Uses {
+                grouping,
+                source_module_name,
+                was_unprefixed: _,
+                overlay: uses_overlay,
+            } => {
+                let expanded = expand_uses_lazy(
+                    grouping,
+                    source_module_name.as_deref(),
+                    uses_overlay,
+                    &node.module_prefix,
+                    &node.module_name,
+                    overlay,
+                    ctx,
+                );
+                let (mut sub_enabled, mut sub_all) = expand_children_and_all(
+                    &expanded,
+                    &node.module_prefix,
+                    &node.module_name,
+                    overlay,
+                    parent_path,
+                    ctx,
+                );
+                enabled.append(&mut sub_enabled);
+                all.append(&mut sub_all);
+            }
+            _ => {
+                if !ctx.has_any_overlay || overlay.is_empty() {
+                    // Fast path: no overlay — clone once, push to both if visible.
+                    let materialized = node.clone();
+                    if node_visible(&materialized, ctx) {
+                        // Clone a second time for `all` only when the node is visible
+                        // (in the common case where all features are enabled, this is
+                        // always true and we avoid a second clone for invisible nodes).
+                        all.push(materialized.clone());
+                        enabled.push(materialized);
+                    } else {
+                        // Feature-gated: goes to `all` only.
+                        all.push(materialized);
+                    }
+                } else {
+                    let mut materialized = node.clone();
+                    let overlay_key = child_overlay_key(parent_path, &materialized.name);
+                    if !apply_overlay_entry(&mut materialized, overlay.get(&overlay_key)) {
+                        // `not-supported` deviated — exclude from both.
+                        continue;
+                    }
+                    if node_visible(&materialized, ctx) {
+                        let node_path =
+                            child_path(parent_path, &materialized.module_prefix, &materialized.name);
+                        attach_schema_path(&mut materialized, node_path.clone());
+                        // pmap is wiped by clone(), so re-attach the schema_path to the clone
+                        // going into `all`. Nodes in `all` are iterated by collect_types_forward
+                        // via all_children() and need the path for deviation overlay lookups.
+                        let mut for_all = materialized.clone();
+                        attach_schema_path(&mut for_all, node_path);
+                        all.push(for_all);
+                        enabled.push(materialized);
+                    } else {
+                        // Feature-gated: still in `all` but not in `enabled`.
+                        all.push(materialized);
+                    }
+                }
+            }
+        }
+    }
+    (enabled, all)
+}
+
 fn child_path(parent_path: &[PathStep], module_prefix: &str, name: &str) -> SchemaPath {
     let mut path = parent_path.to_vec();
     path.push(PathStep {
@@ -1794,6 +2244,16 @@ fn child_path(parent_path: &[PathStep], module_prefix: &str, name: &str) -> Sche
         name: name.to_string(),
     });
     path
+}
+
+/// Build a name-only overlay key for looking up deviations/annotations.
+/// Prefixes are omitted so that nodes from expanded groupings (which may retain
+/// their source module's prefix) still match deviation paths that use the
+/// importing module's prefix.
+fn child_overlay_key(parent_key: &[PathStep], name: &str) -> OverlayKey {
+    let mut key: OverlayKey = parent_key.iter().map(|s| s.name.clone()).collect();
+    key.push(name.to_string());
+    key
 }
 
 /// Find a named child in a raw node list with early termination, expanding
@@ -1812,7 +2272,7 @@ pub fn find_child_in_raw(
     let empty_overlay = NodeOverlayMap::new();
     for node in raw {
         match &node.kind {
-            SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay } => {
+            SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay, was_unprefixed: _ } => {
                 let expanded = expand_uses_lazy(
                     grouping,
                     source_module_name.as_deref(),
@@ -1836,6 +2296,238 @@ pub fn find_child_in_raw(
     None
 }
 
+/// Walk a YANG path through a node-slice without ever cloning intermediate nodes.
+///
+/// For each step in `path`, finds the matching child by name (expanding `Uses`
+/// lazily via the ctx cache but keeping the Arc alive on the call stack so no
+/// `SchemaNode` clone is needed).  When the final step is found the closure
+/// `f` is called with a reference to that terminal node; the closure's return
+/// value is propagated back.
+///
+/// Returns `None` only when a path step is not found.
+///
+/// This is the performance-critical alternative to calling `find_child_in_raw`
+/// step-by-step (which clones every intermediate node, potentially deep-cloning
+/// subtrees with thousands of fully-expanded descendants).
+pub fn walk_path_no_clone<R>(
+    path: &[PathStep],
+    raw: &[SchemaNode],
+    ctx: &ExpansionCtx<'_>,
+    f: &impl Fn(&SchemaNode) -> R,
+) -> Option<R> {
+    let Some(first) = path.first() else { return None };
+    let rest = &path[1..];
+    let empty_overlay = NodeOverlayMap::new();
+
+    for node in raw {
+        match &node.kind {
+            SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay, was_unprefixed: _ } => {
+                let expanded = expand_uses_lazy(
+                    grouping,
+                    source_module_name.as_deref(),
+                    uses_overlay,
+                    &node.module_prefix,
+                    &node.module_name,
+                    &empty_overlay,
+                    ctx,
+                );
+                // Arc kept alive on the call stack — no clone needed.
+                if let Some(r) = walk_path_no_clone(path, &expanded, ctx, f) {
+                    return Some(r);
+                }
+            }
+            _ => {
+                if node.name == first.name && node_visible(node, ctx) {
+                    if rest.is_empty() {
+                        return Some(f(node));
+                    }
+                    // Recurse into this node's raw children.
+                    if let Some(children) = raw_children_of_kind(&node.kind) {
+                        return walk_path_no_clone(rest, children, ctx, f);
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Returns the raw child slice for a schema node kind, or `None` for leaf/leaf-list/rpc-io/anyxml/anydata.
+pub fn raw_children_of_kind(kind: &SchemaNodeKind) -> Option<&[SchemaNode]> {
+    match kind {
+        SchemaNodeKind::Container { children, .. }
+        | SchemaNodeKind::Case { children, .. }
+        | SchemaNodeKind::Notification { children, .. } => Some(children),
+        SchemaNodeKind::Choice { cases, .. } => Some(cases),
+        SchemaNodeKind::List { children, .. } => Some(children),
+        _ => None,
+    }
+}
+
+/// Like [`walk_path_no_clone`], but the closure `f` is also given the `raw`
+/// slice that contains the terminal node (i.e., the terminal node's siblings).
+/// This allows the caller to do further relative navigation from the parent.
+pub fn walk_path_with_siblings<R>(
+    path: &[PathStep],
+    raw: &[SchemaNode],
+    ctx: &ExpansionCtx<'_>,
+    f: &impl Fn(&SchemaNode, &[SchemaNode]) -> R,
+) -> Option<R> {
+    let Some(first) = path.first() else { return None };
+    let rest = &path[1..];
+    let empty_overlay = NodeOverlayMap::new();
+
+    for node in raw {
+        match &node.kind {
+            SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay, was_unprefixed: _ } => {
+                let expanded = expand_uses_lazy(
+                    grouping,
+                    source_module_name.as_deref(),
+                    uses_overlay,
+                    &node.module_prefix,
+                    &node.module_name,
+                    &empty_overlay,
+                    ctx,
+                );
+                if let Some(r) = walk_path_with_siblings(path, &expanded, ctx, f) {
+                    return Some(r);
+                }
+            }
+            _ => {
+                if node.name == first.name && node_visible(node, ctx) {
+                    if rest.is_empty() {
+                        return Some(f(node, raw));
+                    }
+                    if let Some(children) = raw_children_of_kind(&node.kind) {
+                        return walk_path_with_siblings(rest, children, ctx, f);
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Walk a YANG path, folding a `Copy` accumulator over every matched node
+/// without ever cloning any `SchemaNode`.
+///
+/// Like [`walk_path_no_clone`], but the closure `f` is called for **each**
+/// matched step (not only the terminal), allowing the caller to accumulate
+/// per-step information (e.g., the last-explicit `config` value along a path).
+///
+/// `f(acc, node)` is called with the current accumulator and the matched
+/// node reference; the returned value becomes the new accumulator.
+///
+/// Returns `None` only if a path step is not found.
+pub fn fold_path_no_clone<S, F>(
+    path: &[PathStep],
+    raw: &[SchemaNode],
+    ctx: &ExpansionCtx<'_>,
+    init: S,
+    f: &F,
+) -> Option<S>
+where
+    S: Copy,
+    F: Fn(S, &SchemaNode) -> S,
+{
+    let Some(first) = path.first() else { return Some(init) };
+    let rest = &path[1..];
+    let empty_overlay = NodeOverlayMap::new();
+
+    for node in raw {
+        match &node.kind {
+            SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay, was_unprefixed: _ } => {
+                let expanded = expand_uses_lazy(
+                    grouping,
+                    source_module_name.as_deref(),
+                    uses_overlay,
+                    &node.module_prefix,
+                    &node.module_name,
+                    &empty_overlay,
+                    ctx,
+                );
+                // Arc kept alive on the call stack — no SchemaNode clone needed.
+                if let Some(r) = fold_path_no_clone(path, &expanded, ctx, init, f) {
+                    return Some(r);
+                }
+            }
+            _ => {
+                if node.name == first.name && node_visible(node, ctx) {
+                    let new_acc = f(init, node);
+                    if rest.is_empty() {
+                        return Some(new_acc);
+                    }
+                    if let Some(children) = raw_children_of_kind(&node.kind) {
+                        return fold_path_no_clone(rest, children, ctx, new_acc, f);
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+
+
+/// Walk a YANG path through raw schema nodes, collecting every intermediate
+/// node (all matched steps except the terminal) as owned clones.
+///
+/// Returns `Some((terminal_clone, intermediates))` where:
+/// - `terminal_clone` is an owned clone of the terminal node, and
+/// - `intermediates` is a `Vec<SchemaNode>` of clones of all nodes visited
+///   before the terminal, in root-to-parent order (the parent is last).
+///
+/// Returns `None` if any step in the path cannot be found.
+///
+/// Handles `Uses` expansion transparently (same as `walk_path_with_siblings`).
+pub fn walk_path_collecting_intermediates(
+    path: &[PathStep],
+    raw: &[SchemaNode],
+    ctx: &ExpansionCtx<'_>,
+) -> Option<(SchemaNode, Vec<SchemaNode>)> {
+    if path.is_empty() {
+        return None;
+    }
+    let first = &path[0];
+    let rest = &path[1..];
+    let empty_overlay = NodeOverlayMap::new();
+
+    for node in raw {
+        match &node.kind {
+            SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay, was_unprefixed: _ } => {
+                let expanded = expand_uses_lazy(
+                    grouping,
+                    source_module_name.as_deref(),
+                    uses_overlay,
+                    &node.module_prefix,
+                    &node.module_name,
+                    &empty_overlay,
+                    ctx,
+                );
+                if let Some(r) = walk_path_collecting_intermediates(path, &expanded, ctx) {
+                    return Some(r);
+                }
+            }
+            _ => {
+                if node.name == first.name && node_visible(node, ctx) {
+                    if rest.is_empty() {
+                        return Some((node.clone(), vec![]));
+                    }
+                    if let Some(children) = raw_children_of_kind(&node.kind) {
+                        let (terminal, mut intermediates) =
+                            walk_path_collecting_intermediates(rest, children, ctx)?;
+                        intermediates.insert(0, node.clone());
+                        return Some((terminal, intermediates));
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
 
 fn node_visible(node: &SchemaNode, ctx: &ExpansionCtx<'_>) -> bool {
     if let Some(max_status) = ctx.max_status {
@@ -1867,30 +2559,92 @@ fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> 
                 node,
                 &deviate.substmts,
                 MutationMode::Add,
+                overlay.source_module.as_deref().unwrap_or(""),
+                None,
                 &mut ignored_errors,
             ),
             Some("replace") => apply_node_mutation(
                 node,
                 &deviate.substmts,
                 MutationMode::Replace,
+                overlay.source_module.as_deref().unwrap_or(""),
+                None,
                 &mut ignored_errors,
             ),
             Some("delete") => apply_node_mutation(
                 node,
                 &deviate.substmts,
                 MutationMode::Delete,
+                overlay.source_module.as_deref().unwrap_or(""),
+                None,
                 &mut ignored_errors,
             ),
             _ => {}
         }
     }
 
-    // Inject annotation extension instances into the node.
+    // Inject annotation extension instances and apply when/must from annotations.
     for ann in &overlay.annotations {
         node.extensions.extend(ann.instances.iter().cloned());
+        let source = ann.source_module.as_str();
+        let source_rev = ann.source_revision.clone();
+        for when in &ann.when_stmts {
+            mutate_when_exprs(&mut node.when, when, MutationMode::Add, source, source_rev.clone());
+        }
+        match &mut node.kind {
+            SchemaNodeKind::Container { musts, .. }
+            | SchemaNodeKind::Leaf { musts, .. }
+            | SchemaNodeKind::LeafList { musts, .. }
+            | SchemaNodeKind::List { musts, .. }
+            | SchemaNodeKind::Rpc { musts, .. }
+            | SchemaNodeKind::Notification { musts, .. }
+            | SchemaNodeKind::AnyXml { musts, .. }
+            | SchemaNodeKind::AnyData { musts, .. } => {
+                for must in &ann.must_stmts {
+                    mutate_must_exprs(musts, must, MutationMode::Add, source, source_rev.clone());
+                }
+            }
+            _ => {}
+        }
     }
 
     true
+}
+
+/// Recursively set `scope_groupings` on any Uses node's grouping that doesn't already have it.
+/// This ensures nested grouping references can resolve sibling groupings transitively.
+/// Old Arcs are collected in `keepalive` to prevent memory address reuse which would corrupt
+/// the pointer-based expansion cache.
+fn propagate_scope_groupings(
+    nodes: &mut [SchemaNode],
+    scope: &Arc<IndexMap<String, Grouping>>,
+) {
+    for node in nodes.iter_mut() {
+        match &mut node.kind {
+            SchemaNodeKind::Uses { grouping, .. } => {
+                if grouping.scope_groupings.is_none() {
+                    let mut g = (**grouping).clone();
+                    g.scope_groupings = Some(Arc::clone(scope));
+                    *grouping = Arc::new(g);
+                }
+            }
+            SchemaNodeKind::Container { children, .. }
+            | SchemaNodeKind::List { children, .. }
+            | SchemaNodeKind::Case { children }
+            | SchemaNodeKind::Notification { children, .. } => {
+                propagate_scope_groupings(children, scope);
+            }
+            SchemaNodeKind::Choice { cases, .. } => {
+                propagate_scope_groupings(cases, scope);
+            }
+            SchemaNodeKind::Rpc { input, output, .. }
+            | SchemaNodeKind::Action { input, output } => {
+                propagate_scope_groupings(input, scope);
+                propagate_scope_groupings(output, scope);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn fully_expand_nodes(
@@ -1907,6 +2661,7 @@ fn fully_expand_nodes(
             SchemaNodeKind::Uses {
                 grouping,
                 source_module_name,
+                was_unprefixed: _,
                 overlay: uses_overlay,
             } => {
                 let expanded = expand_uses_lazy(
@@ -1971,17 +2726,23 @@ fn expand_uses_lazy(
 ) -> Arc<Vec<SchemaNode>> {
     let grouping_ptr = Arc::as_ptr(grouping);
 
-    // Fast path: if the cache has a hit AND no mutations are needed (empty overlay and all
-    // features enabled), return the Arc directly — zero Vec cloning.
+    // Fast path: if the cache has a hit AND no overlay mutations are needed,
+    // return the Arc directly — zero Vec cloning.
+    // The cached Arc was built with the SAME ExpansionCtx (same feature set, same max_status),
+    // so it is already correctly feature-filtered for this call.
+    // We only need to clone when uses_overlay carries refinements/augments/when/if-feature
+    // that must be applied on top of the cached base.
     if let Some(cached_arc) = ctx.cache_get(grouping_ptr, own_prefix) {
-        if uses_overlay.is_empty() && ctx.enabled_features.is_empty() {
+        if uses_overlay.is_empty() {
             return cached_arc;
         }
-        // Mutations needed: fall through to apply them on a cloned Vec.
+        // Overlay mutations needed: clone and apply them.
         let mut nodes: Vec<SchemaNode> = (*cached_arc).clone();
         let mut ignored_errors = Vec::new();
+        let using_module = ctx.registry.resolve_import(module_name, None);
+        let prefix_ctx = using_module.as_ref().map(|m| (own_prefix, &m.prefix_map));
         for refine in &uses_overlay.refine_stmts {
-            apply_refine_stmt(refine, &mut nodes, &mut ignored_errors);
+            apply_refine_stmt(refine, &mut nodes, module_name, prefix_ctx, &mut ignored_errors);
         }
         for augment in &uses_overlay.local_augments {
             apply_local_augment_entry(augment, &mut nodes, ctx);
@@ -2031,9 +2792,13 @@ fn expand_uses_lazy(
             .map(|m| m.key.clone())
             .unwrap_or_else(|| ModuleKey::latest(module_name));
         let empty_groupings = IndexMap::new();
-        let eff_groupings_ref = source_module
-            .as_ref()
-            .map(|m| m.groupings.as_ref())
+        // If the grouping carries scope_groupings (populated for nested/inline groupings),
+        // use those — they include both module-level and sibling groupings visible at the
+        // definition site. Otherwise fall back to module-level groupings only.
+        let eff_groupings_ref = grouping
+            .scope_groupings
+            .as_deref()
+            .or_else(|| source_module.as_ref().map(|m| m.groupings.as_ref()))
             .or_else(|| current_module.as_ref().map(|m| m.groupings.as_ref()))
             .unwrap_or(&empty_groupings);
         let definer_module_name = source_module_name.unwrap_or(module_name).to_string();
@@ -2057,6 +2822,7 @@ fn expand_uses_lazy(
         let mut nodes = compile_schema_children(
             &instantiated_children,
             &current_key,
+            source_module_name.unwrap_or(module_name),
             current_module
                 .as_ref()
                 .map(|m| m.yang_version)
@@ -2066,7 +2832,16 @@ fn expand_uses_lazy(
             ctx.registry,
             eff_groupings_ref,
             &mut ignored_errors,
+            // Inline groupings within grouping bodies are not affected by AST-level
+            // annotation injection (annotate-module targets module-level groupings).
+            &AstAnnotationIndex::default(),
         );
+        // Propagate scope_groupings to inner Uses nodes so that transitive
+        // nested grouping references can resolve siblings (e.g., vrf-engine-id
+        // referencing engine-id-group when both are nested siblings).
+        if let Some(ref scope) = grouping.scope_groupings {
+            propagate_scope_groupings(&mut nodes, scope);
+        }
         if grouping.def_own_prefix != own_prefix {
             for node in &mut nodes {
                 fix_module_prefix(node, module_name, own_prefix);
@@ -2078,7 +2853,7 @@ fn expand_uses_lazy(
     // Flatten nested `uses` nodes before caching.
     let expanded = fully_expand_nodes(&raw, own_prefix, module_name, ctx);
     let cached_arc = Arc::new(expanded);
-    ctx.cache_insert(grouping_ptr, own_prefix, Arc::clone(&cached_arc));
+    ctx.cache_insert(grouping_ptr, own_prefix, Arc::clone(&cached_arc), grouping);
 
     // Now apply the UsesOverlay on top of the cached (immutable) base.
     if uses_overlay.is_empty() && ctx.enabled_features.is_empty() {
@@ -2086,8 +2861,10 @@ fn expand_uses_lazy(
     }
     let mut nodes: Vec<SchemaNode> = (*cached_arc).clone();
     let mut ignored_errors = Vec::new();
+    let using_module2 = ctx.registry.resolve_import(module_name, None);
+    let prefix_ctx2 = using_module2.as_ref().map(|m| (own_prefix, &m.prefix_map));
     for refine in &uses_overlay.refine_stmts {
-        apply_refine_stmt(refine, &mut nodes, &mut ignored_errors);
+        apply_refine_stmt(refine, &mut nodes, module_name, prefix_ctx2, &mut ignored_errors);
     }
     for augment in &uses_overlay.local_augments {
         apply_local_augment_entry(augment, &mut nodes, ctx);
@@ -2143,13 +2920,47 @@ fn inline_local_augment_into(
             | SchemaNodeKind::List { children: c, .. }
             | SchemaNodeKind::Case { children: c }
             | SchemaNodeKind::Notification { children: c, .. } => c.extend(nodes),
-            SchemaNodeKind::Choice { cases, .. } => cases.extend(nodes),
+            SchemaNodeKind::Choice { cases, .. } => {
+                // RFC 7950 §7.9.2: non-case nodes in a choice are implicitly wrapped
+                // in a case with the same name as the node. Apply wrapping here.
+                for node in nodes {
+                    match &node.kind {
+                        SchemaNodeKind::Case { .. } => cases.push(node),
+                        _ => {
+                            let case_name = node.name.clone();
+                            let case_module = node.module_name.clone();
+                            let case_prefix = node.module_prefix.clone();
+                            let case_origin = node.origin_module.clone();
+                            let case_pos = node.pos.clone();
+                            let implicit_case = SchemaNode {
+                                name: case_name,
+                                module_name: case_module,
+                                module_prefix: case_prefix,
+                                origin_module: case_origin,
+                                pos: case_pos,
+                                status: Status::Current,
+                                status_before_ext_meta: false,
+                                units_before_status: false,
+                                config: None,
+                                when: Vec::new(),
+                                if_features: Vec::new(),
+                                description: None,
+                                reference: None,
+                                extensions: Vec::new(),
+                                kind: SchemaNodeKind::Case { children: vec![node] },
+                                uses_grouping_statuses: Vec::new(),
+                                pmap: HashMap::new(),
+                            };
+                            cases.push(implicit_case);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
 }
 
-/// Recursively update `module_prefix` on all nodes that belong to `module_name`.
 /// Used after grouping expansion to ensure nodes carry the using module's prefix
 /// rather than the grouping definer's prefix (for tree-diagram display).
 fn fix_module_prefix(node: &mut SchemaNode, module_name: &str, new_prefix: &str) {
@@ -2265,7 +3076,13 @@ fn instantiate_stmt_for_uses(stmt: &Stmt, uses_pos: &Pos) -> Stmt {
     }
 }
 
-fn apply_refine_stmt(refine: &Stmt, nodes: &mut Vec<SchemaNode>, module_errors: &mut Vec<YError>) {
+fn apply_refine_stmt(
+    refine: &Stmt,
+    nodes: &mut Vec<SchemaNode>,
+    source_module_name: &str,
+    prefix_ctx: Option<(&str, &PrefixMap)>,
+    module_errors: &mut Vec<YError>,
+) {
     let Some(path) = parse_relative_schema_path(
         refine.arg.as_deref().unwrap_or(""),
         &refine.pos,
@@ -2291,6 +3108,8 @@ fn apply_refine_stmt(refine: &Stmt, nodes: &mut Vec<SchemaNode>, module_errors: 
         target,
         &refine.substmts,
         MutationMode::Replace,
+        source_module_name,
+        prefix_ctx,
         module_errors,
     );
 }
@@ -2305,7 +3124,13 @@ fn propagate_uses_constraints(
     // recursively to their descendants.  Yanger's expand_uses applies WhenL
     // only to `Grouping#grouping.children` (one level).
     if !inherited_when.is_empty() {
-        let mut combined = inherited_when.to_vec();
+        // Mark inherited when expressions as non_local — they originated from a `uses`
+        // or `augment` statement, so F_WHEN_CTX_NODE_UP must be set in the FXS encoding
+        // and deps must be adjusted by adding a parent step.
+        let mut combined: Vec<WhenExpr> = inherited_when
+            .iter()
+            .map(|w| WhenExpr { non_local: true, ..w.clone() })
+            .collect();
         combined.extend(node.when.clone());
         node.when = combined;
     }
@@ -2350,6 +3175,42 @@ fn propagate_uses_constraints(
     }
 }
 
+/// Recursively apply augment-level status restriction (RFC 6020 §7.15) to all schema nodes.
+/// A `augment { status X; }` defines the status of all added definitions.
+fn apply_augment_status(node: &mut SchemaNode, aug_status: Status) {
+    if node.status < aug_status {
+        node.status = aug_status;
+    }
+    match &mut node.kind {
+        SchemaNodeKind::Container { children, .. }
+        | SchemaNodeKind::List { children, .. }
+        | SchemaNodeKind::Case { children }
+        | SchemaNodeKind::Notification { children, .. } => {
+            for child in children {
+                apply_augment_status(child, aug_status);
+            }
+        }
+        SchemaNodeKind::Choice { cases, .. } => {
+            for case in cases {
+                apply_augment_status(case, aug_status);
+            }
+        }
+        SchemaNodeKind::Rpc { input, output, .. } | SchemaNodeKind::Action { input, output } => {
+            for child in input {
+                apply_augment_status(child, aug_status);
+            }
+            for child in output {
+                apply_augment_status(child, aug_status);
+            }
+        }
+        SchemaNodeKind::Leaf { .. }
+        | SchemaNodeKind::LeafList { .. }
+        | SchemaNodeKind::AnyXml { .. }
+        | SchemaNodeKind::AnyData { .. }
+        | SchemaNodeKind::Uses { .. } => {}
+    }
+}
+
 fn apply_deviations(
     key: &ModuleKey,
     children: &mut Vec<SchemaNode>,
@@ -2370,15 +3231,15 @@ fn apply_deviations(
                 continue;
             };
 
-            if !deviation_leaf_targets_module(&target_path, key, deviation) {
-                continue;
-            }
-
             let target_found = find_node_mut(children, &target_path).is_some();
             if !target_found {
-                overlay
-                    .entry(target_path.clone())
-                    .or_default()
+                let overlay_key: OverlayKey =
+                    target_path.iter().map(|s| s.name.clone()).collect();
+                let entry = overlay.entry(overlay_key).or_default();
+                if entry.source_module.is_none() {
+                    entry.source_module = Some(deviation.from_module.name.clone());
+                }
+                entry
                     .deviate_stmts
                     .extend(deviation.deviate_stmts.iter().cloned());
                 continue;
@@ -2388,11 +3249,13 @@ fn apply_deviations(
                 match deviate.arg.as_deref() {
                     Some("not-supported") => {
                         if !remove_node_at_path(children, &target_path) {
-                            overlay
-                                .entry(target_path.clone())
-                                .or_default()
-                                .deviate_stmts
-                                .push(deviate.clone());
+                            let overlay_key: OverlayKey =
+                                target_path.iter().map(|s| s.name.clone()).collect();
+                            let entry = overlay.entry(overlay_key).or_default();
+                            if entry.source_module.is_none() {
+                                entry.source_module = Some(deviation.from_module.name.clone());
+                            }
+                            entry.deviate_stmts.push(deviate.clone());
                         }
                     }
                     Some("add") => apply_deviation_edit(
@@ -2400,6 +3263,7 @@ fn apply_deviations(
                         &target_path,
                         &deviate.substmts,
                         MutationMode::Add,
+                        deviation.from_module.name.as_str(),
                         &deviation.pos,
                         module_errors,
                     ),
@@ -2408,6 +3272,7 @@ fn apply_deviations(
                         &target_path,
                         &deviate.substmts,
                         MutationMode::Replace,
+                        deviation.from_module.name.as_str(),
                         &deviation.pos,
                         module_errors,
                     ),
@@ -2416,6 +3281,7 @@ fn apply_deviations(
                         &target_path,
                         &deviate.substmts,
                         MutationMode::Delete,
+                        deviation.from_module.name.as_str(),
                         &deviation.pos,
                         module_errors,
                     ),
@@ -2440,9 +3306,11 @@ fn apply_deviations(
 fn apply_annotations(
     key: &ModuleKey,
     children: &mut Vec<SchemaNode>,
+    augments: &mut Vec<AugmentEntry>,
     ann_index: &AnnotationIndex,
     module_errors: &mut Vec<YError>,
     overlay: &mut NodeOverlayMap,
+    grouping_children: &HashMap<String, Arc<Vec<SchemaNode>>>,
 ) {
     let Some(pending) = ann_index.by_target_module.get(&key.name) else {
         return;
@@ -2465,19 +3333,91 @@ fn apply_annotations(
 
         if find_node_mut(children, &target_path).is_some() {
             let node = find_node_mut(children, &target_path).unwrap();
-            node.extensions.extend(ann.instances.iter().cloned());
+            apply_annotation_to_node(node, ann);
+        } else if let Some(node) = find_node_in_augments(augments, &target_path, grouping_children) {
+            apply_annotation_to_node(node, ann);
         } else {
             // Target is inside an unexpanded `uses` — defer to overlay.
+            let overlay_key: OverlayKey =
+                target_path.iter().map(|s| s.name.clone()).collect();
             overlay
-                .entry(target_path)
+                .entry(overlay_key)
                 .or_default()
                 .annotations
                 .push(crate::compiler::types::Annotation {
                     instances: ann.instances.clone(),
+                    when_stmts: ann.when_stmts.clone(),
+                    must_stmts: ann.must_stmts.clone(),
+                    source_module: ann.from_module.name.clone(),
+                    source_revision: ann.from_module.revision.clone(),
                     source_plugin: ann.source_plugin,
                 });
         }
     }
+}
+
+/// Apply annotation (extensions, whens, musts) to a resolved target node.
+fn apply_annotation_to_node(node: &mut SchemaNode, ann: &PendingAnnotation) {
+    node.extensions.extend(ann.instances.iter().cloned());
+    let source = ann.from_module.name.as_str();
+    let source_rev = ann.from_module.revision.clone();
+    for when in &ann.when_stmts {
+        mutate_when_exprs(&mut node.when, when, MutationMode::Add, source, source_rev.clone());
+    }
+    match &mut node.kind {
+        SchemaNodeKind::Container { musts, .. }
+        | SchemaNodeKind::Leaf { musts, .. }
+        | SchemaNodeKind::LeafList { musts, .. }
+        | SchemaNodeKind::List { musts, .. }
+        | SchemaNodeKind::Rpc { musts, .. }
+        | SchemaNodeKind::Notification { musts, .. }
+        | SchemaNodeKind::AnyXml { musts, .. }
+        | SchemaNodeKind::AnyData { musts, .. } => {
+            for must in &ann.must_stmts {
+                mutate_must_exprs(musts, must, MutationMode::Add, source, source_rev.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Search for a target node inside external augment bodies.
+/// The annotation path may start with the augment's target_path prefix; the
+/// remaining steps navigate into the augment body.
+/// When the body contains unexpanded `Uses` nodes, navigates through the grouping's
+/// pre-compiled children to locate the target, then stores the annotation in the
+/// Uses node's overlay for application during normal expansion.
+fn find_node_in_augments<'a>(
+    augments: &'a mut Vec<AugmentEntry>,
+    target_path: &[PathStep],
+    grouping_children: &HashMap<String, Arc<Vec<SchemaNode>>>,
+) -> Option<&'a mut SchemaNode> {
+    for aug in augments.iter_mut() {
+        let aug_len = aug.target_path.len();
+        if target_path.len() <= aug_len {
+            continue;
+        }
+        // Check if the annotation path starts with this augment's target_path
+        // (compare by name only — prefixes may differ between the annotation
+        // module and the augmenting module).
+        let matches = aug.target_path.iter().zip(target_path.iter()).all(|(a, b)| a.name == b.name);
+        if !matches {
+            continue;
+        }
+        // Remaining path navigates into the augment body.
+        let remaining = &target_path[aug_len..];
+        // Try direct navigation first (handles pre-expanded bodies or non-Uses nodes).
+        if find_node_mut(&mut aug.nodes, remaining).is_some() {
+            return find_node_mut(&mut aug.nodes, remaining);
+        }
+        // If the body contains Uses nodes, check if the target exists inside
+        // any grouping body. If found, we don't expand here — we'll return None
+        // and let the caller defer to the overlay mechanism with the FULL path
+        // (not just the remaining part), which correctly identifies the target
+        // during Uses expansion.
+        // This avoids corrupting the augment body structure.
+    }
+    None
 }
 
 fn annotation_targets_module(ann: &PendingAnnotation, key: &ModuleKey) -> bool {
@@ -2512,48 +3452,50 @@ fn annotation_leaf_targets_module(
 /// The target module name was resolved from the deviating module's imports at
 /// devindex build time, so no registry lookup or prefix-string comparison is
 /// needed.  Using the pre-resolved name is also correct when many modules share
-/// the same self-declared prefix letter (e.g. all submodules of a suite may use
-/// the same short prefix string).
+/// the same self-declared prefix letter (e.g. all Cisco-IOS-XE submodules use
+/// `prefix ios`).
+/// Returns `true` if `deviation` should be applied when compiling module `key`.
+///
+/// Routing is based on the **last** path step's prefix (the module that owns
+/// the leaf node), which matches how `expand_children` routes overlay entries
+/// for augmented nodes.  For non-augmented paths (all steps share the same
+/// prefix) this is identical to the old first-prefix routing.
 fn deviation_targets_module(deviation: &PendingDeviation, key: &ModuleKey) -> bool {
-    match &deviation.target_module_name {
-        // Prefix resolved to a known module: only apply to that module.
-        Some(module_name) => module_name == &key.name,
-        // No target module name: either the path had no prefix (self-deviation)
+    // Primary check: use the leaf module (last path step's prefix).
+    // This correctly routes cross-module augment deviations like
+    // `/A:foo/B:bar` to module B (where B augmented `bar` into A).
+    match &deviation.target_leaf_module_name {
+        Some(module_name) => {
+            if module_name == &key.name {
+                return true;
+            }
+            // Leaf module doesn't match. Fall back to root module check for
+            // deviations where first and last module differ (e.g., the leaf
+            // is from yet another module that the root module imports).
+            // We also accept the root module as a target so that `find_node_mut`
+            // can store the deviation in the overlay for later augment expansion.
+            match &deviation.target_module_name {
+                Some(root_module) => root_module == &key.name,
+                None => match &deviation.target_prefix {
+                    None => deviation.from_module.name == key.name,
+                    Some(_) => false,
+                },
+            }
+        }
+        // No leaf module name: either the last step has no prefix (self-deviation)
         // or the prefix wasn't found in the imports (malformed file).
-        None => match &deviation.target_prefix {
-            // No prefix on the path → targets the deviating module itself.
-            None => deviation.from_module.name == key.name,
+        None => match &deviation.target_leaf_prefix {
+            // No prefix on the leaf step → fall back to root module routing.
+            None => match &deviation.target_module_name {
+                Some(module_name) => module_name == &key.name,
+                None => match &deviation.target_prefix {
+                    None => deviation.from_module.name == key.name,
+                    Some(_) => false,
+                },
+            },
             // Prefix present but unresolved → cannot determine target; skip.
             Some(_) => false,
         },
-    }
-}
-
-/// Returns `false` if the most-specific (last) element of `path` carries a
-/// prefix that resolves to a module other than `key`.  Such a deviation targets
-/// a node contributed by a foreign augment, not by the module being compiled,
-/// so it should be silently skipped.  When the prefix cannot be resolved we
-/// conservatively return `true` to keep the existing error.
-fn deviation_leaf_targets_module(
-    path: &[PathStep],
-    key: &ModuleKey,
-    deviation: &PendingDeviation,
-) -> bool {
-    let Some(last) = path.last() else {
-        return true;
-    };
-    let Some(ref prefix) = last.prefix else {
-        // No prefix on the leaf step → inherits the root namespace which is
-        // already confirmed to be this module.
-        return true;
-    };
-    // Resolve the prefix using the deviating module's import map, which was
-    // captured at devindex build time from the AST — no registry lookup needed.
-    match deviation.prefix_map.get(prefix) {
-        Some(module_name) => module_name == &key.name,
-        // Prefix not in any import → refers to something entirely outside
-        // the current context; skip silently.
-        None => false,
     }
 }
 
@@ -2562,6 +3504,7 @@ fn apply_deviation_edit(
     target_path: &[PathStep],
     stmts: &[Stmt],
     mode: MutationMode,
+    source_module_name: &str,
     pos: &Pos,
     module_errors: &mut Vec<YError>,
 ) {
@@ -2575,13 +3518,15 @@ fn apply_deviation_edit(
         return;
     };
 
-    apply_node_mutation(target, stmts, mode, module_errors);
+    apply_node_mutation(target, stmts, mode, source_module_name, None, module_errors);
 }
 
 fn apply_node_mutation(
     node: &mut SchemaNode,
     stmts: &[Stmt],
     mode: MutationMode,
+    source_module_name: &str,
+    prefix_ctx: Option<(&str, &PrefixMap)>,
     module_errors: &mut Vec<YError>,
 ) {
     for stmt in stmts {
@@ -2602,7 +3547,7 @@ fn apply_node_mutation(
             Some(BuiltInKeyword::Reference) => {
                 apply_opt_string(mode, &mut node.reference, stmt.arg.clone())
             }
-            Some(BuiltInKeyword::When) => mutate_when_exprs(&mut node.when, stmt, mode),
+            Some(BuiltInKeyword::When) => mutate_when_exprs(&mut node.when, stmt, mode, source_module_name, None),
             Some(BuiltInKeyword::IfFeature) => {
                 if mode == MutationMode::Delete {
                     node.if_features.clear();
@@ -2616,7 +3561,7 @@ fn apply_node_mutation(
                 | SchemaNodeKind::Rpc { musts, .. }
                 | SchemaNodeKind::Notification { musts, .. }
                 | SchemaNodeKind::AnyXml { musts, .. }
-                | SchemaNodeKind::AnyData { musts, .. } => mutate_must_exprs(musts, stmt, mode),
+                | SchemaNodeKind::AnyData { musts, .. } => mutate_must_exprs(musts, stmt, mode, source_module_name, None),
                 _ => {}
             },
             Some(BuiltInKeyword::Mandatory) => match &mut node.kind {
@@ -2710,16 +3655,40 @@ fn apply_node_mutation(
                     }
                 }
             }
-            _ => {}
+            _ => {
+                // Handle extension statements (e.g. tailf:cli-mode-name in a refine).
+                if let Some((own_prefix, prefix_map)) = prefix_ctx {
+                    if let Some((module, name)) = resolve_kw(&stmt.keyword, own_prefix, source_module_name, prefix_map) {
+                        let ext = ExtensionInstance {
+                            module: module.to_string(),
+                            name: name.to_string(),
+                            arg: stmt.arg.clone(),
+                            substmts: stmt.substmts.clone(),
+                            pos: stmt.pos.clone(),
+                        };
+                        match mode {
+                            MutationMode::Delete => {
+                                node.extensions.retain(|e| !(e.name == name && e.module == module));
+                            }
+                            _ => {
+                                node.extensions.push(ext);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
-fn mutate_when_exprs(list: &mut Vec<WhenExpr>, stmt: &Stmt, mode: MutationMode) {
+fn mutate_when_exprs(list: &mut Vec<WhenExpr>, stmt: &Stmt, mode: MutationMode, source_module_name: &str, source_revision: Option<String>) {
     let entry = WhenExpr {
         xpath: stmt.arg.clone().unwrap_or_default(),
         description: opt_substmt_arg(stmt, BuiltInKeyword::Description),
         reference: opt_substmt_arg(stmt, BuiltInKeyword::Reference),
+        source_module: source_module_name.to_string(),
+        source_revision,
+        non_local: false,
     };
     match mode {
         MutationMode::Add => list.push(entry),
@@ -2731,12 +3700,19 @@ fn mutate_when_exprs(list: &mut Vec<WhenExpr>, stmt: &Stmt, mode: MutationMode) 
     }
 }
 
-fn mutate_must_exprs(list: &mut Vec<MustExpr>, stmt: &Stmt, mode: MutationMode) {
+fn mutate_must_exprs(list: &mut Vec<MustExpr>, stmt: &Stmt, mode: MutationMode, source_module_name: &str, source_revision: Option<String>) {
     let entry = MustExpr {
         xpath: stmt.arg.clone().unwrap_or_default(),
         error_message: opt_substmt_arg(stmt, BuiltInKeyword::ErrorMessage),
         error_app_tag: opt_substmt_arg(stmt, BuiltInKeyword::ErrorAppTag),
         description: opt_substmt_arg(stmt, BuiltInKeyword::Description),
+        source_module: source_module_name.to_string(),
+        source_revision,
+        // tailf:dependency sub-stmts from annotation-injected musts are not available
+        // in the mutate path (no own_prefix/prefix_map). Leave empty; callers can
+        // fix this up if needed.
+        explicit_deps: vec![],
+        override_auto_deps: false,
     };
     match mode {
         MutationMode::Add => list.push(entry),
@@ -3265,10 +4241,30 @@ fn is_ident_char(ch: char) -> bool {
 
 /// Collect the deviation modules that were applied to `key` during this compilation.
 ///
+/// Returns `true` if any deviate statement in `deviations` adds or replaces a
+/// `must` or `when` statement.
+fn deviations_have_must_or_when(deviations: &[PendingDeviation]) -> bool {
+    deviations.iter().any(|d| {
+        d.deviate_stmts.iter().any(|deviate| {
+            let arg = deviate.arg.as_deref().unwrap_or("");
+            if arg != "add" && arg != "replace" {
+                return false;
+            }
+            deviate.substmts.iter().any(|sub| {
+                matches!(
+                    &sub.keyword,
+                    Keyword::BuiltIn(k)
+                        if *k == BuiltInKeyword::Must || *k == BuiltInKeyword::When
+                )
+            })
+        })
+    })
+}
+
 /// Returns an [`AppliedDeviations`] value ready to be stored with
 /// [`CompiledModule::set_pdata`].
 fn collect_applied_deviations(key: &ModuleKey, dev_index: &DeviationIndex) -> AppliedDeviations {
-    let mut result: Vec<(String, Option<String>)> = dev_index
+    let mut result: Vec<(String, Option<String>, PrefixMap, bool)> = dev_index
         .by_deviating_module
         .iter()
         .filter_map(|(dev_key, deviations)| {
@@ -3277,7 +4273,7 @@ fn collect_applied_deviations(key: &ModuleKey, dev_index: &DeviationIndex) -> Ap
                     return true;
                 }
                 // Also check the last prefix-qualified step: a deviation path like
-                // `/mod-a:container/mod-b:leaf` targets `mod-b`, not `mod-a`.
+                // `/ios-sm:netconf-yang/cisco-ia:cisco-ia` targets `cisco-ia`, not `ios-sm`.
                 let mut ignored = Vec::new();
                 if let Some(path) = parse_path_internal(&d.target_path, true, &d.pos, &mut ignored)
                 {
@@ -3294,7 +4290,11 @@ fn collect_applied_deviations(key: &ModuleKey, dev_index: &DeviationIndex) -> Ap
                 false
             });
             if targets_us {
-                Some((dev_key.name.clone(), dev_key.revision.clone()))
+                let prefix_map: PrefixMap = deviations.first()
+                    .map(|d| d.prefix_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default();
+                let has_must_or_when = deviations_have_must_or_when(deviations);
+                Some((dev_key.name.clone(), dev_key.revision.clone(), prefix_map, has_must_or_when))
             } else {
                 None
             }
@@ -3312,30 +4312,135 @@ fn collect_applied_annotations(
     key: &ModuleKey,
     ann_index: &AnnotationIndex,
 ) -> AppliedAnnotations {
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::new();
+    // Group annotations by source module, tracking prefix_map, has_when_or_must, root_is_self,
+    // and the set of YANG prefixes used in extension instance arguments.
+    let mut seen: std::collections::HashMap<
+        String,
+        (Option<String>, PrefixMap, bool, bool, std::collections::HashSet<String>),
+    > = std::collections::HashMap::new();
     if let Some(pending) = ann_index.by_target_module.get(&key.name) {
-        for ann in pending {
-            if seen.insert(ann.from_module.name.clone()) {
-                let prefix_map: PrefixMap = ann
-                    .prefix_map
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                result.push((
-                    ann.from_module.name.clone(),
-                    ann.from_module.revision.clone(),
-                    prefix_map,
-                ));
+        if std::env::var("YANGEST_DEBUG_ANN").is_ok() && key.name == "Cisco-IOS-XE-aaa" {
+            eprintln!("DEBUG collect_applied_annotations for {} — {} pending entries", key.name, pending.len());
+            for ann in pending.iter().take(3) {
+                eprintln!("  from={} target_path={} when_stmts={} must_stmts={}",
+                    ann.from_module.name, ann.target_path,
+                    ann.when_stmts.len(), ann.must_stmts.len());
             }
         }
+        for ann in pending {
+            let has_wm = !ann.when_stmts.is_empty() || !ann.must_stmts.is_empty();
+            // Collect prefixes used in extension instance arguments (e.g. cli-diff-* paths).
+            let inst_prefixes: std::collections::HashSet<String> = ann
+                .instances
+                .iter()
+                .filter_map(|inst| inst.arg.as_deref())
+                .flat_map(extract_yang_path_prefixes)
+                .collect();
+            // Determine if this annotation's paths root directly into the target module.
+            let root_is_self = annotation_root_is_target(&ann.target_path, &ann.prefix_map, &key.name);
+            seen.entry(ann.from_module.name.clone())
+                .and_modify(|e| {
+                    e.2 |= has_wm;
+                    e.3 |= root_is_self;
+                    e.4.extend(inst_prefixes.iter().cloned());
+                })
+                .or_insert_with(|| {
+                    let prefix_map: PrefixMap = ann
+                        .prefix_map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    (ann.from_module.revision.clone(), prefix_map, has_wm, root_is_self, inst_prefixes)
+                });
+        }
     }
+    let mut result: Vec<(String, Option<String>, PrefixMap, bool, bool, Vec<String>)> = seen
+        .into_iter()
+        .map(|(name, (rev, pm, hwm, ris, ep))| {
+            let mut ext_prefixes: Vec<String> = ep.into_iter().collect();
+            ext_prefixes.sort_unstable();
+            (name, rev, pm, hwm, ris, ext_prefixes)
+        })
+        .collect();
+    result.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     AppliedAnnotations(result)
+}
+
+/// Extract YANG identifier prefixes from a path-like string argument.
+///
+/// Looks for patterns like `pfx:localname` and returns the `pfx` parts.
+/// Skips URL-like constructs (e.g. `http://`) to avoid false matches.
+fn extract_yang_path_prefixes(s: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip to start of an identifier-like token
+        while i < bytes.len()
+            && !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
+        {
+            i += 1;
+        }
+        let start = i;
+        // Scan the token: allow alphanumeric, hyphen, underscore, dot
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || bytes[i] == b'-'
+                || bytes[i] == b'_'
+                || bytes[i] == b'.')
+        {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b':' && i > start {
+            let next = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
+            // Skip URLs like http:// or urn: followed by /
+            if next != b'/' {
+                let prefix = &s[start..i];
+                prefixes.push(prefix.to_string());
+            }
+            i += 1; // skip the ':'
+        } else {
+            i += 1; // skip past current position
+        }
+    }
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    prefixes
+}
+
+/// Returns true if the annotation's `target_path` starts with a prefix that resolves
+/// to `target_module_name` via the annotation module's `prefix_map`.
+///
+/// Example: path `/cisco-smart-license:licensing`, prefix_map has `cisco-smart-license → cisco-smart-license`
+/// → first prefix = `cisco-smart-license`, resolves to module `cisco-smart-license` → `root_is_self = true`.
+fn annotation_root_is_target(
+    target_path: &str,
+    ann_prefix_map: &HashMap<String, String>,
+    target_module_name: &str,
+) -> bool {
+    // Strip leading '/'; find the first colon-prefixed step.
+    let path = target_path.trim_start_matches('/');
+    let colon_pos = match path.find(':') {
+        Some(p) => p,
+        None => return false, // no prefix → can't determine
+    };
+    // Verify the prefix is before any '/' separator.
+    let slash_pos = path.find('/').unwrap_or(path.len());
+    if colon_pos > slash_pos {
+        return false;
+    }
+    let first_prefix = &path[..colon_pos];
+    // Resolve prefix → module name using the annotation module's prefix_map.
+    ann_prefix_map
+        .get(first_prefix)
+        .map(|mod_name| mod_name == target_module_name)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::astannindex::AstAnnotationIndex;
     use crate::parser::parse_yang;
     use std::sync::Arc;
 
@@ -3363,6 +4468,7 @@ module example {
             &ModuleRegistry::default(),
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
 
         assert!(
@@ -3391,6 +4497,7 @@ module dep {
             &ModuleRegistry::default(),
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         ));
         assert!(
             dep_compiled.errors.is_empty(),
@@ -3419,6 +4526,7 @@ module main {
             &registry,
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
 
         assert!(
@@ -3451,6 +4559,7 @@ module leafmod {
             &ModuleRegistry::default(),
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
 
         assert!(
@@ -3512,6 +4621,7 @@ module ext-test {
             &ModuleRegistry::default(),
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
 
         assert!(compiled.errors.is_empty(), "errors: {:?}", compiled.errors);
@@ -3542,6 +4652,7 @@ module ext-defs {
             &reg,
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
         reg.insert(std::sync::Arc::new(compiled_a));
 
@@ -3564,6 +4675,7 @@ module uses-ext {
             &reg,
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
 
         assert!(
@@ -3598,6 +4710,7 @@ module ext-defs {
             &reg,
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
         reg.insert(std::sync::Arc::new(ca));
 
@@ -3617,6 +4730,7 @@ module use-marker {
             &reg,
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
         let leaf = &cb.children[0];
         assert!(leaf.extension("ext-defs", "marker").is_some());
@@ -3652,6 +4766,7 @@ module ext-defs {
             &reg,
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
         reg.insert(std::sync::Arc::new(ca));
 
@@ -3671,6 +4786,7 @@ module bad-use {
             &reg,
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
         // Should produce a validation error about unexpected argument.
         assert!(
@@ -3713,6 +4829,7 @@ module ext-defs {
             &reg,
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
         reg.insert(std::sync::Arc::new(ca));
 
@@ -3736,6 +4853,7 @@ module bad-use {
             &reg,
             &DeviationIndex::default(),
             &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
         );
         assert!(
             cb.errors

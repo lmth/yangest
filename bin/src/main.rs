@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use yangest_core::annindex::AnnotationIndex;
 use yangest_core::astannindex::AstAnnotationIndex;
 use yangest_core::ast::{self, ModuleKey};
-use yangest_core::compiler::{ExpansionCtx, ModuleRegistry, compile_module};
+use yangest_core::compiler::{AstAppliedAnnotations, ExpansionCtx, ModuleRegistry, compile_module};
 use yangest_core::depgraph::DepGraph;
 use yangest_core::devindex::DeviationIndex;
 use yangest_core::plugin::{AstOverlayDescriptor, EmitState, OverlayExtension, Plugin, PluginRegistration};
@@ -70,7 +70,7 @@ struct Cli {
 
     /// Apply plugin-declared annotations from FILE without emitting output for
     /// it (may be repeated).  Annotation modules contain extension statements
-    /// (e.g. `acme:annotate`) that target schema nodes by path.
+    /// (e.g. `ext:annotate`) that target schema nodes by path.
     #[arg(long = "annotation-module", value_name = "FILE")]
     annotation_modules: Vec<PathBuf>,
 
@@ -297,6 +297,14 @@ fn main() {
     }
     modules.retain(|(k, _)| reachable.contains(k.name.as_str()));
 
+    // Deduplicate modules by name.  A module can appear twice when it is
+    // listed as an explicit annotation/deviation file AND also found by the
+    // search-path directory scan.  Keep the first (higher-priority) entry.
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        modules.retain(|(k, _)| seen.insert(k.name.clone()));
+    }
+
     let dep_graph = DepGraph::build(&modules, &mut all_parse_errors);
     let waves = match dep_graph.topo_sort_levels() {
         Ok(w) => w,
@@ -364,8 +372,18 @@ fn main() {
             .into_par_iter()
             .map(|(key, stmt)| {
                 let stmt = ast_ann_index.apply(stmt, &key.name);
-                let mut compiled = compile_module(&key, stmt, &reg_read, &dev_index, &ann_index);
+                let mut compiled = compile_module(&key, stmt, &reg_read, &dev_index, &ann_index, &ast_ann_index);
                 compiled.source_path = path_map.get(&key).cloned();
+                // Record which annotation modules targeted this module via an annotate-module overlay extension.
+                let ast_sources = ast_ann_index.sources_for(&key.name);
+                if !ast_sources.is_empty() {
+                    let entries: Vec<(String, Option<String>, std::collections::HashMap<String, String>)> =
+                        ast_sources
+                            .iter()
+                            .map(|(mk, pm)| (mk.name.clone(), mk.revision.clone(), pm.clone()))
+                            .collect();
+                    compiled.set_pdata(AstAppliedAnnotations(entries));
+                }
                 compiled
             })
             .collect();
@@ -413,6 +431,12 @@ fn main() {
         },
     };
 
+    // Shared cross-module expand cache: grouping expansions computed by one module's emit
+    // are reused by all subsequent modules, eliminating redundant expand_uses_lazy calls.
+    // Keyed by (grouping address as usize, own_prefix).
+    let shared_expand_cache: Arc<RwLock<HashMap<(usize, String), Arc<Vec<yangest_core::compiler::SchemaNode>>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
     // Build a fresh ExpansionCtx for one emission task.
     // Each parallel worker gets its own instance because ExpansionCtx holds a
     // per-call RefCell cache that is !Sync.  Construction is cheap: the ctx
@@ -431,6 +455,7 @@ fn main() {
         if is_bundle_mode || !enabled_features.is_empty() {
             ctx = ctx.with_unlisted_modules_enabled();
         }
+        ctx = ctx.with_shared_expand_cache(Arc::clone(&shared_expand_cache));
         ctx
     };
 
@@ -550,6 +575,7 @@ fn main() {
             eprintln!("yangest: emit error: {}", e);
         }
     }
+    plugin.finish_bundle(&bundle);
     std::process::exit(if has_errors { 1 } else { 0 });
 }
 

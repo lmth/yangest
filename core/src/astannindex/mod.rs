@@ -3,8 +3,8 @@
 //! AST-level annotation index.
 //!
 //! Scans annotation modules for plugin-declared *module-selector* extensions
-//! (e.g. `acme:annotate-module`) and their nested *statement-selector*
-//! extensions (e.g. `acme:annotate-statement`), then builds a per-module
+//! (e.g. `tailf:annotate-module`) and their nested *statement-selector*
+//! extensions (e.g. `tailf:annotate-statement`), then builds a per-module
 //! patch set.  Each patch is applied to the target module's raw [`Stmt`] tree
 //! **before** [`compile_module`] is called, making injected statements visible
 //! to type resolution, grouping instantiation, and constraint checking.
@@ -54,6 +54,15 @@ pub struct ModuleAnnotation {
 #[derive(Debug, Default)]
 pub struct AstAnnotationIndex {
     by_module: HashMap<String, ModuleAnnotation>,
+    /// Maps target module name → list of `(ann_module_key, prefix_map)` for
+    /// every annotation module that targets it via `tailf:annotate-module`.
+    /// Used by plugins to look up which annotation modules contributed
+    /// extension-arg imports to a given target module.
+    ann_sources: HashMap<String, Vec<(ModuleKey, HashMap<String, String>)>>,
+    /// Maps annotation module source file path → `ModuleKey` for that annotation module.
+    /// Used during compilation to identify which annotation module injected a particular
+    /// statement (must/when) by checking `stmt.pos.file()` against this map.
+    file_to_key: HashMap<String, ModuleKey>,
 }
 
 impl AstAnnotationIndex {
@@ -85,9 +94,20 @@ impl AstAnnotationIndex {
                 };
                 let ann =
                     parse_module_annotation(&sub.substmts, &prefix_map, &own_pfx, &key.name, desc);
-                let entry = index.by_module.entry(target_module).or_default();
+                let entry = index.by_module.entry(target_module.clone()).or_default();
                 entry.direct_injections.extend(ann.direct_injections);
                 entry.selectors.extend(ann.selectors);
+                // Track the annotation module source for import resolution.
+                index
+                    .ann_sources
+                    .entry(target_module)
+                    .or_default()
+                    .push((key.clone(), prefix_map.clone()));
+                // Track the annotation file path → module key, so that compilation
+                // can detect which annotation module injected a given statement by
+                // checking stmt.pos.orig_file() against this map.
+                let file_path = stmt.pos.file().to_string();
+                index.file_to_key.entry(file_path).or_insert_with(|| key.clone());
             }
         }
         index
@@ -107,6 +127,23 @@ impl AstAnnotationIndex {
             apply_selector(&mut stmt.substmts, sel);
         }
         stmt
+    }
+
+    /// Returns the list of `(ann_module_key, prefix_map)` for every annotation
+    /// module that targets `module_name` via `tailf:annotate-module`.
+    pub fn sources_for(&self, module_name: &str) -> &[(ModuleKey, HashMap<String, String>)] {
+        self.ann_sources.get(module_name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Returns the `ModuleKey` of the annotation module whose source file matches `file`,
+    /// or `None` if the file is not from any annotation module.
+    ///
+    /// Use `stmt.pos.orig_file()` (not `stmt.pos.file()`) as the key to handle statements
+    /// that were injected into a grouping and then expanded via `uses` — in that case
+    /// `pos.file()` returns the uses-call site, but `pos.orig_file()` returns the
+    /// original definition (annotation module) file.
+    pub fn module_key_for_file(&self, file: &str) -> Option<&ModuleKey> {
+        self.file_to_key.get(file)
     }
 
     pub fn is_empty(&self) -> bool {

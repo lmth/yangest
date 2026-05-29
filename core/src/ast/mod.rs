@@ -35,6 +35,27 @@ impl Pos {
         }
     }
 
+    /// Returns the file of the original definition site, ignoring any `uses`
+    /// context.  For a `FilePos` this is the same as [`file()`].  For a
+    /// `UsesPos` this recurses into `orig_pos` instead of `uses_pos`, giving
+    /// the file where the statement was originally defined (e.g. a grouping
+    /// body or an annotation module), not where it was instantiated.
+    pub fn orig_file(&self) -> &Arc<str> {
+        match self {
+            Pos::FilePos { file, .. } => file,
+            Pos::UsesPos { orig_pos, .. } => orig_pos.orig_file(),
+        }
+    }
+
+    /// Returns the line number of the original definition site, ignoring any
+    /// `uses` context.  Mirrors [`orig_file()`] for the line component.
+    pub fn orig_line(&self) -> u32 {
+        match self {
+            Pos::FilePos { line, .. } => *line,
+            Pos::UsesPos { orig_pos, .. } => orig_pos.orig_line(),
+        }
+    }
+
     pub fn line(&self) -> u32 {
         match self {
             Pos::FilePos { line, .. } => *line,

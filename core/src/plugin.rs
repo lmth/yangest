@@ -121,15 +121,15 @@ impl Default for EmitState {
 /// Identifies a YANG extension statement by module name and local name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtensionId {
-    /// YANG module that defines this extension (e.g. `"acme-ext"`).
+    /// YANG module that defines this extension (e.g. `"tailf-common"`).
     pub module: &'static str,
     /// Local extension name (e.g. `"annotate-module"`).
     pub name: &'static str,
 }
 
 /// Declares a pair of extension statements that implement an AST-level
-/// annotation overlay: a *module selector* (e.g. `acme:annotate-module`) and
-/// a *statement selector* (e.g. `acme:annotate-statement`).
+/// annotation overlay: a *module selector* (e.g. `tailf:annotate-module`) and
+/// a *statement selector* (e.g. `tailf:annotate-statement`).
 ///
 /// Registered via [`Plugin::ast_overlay_extensions`].  The
 /// [`AstAnnotationIndex`] scans overlay modules for `module_selector`
@@ -157,7 +157,7 @@ pub struct AstOverlayDescriptor {
 /// at expansion time.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OverlayExtension {
-    /// YANG module that defines this extension (e.g. `"acme-ext"`).
+    /// YANG module that defines this extension (e.g. `"tailf-common"`).
     pub module: &'static str,
     /// Local extension name (e.g. `"annotate"`).
     pub name: &'static str,
@@ -234,7 +234,7 @@ pub trait Plugin: Send + Sync {
     /// ```rust,ignore
     /// static ANN_EXTS: &[OverlayExtension] = &[
     ///     OverlayExtension {
-    ///         module: "acme-ext",
+    ///         module: "tailf-common",
     ///         name: "annotate",
     ///         source_plugin: "example-ann",
     ///     },
@@ -250,7 +250,7 @@ pub trait Plugin: Send + Sync {
     /// Each [`AstOverlayDescriptor`] identifies a *module-selector* extension
     /// (takes a module name as argument) and a *statement-selector* extension
     /// (takes a `keyword[name='value']` selector).  Together they implement a
-    /// mechanism equivalent to `acme:annotate-module` + `acme:annotate-statement`.
+    /// mechanism equivalent to `tailf:annotate-module` + `tailf:annotate-statement`.
     ///
     /// Patches declared via these extensions are applied to the target module's
     /// raw source AST **before** `compile_module` is called, so injected
@@ -260,8 +260,8 @@ pub trait Plugin: Send + Sync {
     ///
     /// ```rust,ignore
     /// static AST_OVERLAYS: &[AstOverlayDescriptor] = &[AstOverlayDescriptor {
-    ///     module_selector: ExtensionId { module: "acme-ext", name: "annotate-module" },
-    ///     stmt_selector:   ExtensionId { module: "acme-ext", name: "annotate-statement" },
+    ///     module_selector: ExtensionId { module: "tailf-common", name: "annotate-module" },
+    ///     stmt_selector:   ExtensionId { module: "tailf-common", name: "annotate-statement" },
     /// }];
     /// fn ast_overlay_extensions(&self) -> &'static [AstOverlayDescriptor] { AST_OVERLAYS }
     /// ```
@@ -383,4 +383,8 @@ pub trait Plugin: Send + Sync {
     ) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// Called once after all modules have been emitted.
+    /// Default implementation is a no-op.
+    fn finish_bundle(&self, _bundle: &BundleState) {}
 }

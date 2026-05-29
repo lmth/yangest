@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Magnus Thoäng
 use std::any::TypeId;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use super::compile::{expand_children, find_child_in_raw};
+use super::compile::{expand_children, expand_children_all, expand_children_and_all, find_child_in_raw};
 use super::{
     CompiledModule, Grouping, IfFeatureExpr, ModuleRegistry, NodeOverlayMap, PathStep, SchemaNode,
     SchemaNodeKind, SchemaPath, Status,
@@ -37,6 +37,11 @@ pub struct ExpansionCtx<'a> {
     /// a single plugin call. Keyed by (grouping raw pointer, using-module own_prefix).
     /// Values are Arc so cache hits are O(1) clones rather than O(n) Vec clones.
     cache: RefCell<HashMap<(*const Grouping, String), Arc<Vec<SchemaNode>>>>,
+    /// Optional shared cross-module expand cache. When set, `cache_get` checks this cache
+    /// AFTER the per-invocation cache, and `cache_insert` also writes to it.
+    /// Keyed by (grouping address as usize, own_prefix).
+    /// This allows all module emits in a parallel bundle to share expansion results.
+    pub shared_expand_cache: Option<Arc<RwLock<HashMap<(usize, String), Arc<Vec<SchemaNode>>>>>>,
     /// True when at least one module in the registry has a non-empty overlay
     /// (deviations targeting nodes inside `uses` expansions).
     /// When false, `expand_children` skips all per-node path allocation.
@@ -48,6 +53,20 @@ pub struct ExpansionCtx<'a> {
     /// When false (default / CLI `--feature` mode), `enabled_features` is a strict
     /// global whitelist.
     pub unlisted_modules_enabled: bool,
+    /// The overlay of the "file module" currently being compiled/emitted.
+    ///
+    /// When a node belongs to a grouping from an external module (its own module's overlay
+    /// is empty), `SchemaNode::children()` uses this field instead so that deviations
+    /// targeting nodes inside external groupings are still applied correctly.
+    ///
+    /// Stored as a raw pointer to avoid making `ExpansionCtx<'a>` invariant over `'a`
+    /// (which `Cell<Option<&'a T>>` would cause).  The pointer is only valid during the
+    /// current module emission call and is never stored beyond that.
+    pub file_module_overlay: Cell<*const NodeOverlayMap>,
+    /// Holds Arc<Grouping> references for all groupings that have been inserted into
+    /// the expansion cache. This prevents the Arcs from being deallocated (and their
+    /// memory addresses reused), which would corrupt the pointer-based cache keys.
+    cache_keepalive: RefCell<Vec<Arc<Grouping>>>,
 }
 
 impl<'a> ExpansionCtx<'a> {
@@ -62,8 +81,11 @@ impl<'a> ExpansionCtx<'a> {
             registry,
             max_status: None,
             cache: RefCell::new(HashMap::new()),
+            shared_expand_cache: None,
             has_any_overlay: registry.has_any_overlay(),
             unlisted_modules_enabled: false,
+            file_module_overlay: Cell::new(std::ptr::null()),
+            cache_keepalive: RefCell::new(Vec::new()),
         }
     }
 
@@ -91,6 +113,26 @@ impl<'a> ExpansionCtx<'a> {
     pub fn all_features(registry: &'a ModuleRegistry) -> Self {
         static EMPTY: std::sync::OnceLock<HashSet<(String, String)>> = std::sync::OnceLock::new();
         Self::new(registry, EMPTY.get_or_init(HashSet::new))
+    }
+
+    /// Attach a shared cross-module expand cache. When set, `cache_get` checks this global
+    /// cache after the per-invocation cache, and `cache_insert` also populates it.
+    pub fn with_shared_expand_cache(
+        mut self,
+        cache: Arc<RwLock<HashMap<(usize, String), Arc<Vec<SchemaNode>>>>>,
+    ) -> Self {
+        self.shared_expand_cache = Some(cache);
+        self
+    }
+
+    /// Set the file module overlay for this context.
+    ///
+    /// This overlay is used by `SchemaNode::children()` as a fallback when a node's own
+    /// module has no overlay.  This handles nodes from external groupings (expanded via
+    /// `uses`) whose `module_name` points to the source module rather than the file module.
+    pub fn with_file_module_overlay(self, overlay: &NodeOverlayMap) -> Self {
+        self.file_module_overlay.set(overlay as *const _);
+        self
     }
 
     /// Returns true when the named feature is enabled.
@@ -151,10 +193,29 @@ impl<'a> ExpansionCtx<'a> {
         grouping_ptr: *const Grouping,
         own_prefix: &str,
     ) -> Option<Arc<Vec<SchemaNode>>> {
-        self.cache
+        // Check per-invocation cache first (no lock needed).
+        if let Some(arc) = self
+            .cache
             .borrow()
             .get(&(grouping_ptr, own_prefix.to_string()))
             .map(Arc::clone)
+        {
+            return Some(arc);
+        }
+        // Check shared global cache (read lock).
+        if let Some(ref shared) = self.shared_expand_cache {
+            if let Ok(map) = shared.read() {
+                if let Some(arc) = map.get(&(grouping_ptr as usize, own_prefix.to_string())) {
+                    let arc = Arc::clone(arc);
+                    // Populate per-invocation cache so subsequent lookups skip the lock.
+                    self.cache
+                        .borrow_mut()
+                        .insert((grouping_ptr, own_prefix.to_string()), Arc::clone(&arc));
+                    return Some(arc);
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn cache_insert(
@@ -162,10 +223,19 @@ impl<'a> ExpansionCtx<'a> {
         grouping_ptr: *const Grouping,
         own_prefix: &str,
         nodes: Arc<Vec<SchemaNode>>,
+        grouping_arc: &Arc<Grouping>,
     ) {
+        self.cache_keepalive.borrow_mut().push(Arc::clone(grouping_arc));
         self.cache
             .borrow_mut()
-            .insert((grouping_ptr, own_prefix.to_string()), nodes);
+            .insert((grouping_ptr, own_prefix.to_string()), Arc::clone(&nodes));
+        // Also populate shared global cache if present.
+        if let Some(ref shared) = self.shared_expand_cache {
+            if let Ok(mut map) = shared.write() {
+                map.entry((grouping_ptr as usize, own_prefix.to_string()))
+                    .or_insert(nodes);
+            }
+        }
     }
 }
 
@@ -191,6 +261,31 @@ impl CompiledModule {
             &[],
             ctx,
         )
+    }
+
+    /// Like [`children`](Self::children) but includes feature-gated nodes.  Used for
+    /// collecting inline enum types from the full schema tree (matching yanger_fxs which
+    /// walks all #sn{} nodes regardless of if-feature state).
+    pub fn all_children(&self, ctx: &ExpansionCtx<'_>) -> Vec<SchemaNode> {
+        let empty_overlay = NodeOverlayMap::new();
+        let overlay = if self.overlay.is_empty() {
+            &empty_overlay
+        } else {
+            &self.overlay
+        };
+        // Use expand_children_and_all (not expand_children_all) so that:
+        // 1. Schema paths are attached to returned nodes (needed for correct deviation
+        //    lookup when SchemaNode::all_children() recurses into children).
+        // 2. `deviate not-supported` overlays at the top level are applied correctly.
+        let (_enabled, all) = expand_children_and_all(
+            &self.children,
+            &self.prefix,
+            &self.key.name,
+            overlay,
+            &[],
+            ctx,
+        );
+        all
     }
 
     /// Find a named top-level child with early termination, expanding Uses as needed.
@@ -232,6 +327,49 @@ impl SchemaNode {
             .as_ref()
             .map(|module| &module.overlay)
             .unwrap_or(&empty_overlay);
+        if overlay.is_empty() {
+            // This node's module has no overlay. Check if there is a file_module_overlay
+            // from the enclosing context — this handles nodes that were expanded from an
+            // external grouping (their module_name is the source module, not the file module).
+            // In that case, deviations from the file module still need to be applied.
+            let fallback_ptr = ctx.file_module_overlay.get();
+            let fallback = if fallback_ptr.is_null() {
+                &empty_overlay
+            } else {
+                // SAFETY: The pointer is set by `walk_module` immediately before calling
+                // `module.children(ctx)` and points to the module's overlay, which is owned
+                // by the `CompiledModule` that outlives this call.  It is never stored beyond
+                // the duration of this function.
+                unsafe { &*fallback_ptr }
+            };
+            if fallback.is_empty() {
+                // No overlay at all — fast path, skip path computation.
+                return expand_children(
+                    raw,
+                    &self.module_prefix,
+                    &self.module_name,
+                    overlay, // empty
+                    &[],
+                    ctx,
+                );
+            }
+            // Use the file module overlay with the schema_path as parent_path so that
+            // nodes inside this external-grouping node can still have deviations applied.
+            let node_path = self.schema_path().unwrap_or_else(|| {
+                vec![PathStep {
+                    prefix: Some(self.module_prefix.clone()),
+                    name: self.name.clone(),
+                }]
+            });
+            return expand_children(
+                raw,
+                &self.module_prefix,
+                &self.module_name,
+                fallback,
+                &node_path,
+                ctx,
+            );
+        }
         let node_path = self.schema_path().unwrap_or_else(|| {
             vec![PathStep {
                 prefix: Some(self.module_prefix.clone()),
@@ -246,6 +384,93 @@ impl SchemaNode {
             &node_path,
             ctx,
         )
+    }
+
+    /// Like [`children`](Self::children) but includes feature-gated nodes (if-feature
+    /// conditions are NOT evaluated).  Used for type collection, mirroring yanger_fxs's
+    /// `add_enumeration_types` which walks the full #sn{} tree regardless of if-feature.
+    /// Like [`children`](Self::children) but includes feature-gated nodes (if-feature
+    /// conditions are NOT evaluated). Used for type collection, mirroring yanger_fxs's
+    /// `add_enumeration_types` which walks the full #sn{} tree regardless of if-feature.
+    ///
+    /// Unlike the old implementation, this DOES apply `deviate not-supported` overlays
+    /// (using the module's overlay map with the node's schema_path for key matching),
+    /// so deviated-away nodes are correctly excluded from the result.
+    pub fn all_children(&self, ctx: &ExpansionCtx<'_>) -> Vec<SchemaNode> {
+        let Some(raw) = self.raw_children() else {
+            return Vec::new();
+        };
+        if !ctx.has_any_overlay {
+            // Fast path: no overlay anywhere — no deviations to apply.
+            let empty_overlay = NodeOverlayMap::new();
+            let (_enabled, all) = expand_children_and_all(
+                raw,
+                &self.module_prefix,
+                &self.module_name,
+                &empty_overlay,
+                &[],
+                ctx,
+            );
+            return all;
+        }
+        let empty_overlay = NodeOverlayMap::new();
+        let overlay_owner = ctx.registry.resolve_import(&self.module_name, None);
+        let overlay = overlay_owner
+            .as_ref()
+            .map(|module| &module.overlay)
+            .unwrap_or(&empty_overlay);
+        if overlay.is_empty() {
+            // This node's module has no overlay. Check the file_module_overlay fallback
+            // (handles nodes expanded from external groupings where the file module's
+            // deviations still apply).
+            let fallback_ptr = ctx.file_module_overlay.get();
+            let fallback = if fallback_ptr.is_null() {
+                &empty_overlay
+            } else {
+                unsafe { &*fallback_ptr }
+            };
+            if fallback.is_empty() {
+                let (_enabled, all) = expand_children_and_all(
+                    raw,
+                    &self.module_prefix,
+                    &self.module_name,
+                    overlay, // empty
+                    &[],
+                    ctx,
+                );
+                return all;
+            }
+            let node_path = self.schema_path().unwrap_or_else(|| {
+                vec![PathStep {
+                    prefix: Some(self.module_prefix.clone()),
+                    name: self.name.clone(),
+                }]
+            });
+            let (_enabled, all) = expand_children_and_all(
+                raw,
+                &self.module_prefix,
+                &self.module_name,
+                fallback,
+                &node_path,
+                ctx,
+            );
+            return all;
+        }
+        let node_path = self.schema_path().unwrap_or_else(|| {
+            vec![PathStep {
+                prefix: Some(self.module_prefix.clone()),
+                name: self.name.clone(),
+            }]
+        });
+        let (_enabled, all) = expand_children_and_all(
+            raw,
+            &self.module_prefix,
+            &self.module_name,
+            overlay,
+            &node_path,
+            ctx,
+        );
+        all
     }
 
     pub fn input_children(&self, ctx: &ExpansionCtx<'_>) -> Vec<SchemaNode> {

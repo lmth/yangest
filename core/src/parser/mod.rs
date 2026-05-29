@@ -97,6 +97,23 @@ impl<'a> Parser<'a> {
         b
     }
 
+    /// Advance past the current UTF-8 character and return it as a `char`.
+    /// For ASCII bytes (< 0x80) this advances 1 byte; for multi-byte sequences
+    /// it advances the full character length.
+    fn advance_char(&mut self) -> char {
+        let s = &self.src[self.pos..];
+        let ch = s.chars().next().unwrap_or('\0');
+        let len = ch.len_utf8();
+        // Track newlines within the advanced bytes
+        for &b in &self.src.as_bytes()[self.pos..self.pos + len] {
+            if b == b'\n' {
+                self.line += 1;
+            }
+        }
+        self.pos += len;
+        ch
+    }
+
     #[allow(dead_code)]
     fn remaining(&self) -> &'a str {
         &self.src[self.pos..]
@@ -183,7 +200,7 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     _ => {
-                        buf.push(self.advance() as char);
+                        buf.push(self.advance_char());
                     }
                 }
             }
@@ -219,15 +236,14 @@ impl<'a> Parser<'a> {
                                     ErrorCode::ParseUnexpectedChar,
                                     "unknown escape sequence in double-quoted string",
                                 );
-                                if let Some(b) = self.peek() {
-                                    self.advance();
-                                    buf.push(b as char);
+                                if let Some(_) = self.peek() {
+                                    buf.push(self.advance_char());
                                 }
                             }
                         }
                     }
                     _ => {
-                        buf.push(self.advance() as char);
+                        buf.push(self.advance_char());
                     }
                 }
             }
@@ -797,9 +813,9 @@ module foo {
     #[test]
     fn parse_unquoted_arg_with_bracket_predicate() {
         // RFC 7950 §6.1.3: single-quote is not a stop character for unquoted
-        // strings.  acme:annotate-statement uses this syntax to target
+        // strings.  tailf:annotate-statement uses this syntax to target
         // specific grouping/list instances by name.
-        let src = r#"acme:annotate-statement "grouping[name='foo']" { acme:info "x"; }"#;
+        let src = r#"tailf:annotate-statement "grouping[name='foo']" { tailf:info "x"; }"#;
         let (stmts, errors) = parse_yang(src, file());
         assert!(errors.is_empty(), "errors: {:?}", errors);
         assert_eq!(stmts[0].arg_str(), "grouping[name='foo']");

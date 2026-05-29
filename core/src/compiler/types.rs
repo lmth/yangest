@@ -39,6 +39,20 @@ pub struct CompilationFlags {
     /// Suppress errors for unknown prefixes/features in if-feature expressions.
     /// Unknown features are treated as disabled (false) at expansion time.
     pub ignore_unknown_features: bool,
+    /// Extension on a typedef that provides an informational description string.
+    /// When present, its argument is stored in [`Typedef::ext_info`].
+    /// Format: `(module_name, extension_name)`.
+    pub typedef_info_extension: Option<(String, String)>,
+    /// Extension on a typedef that marks the type as opaque (resolved externally
+    /// at runtime rather than from the YANG type hierarchy).
+    /// Format: `(module_name, extension_name)`.
+    /// When present, its argument is stored in [`Typedef::opaque_type_name`].
+    pub opaque_type_extension: Option<(String, String)>,
+    /// Extensions that count as "metadata" for source-ordering computations.
+    /// [`SchemaNode::status_before_ext_meta`] is `true` when `status` appears
+    /// before the first instance of any of these extensions in the YANG source.
+    /// Format: `[(module_name, extension_name), ...]`.
+    pub meta_extensions: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +88,17 @@ pub struct Typedef {
     pub default: Option<String>,
     pub status: Status,
     pub description: Option<String>,
+    /// Informational text from a plugin-registered extension (e.g. an "info"
+    /// extension providing a short human-readable description of the type).
+    /// Populated during compilation when [`CompilationFlags::typedef_info_extension`]
+    /// is configured and the matching extension is found on the typedef.
+    pub ext_info: Option<String>,
+    /// True when an extension marks this typedef as having an externally-resolved
+    /// (opaque) type that is not part of the standard YANG type hierarchy.
+    pub has_opaque_type: bool,
+    /// The argument of the opaque-type extension, if present (e.g. a named
+    /// type-point identifier used to resolve the type at runtime).
+    pub opaque_type_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +114,10 @@ pub struct Grouping {
     pub def_own_prefix: String,
     /// The module name where this grouping was defined.
     pub definer_module_name: String,
+    /// Groupings available at the scope where this grouping was defined.
+    /// Populated for nested groupings (defined inside another grouping or schema node)
+    /// so that sibling groupings are available during fallback expansion.
+    pub scope_groupings: Option<Arc<IndexMap<String, Grouping>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +132,16 @@ pub struct MustExpr {
     pub error_message: Option<String>,
     pub error_app_tag: Option<String>,
     pub description: Option<String>,
+    pub source_module: String,
+    /// Revision of the source module. `None` for must statements in the target module itself.
+    /// Set when the must was injected by an annotation module.
+    pub source_revision: Option<String>,
+    /// Explicit dependency paths from extension sub-statements (e.g. a "dependency"
+    /// extension that lists additional paths the must expression depends on).
+    pub explicit_deps: Vec<String>,
+    /// True when an "override-auto-dependencies" extension is present: use only
+    /// explicit deps, skip XPath-derived auto-dependency analysis.
+    pub override_auto_deps: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,12 +149,20 @@ pub struct WhenExpr {
     pub xpath: String,
     pub description: Option<String>,
     pub reference: Option<String>,
+    pub source_module: String,
+    /// Revision of the source module. `None` for regular when statements (uses the
+    /// owning node's module revision). Set for annotation-originated when conditions.
+    pub source_revision: Option<String>,
+    /// True when this when expression was inherited from a `uses` or `augment` statement
+    /// (non-local origin). When true, `F_WHEN_CTX_NODE_UP` must be set in the FXS
+    /// when tuple, and deps need a parent step prepended.
+    pub non_local: bool,
 }
 
 /// An extension statement applied to a schema node or module during compilation.
 #[derive(Debug, Clone)]
 pub struct ExtensionInstance {
-    /// The resolved module name of the extension (e.g. `"acme-ext"`).
+    /// The resolved module name of the extension (e.g. `"tailf-common"`).
     pub module: String,
     /// The local extension name (e.g. `"callpoint"`).
     pub name: String,
@@ -124,6 +171,9 @@ pub struct ExtensionInstance {
     /// Raw sub-statements.  The plugin that declared this extension's grammar
     /// can interpret them according to its [`ExtensionGrammar::substmts`] rules.
     pub substmts: Vec<Stmt>,
+    /// Source position of the extension statement (used for ordering, e.g.
+    /// extension entries may need to be sorted by source position).
+    pub pos: Pos,
 }
 
 pub struct SchemaNode {
@@ -133,8 +183,20 @@ pub struct SchemaNode {
     /// Used when rendering augmented nodes in a foreign module's tree where the
     /// augmenting module is not in the target module's prefix_map.
     pub module_prefix: String,
+    /// The module that DEFINED this node — equals the grouping definer for nodes
+    /// expanded from a grouping, the augmenting module for augmented nodes, and
+    /// the module itself for locally-defined nodes.
+    pub origin_module: String,
     pub pos: Pos,
     pub status: Status,
+    /// True if the `status` statement is declared before the first plugin-defined
+    /// metadata extension in the YANG source.  Used by emit plugins that need to
+    /// reproduce source-order-dependent output ordering.
+    /// See [`CompilationFlags::meta_extensions`] for the configured extension list.
+    pub status_before_ext_meta: bool,
+    /// True if the `status` statement is declared before `units` in the YANG source.
+    /// Emit plugins use this to reproduce source-order-dependent output ordering.
+    pub units_before_status: bool,
     pub config: Option<bool>,
     pub when: Vec<WhenExpr>,
     pub if_features: Vec<IfFeatureExpr>,
@@ -143,6 +205,10 @@ pub struct SchemaNode {
     /// Extension statements applied to this node, in declaration order.
     pub extensions: Vec<ExtensionInstance>,
     pub kind: SchemaNodeKind,
+    /// Statuses of groupings directly referenced by `uses` in this node's YANG substmts,
+    /// captured at compile time before expansion replaces children.
+    /// Used by emit plugins that need grouping-status information for output ordering.
+    pub uses_grouping_statuses: Vec<Status>,
     pub pmap: PMap,
 }
 
@@ -152,8 +218,11 @@ impl std::fmt::Debug for SchemaNode {
             .field("name", &self.name)
             .field("module_name", &self.module_name)
             .field("module_prefix", &self.module_prefix)
+            .field("origin_module", &self.origin_module)
             .field("pos", &self.pos)
             .field("status", &self.status)
+            .field("status_before_ext_meta", &self.status_before_ext_meta)
+            .field("units_before_status", &self.units_before_status)
             .field("config", &self.config)
             .field("when", &self.when)
             .field("if_features", &self.if_features)
@@ -171,8 +240,11 @@ impl Clone for SchemaNode {
             name: self.name.clone(),
             module_name: self.module_name.clone(),
             module_prefix: self.module_prefix.clone(),
+            origin_module: self.origin_module.clone(),
             pos: self.pos.clone(),
             status: self.status,
+            status_before_ext_meta: self.status_before_ext_meta,
+            units_before_status: self.units_before_status,
             config: self.config,
             when: self.when.clone(),
             if_features: self.if_features.clone(),
@@ -180,6 +252,7 @@ impl Clone for SchemaNode {
             reference: self.reference.clone(),
             extensions: self.extensions.clone(),
             kind: self.kind.clone(),
+            uses_grouping_statuses: self.uses_grouping_statuses.clone(),
             pmap: HashMap::new(), // pmap holds renderer-private data; not cloned
         }
     }
@@ -268,6 +341,11 @@ pub enum SchemaNodeKind {
         grouping: Arc<Grouping>,
         /// Module name of the grouping source (for cross-module lookups at expansion time).
         source_module_name: Option<String>,
+        /// True if the `uses` statement had NO prefix (e.g., `uses foo`).
+        /// False if it had any prefix (e.g., `uses mymod:foo` or `uses ext:foo`).
+        /// Emit plugins may use this to control whether to recurse into the grouping
+        /// for same-module vs cross-module grouping references.
+        was_unprefixed: bool,
         overlay: UsesOverlay,
     },
 }
@@ -277,6 +355,9 @@ pub struct AugmentEntry {
     pub nodes: Vec<SchemaNode>,
     pub when: Vec<WhenExpr>,
     pub if_features: Vec<IfFeatureExpr>,
+    /// Status from the `augment` statement (RFC 6020 §7.15).
+    /// All nodes added by this augment have their status restricted to this value.
+    pub status: Status,
 }
 
 /// Overlay carried by a `uses` node: use-site refinements, local augments,
@@ -318,6 +399,7 @@ pub struct NodeOverlay {
     /// Raw `deviate` sub-statements (each Stmt has arg = "add"/"replace"/"delete"/"not-supported").
     pub deviate_stmts: Vec<Stmt>,
     pub annotations: Vec<Annotation>,
+    pub source_module: Option<String>,
 }
 
 /// A plugin annotation attached to a schema node by path.
@@ -330,30 +412,73 @@ pub struct Annotation {
     /// Resolved extension instances from the annotation body (sub-statements of
     /// the `annotate`-style extension statement in the overlay module).
     pub instances: Vec<ExtensionInstance>,
+    /// Raw `when` statements from the annotation body; applied to the target
+    /// node's `when` list with the annotation module as source.
+    pub when_stmts: Vec<Stmt>,
+    /// Raw `must` statements from the annotation body; applied to the target
+    /// node's `must` list with the annotation module as source.
+    pub must_stmts: Vec<Stmt>,
+    /// Name of the annotation module that declared this annotation.
+    pub source_module: String,
+    /// Revision of the annotation module that declared this annotation.
+    pub source_revision: Option<String>,
     /// Name of the plugin that registered the corresponding [`OverlayExtension`].
     pub source_plugin: &'static str,
 }
 
-pub type NodeOverlayMap = HashMap<SchemaPath, NodeOverlay>;
+/// Overlay maps use name-only paths (no prefix) as keys so that nodes from
+/// expanded groupings (which may retain a different module prefix than the one
+/// used in the deviation/annotation path) are still matched correctly.
+pub type OverlayKey = Vec<String>;
+pub type NodeOverlayMap = HashMap<OverlayKey, NodeOverlay>;
 
 pub type PrefixMap = indexmap::IndexMap<String, String>;
 
 /// The deviation modules that were applied to this module during compilation.
 ///
 /// Stored via [`CompiledModule::set_pdata`] during compilation.
-/// Each entry is `(module_name, revision)` — revision is `None` when unspecified.
+/// Each entry is `(module_name, revision, prefix_map, has_must_or_when)` where
+/// `prefix_map` maps prefix → module_name for all imports declared in the
+/// deviation module, and `has_must_or_when` is true when the deviation adds
+/// or replaces `must` or `when` statements.
 ///
 /// Retrieved by plugins with `module.pdata::<AppliedDeviations>()`.
-pub struct AppliedDeviations(pub Vec<(String, Option<String>)>);
+pub struct AppliedDeviations(pub Vec<(String, Option<String>, PrefixMap, bool)>);
 
 /// The annotation modules that were applied to this module during compilation.
 ///
 /// Stored via [`CompiledModule::set_pdata`] during compilation.
-/// Each entry is `(module_name, revision, prefix_map)` where `prefix_map` maps
-/// prefix → module_name for all imports declared in the annotation module.
+/// Each entry is `(module_name, revision, prefix_map, has_when_or_must)` where
+/// `prefix_map` maps prefix → module_name for all imports declared in the
+/// annotation module, and `has_when_or_must` is true when the annotation adds
+/// `when` or `must` statements to any target node.
 ///
 /// Retrieved by plugins with `module.pdata::<AppliedAnnotations>()`.
-pub struct AppliedAnnotations(pub Vec<(String, Option<String>, PrefixMap)>);
+///
+/// Each entry: `(name, rev, prefix_map, has_wm, root_is_self, ext_prefixes)` where:
+/// - `root_is_self` is `true` if the annotation module's annotate paths start with
+///   a prefix that resolves to the target (base) module itself — meaning the annotation
+///   targets the base module's own nodes directly, so yanger calls `combine_prefix_maps`
+///   on the base module and the annotation module's namespace should appear in the
+///   base module's `ns_to_prefix_maps` entry.
+/// - `ext_prefixes` is the sorted, deduplicated list of YANG prefixes found in extension
+///   instance arguments (e.g. `cli-diff-dependency` path args like `/ios:native/ios-aaa:...`).
+///   These prefixes must be added to the target module's yang_header imports even when there
+///   are no when/must expressions (`has_wm` is false).
+pub struct AppliedAnnotations(pub Vec<(String, Option<String>, PrefixMap, bool, bool, Vec<String>)>);
+
+/// AST annotation modules applied via annotate-module + annotate-statement overlay extensions.
+///
+/// These annotations are merged into the target module's AST *before* compilation, so they
+/// do not appear in [`AppliedAnnotations`] (which only covers path-based node annotations).
+/// Plugins use this to discover which annotation modules contributed extension arguments
+/// that reference external prefixes.
+///
+/// Each entry: `(ann_module_name, ann_module_revision, prefix_map)`.
+///
+/// Stored via [`CompiledModule::set_pdata`] after compilation in the main driver.
+/// Retrieved by plugins with `module.pdata::<AstAppliedAnnotations>()`.
+pub struct AstAppliedAnnotations(pub Vec<(String, Option<String>, std::collections::HashMap<String, String>)>);
 
 pub struct CompiledModule {
     pub key: ModuleKey,

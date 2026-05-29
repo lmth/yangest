@@ -28,6 +28,15 @@ pub struct PendingDeviation {
     /// Resolved name of the target module, pre-computed from the deviating
     /// module's import stmts.  `None` when there is no prefix (same module).
     pub target_module_name: Option<String>,
+    /// The prefix used on the LAST step of `target_path`.
+    /// For cross-module augment deviations (e.g. `/A:foo/B:bar`), this is B's prefix.
+    /// `None` if the last step has no prefix.
+    pub target_leaf_prefix: Option<String>,
+    /// Resolved name of the module owning the leaf node (last step's module).
+    /// For cross-module augment deviations this differs from `target_module_name`.
+    /// This is the module where the deviation is applied in `apply_deviations`,
+    /// matching how `expand_children` routes overlay entries by the last prefix.
+    pub target_leaf_module_name: Option<String>,
     /// Full prefix→module_name map from the deviating module's imports.
     /// Used to resolve intermediate path step prefixes without a registry lookup.
     pub prefix_map: HashMap<String, String>,
@@ -104,6 +113,11 @@ fn collect_deviations(
                 .as_deref()
                 .and_then(|pfx| prefix_map.get(pfx))
                 .cloned();
+            let target_leaf_prefix = extract_last_prefix(&target_path);
+            let target_leaf_module_name = target_leaf_prefix
+                .as_deref()
+                .and_then(|pfx| prefix_map.get(pfx))
+                .cloned();
             let deviate_stmts: Vec<Stmt> = sub
                 .get_substmts(BuiltInKeyword::Deviate)
                 .cloned()
@@ -114,6 +128,8 @@ fn collect_deviations(
                 target_path,
                 target_prefix,
                 target_module_name,
+                target_leaf_prefix,
+                target_leaf_module_name,
                 prefix_map: prefix_map.clone(),
                 pos: sub.pos.clone(),
                 deviate_stmts,
@@ -131,6 +147,21 @@ fn extract_first_prefix(path: &str) -> Option<String> {
     let first_step = path.split('/').next()?;
     if let Some(colon_pos) = first_step.find(':') {
         Some(first_step[..colon_pos].to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract the prefix from the last path step of an absolute schema node id.
+///
+/// `/A:foo/B:bar/B:baz` → `Some("B")`  
+/// `/A:foo/A:bar`       → `Some("A")`  
+/// `/A:foo/bar`         → `None` (last step has no prefix)
+fn extract_last_prefix(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    let last_step = path.split('/').next_back()?;
+    if let Some(colon_pos) = last_step.find(':') {
+        Some(last_step[..colon_pos].to_string())
     } else {
         None
     }
