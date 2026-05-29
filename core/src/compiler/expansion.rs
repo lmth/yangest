@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use super::compile::{expand_children, expand_children_all, expand_children_and_all, find_child_in_raw};
+use super::compile::{expand_children, expand_children_all, expand_children_and_all, expand_children_with_secondary, find_child_in_raw};
 use super::{
     CompiledModule, Grouping, IfFeatureExpr, ModuleRegistry, NodeOverlayMap, PathStep, SchemaNode,
     SchemaNodeKind, SchemaPath, Status,
@@ -327,63 +327,73 @@ impl SchemaNode {
             .as_ref()
             .map(|module| &module.overlay)
             .unwrap_or(&empty_overlay);
-        if overlay.is_empty() {
-            // This node's module has no overlay. Check if there is a file_module_overlay
-            // from the enclosing context — this handles nodes that were expanded from an
-            // external grouping (their module_name is the source module, not the file module).
-            // In that case, deviations from the file module still need to be applied.
-            let fallback_ptr = ctx.file_module_overlay.get();
-            let fallback = if fallback_ptr.is_null() {
-                &empty_overlay
-            } else {
-                // SAFETY: The pointer is set by `walk_module` immediately before calling
-                // `module.children(ctx)` and points to the module's overlay, which is owned
-                // by the `CompiledModule` that outlives this call.  It is never stored beyond
-                // the duration of this function.
-                unsafe { &*fallback_ptr }
-            };
-            if fallback.is_empty() {
-                // No overlay at all — fast path, skip path computation.
-                return expand_children(
-                    raw,
-                    &self.module_prefix,
-                    &self.module_name,
-                    overlay, // empty
-                    &[],
-                    ctx,
-                );
-            }
-            // Use the file module overlay with the schema_path as parent_path so that
-            // nodes inside this external-grouping node can still have deviations applied.
-            let node_path = self.schema_path().unwrap_or_else(|| {
-                vec![PathStep {
-                    prefix: Some(self.module_prefix.clone()),
-                    name: self.name.clone(),
-                }]
-            });
+
+        // Get file_module_overlay (annotations from the emitting module targeting nodes
+        // in external groupings).
+        let fallback_ptr = ctx.file_module_overlay.get();
+        let file_overlay = if fallback_ptr.is_null() {
+            &empty_overlay
+        } else {
+            // SAFETY: The pointer is set by `walk_module` immediately before calling
+            // `module.children(ctx)` and points to the module's overlay, which is owned
+            // by the `CompiledModule` that outlives this call.
+            unsafe { &*fallback_ptr }
+        };
+
+        // Both overlays empty → fast path.
+        if overlay.is_empty() && file_overlay.is_empty() {
             return expand_children(
                 raw,
                 &self.module_prefix,
                 &self.module_name,
-                fallback,
-                &node_path,
+                &empty_overlay,
+                &[],
                 ctx,
             );
         }
+
         let node_path = self.schema_path().unwrap_or_else(|| {
             vec![PathStep {
                 prefix: Some(self.module_prefix.clone()),
                 name: self.name.clone(),
             }]
         });
-        expand_children(
-            raw,
-            &self.module_prefix,
-            &self.module_name,
-            overlay,
-            &node_path,
-            ctx,
-        )
+
+        // Determine primary/secondary overlay pairing.  When both are non-empty and
+        // different, use the node's own module overlay as primary and file_module_overlay
+        // as secondary (fallback for keys not found in primary).
+        if overlay.is_empty() {
+            // Only file overlay — use it as primary.
+            expand_children(
+                raw,
+                &self.module_prefix,
+                &self.module_name,
+                file_overlay,
+                &node_path,
+                ctx,
+            )
+        } else if file_overlay.is_empty() || std::ptr::eq(overlay, file_overlay) {
+            // Only node overlay (or same pointer) — use it as primary.
+            expand_children(
+                raw,
+                &self.module_prefix,
+                &self.module_name,
+                overlay,
+                &node_path,
+                ctx,
+            )
+        } else {
+            // Both non-empty and different — use secondary overlay for fallback lookups.
+            expand_children_with_secondary(
+                raw,
+                &self.module_prefix,
+                &self.module_name,
+                overlay,
+                file_overlay,
+                &node_path,
+                ctx,
+            )
+        }
     }
 
     /// Like [`children`](Self::children) but includes feature-gated nodes (if-feature
@@ -419,54 +429,53 @@ impl SchemaNode {
             .as_ref()
             .map(|module| &module.overlay)
             .unwrap_or(&empty_overlay);
-        if overlay.is_empty() {
-            // This node's module has no overlay. Check the file_module_overlay fallback
-            // (handles nodes expanded from external groupings where the file module's
-            // deviations still apply).
-            let fallback_ptr = ctx.file_module_overlay.get();
-            let fallback = if fallback_ptr.is_null() {
-                &empty_overlay
-            } else {
-                unsafe { &*fallback_ptr }
-            };
-            if fallback.is_empty() {
-                let (_enabled, all) = expand_children_and_all(
-                    raw,
-                    &self.module_prefix,
-                    &self.module_name,
-                    overlay, // empty
-                    &[],
-                    ctx,
-                );
-                return all;
-            }
-            let node_path = self.schema_path().unwrap_or_else(|| {
-                vec![PathStep {
-                    prefix: Some(self.module_prefix.clone()),
-                    name: self.name.clone(),
-                }]
-            });
+
+        // Get file_module_overlay for secondary lookup.
+        let fallback_ptr = ctx.file_module_overlay.get();
+        let file_overlay = if fallback_ptr.is_null() {
+            &empty_overlay
+        } else {
+            unsafe { &*fallback_ptr }
+        };
+
+        // Both empty → fast path.
+        if overlay.is_empty() && file_overlay.is_empty() {
             let (_enabled, all) = expand_children_and_all(
                 raw,
                 &self.module_prefix,
                 &self.module_name,
-                fallback,
-                &node_path,
+                &empty_overlay,
+                &[],
                 ctx,
             );
             return all;
         }
+
         let node_path = self.schema_path().unwrap_or_else(|| {
             vec![PathStep {
                 prefix: Some(self.module_prefix.clone()),
                 name: self.name.clone(),
             }]
         });
+
+        // Use the non-empty overlay (or merge if both are non-empty).
+        // For all_children, expand_children_and_all only checks for not-supported
+        // deviations so exact merge semantics don't affect type collection.
+        let effective = if overlay.is_empty() {
+            file_overlay
+        } else if file_overlay.is_empty() || std::ptr::eq(overlay, file_overlay) {
+            overlay
+        } else {
+            // Both non-empty: use node's overlay (sufficient for not-supported checks
+            // since all_children is used for type collection, not must/when application).
+            overlay
+        };
+
         let (_enabled, all) = expand_children_and_all(
             raw,
             &self.module_prefix,
             &self.module_name,
-            overlay,
+            effective,
             &node_path,
             ctx,
         );

@@ -2046,6 +2046,34 @@ pub fn expand_children(
     parent_path: &[PathStep],
     ctx: &ExpansionCtx<'_>,
 ) -> Vec<SchemaNode> {
+    expand_children_inner(raw, own_prefix, module_name, overlay, None, parent_path, ctx)
+}
+
+/// Like [`expand_children`] but with an additional secondary overlay that is checked
+/// when the primary overlay does not contain an entry for a given key.  Used when
+/// expanding children of an external-grouping node where annotations may come from
+/// both the node's defining module and the file module being emitted.
+pub fn expand_children_with_secondary(
+    raw: &[SchemaNode],
+    own_prefix: &str,
+    module_name: &str,
+    overlay: &NodeOverlayMap,
+    secondary_overlay: &NodeOverlayMap,
+    parent_path: &[PathStep],
+    ctx: &ExpansionCtx<'_>,
+) -> Vec<SchemaNode> {
+    expand_children_inner(raw, own_prefix, module_name, overlay, Some(secondary_overlay), parent_path, ctx)
+}
+
+fn expand_children_inner(
+    raw: &[SchemaNode],
+    own_prefix: &str,
+    module_name: &str,
+    overlay: &NodeOverlayMap,
+    secondary_overlay: Option<&NodeOverlayMap>,
+    parent_path: &[PathStep],
+    ctx: &ExpansionCtx<'_>,
+) -> Vec<SchemaNode> {
     let _ = (own_prefix, module_name);
     let mut result = Vec::with_capacity(raw.len());
     for node in raw {
@@ -2065,17 +2093,20 @@ pub fn expand_children(
                     overlay,
                     ctx,
                 );
-                result.extend(expand_children(
+                result.extend(expand_children_inner(
                     &expanded,
                     &node.module_prefix,
                     &node.module_name,
                     overlay,
+                    secondary_overlay,
                     parent_path,
                     ctx,
                 ));
             }
             _ => {
-                if !ctx.has_any_overlay || overlay.is_empty() {
+                let has_overlay = ctx.has_any_overlay
+                    && (!overlay.is_empty() || secondary_overlay.map_or(false, |s| !s.is_empty()));
+                if !has_overlay {
                     // Fast path: no overlay applicable — skip per-node path allocation,
                     // overlay lookup, and schema_path pmap insert.
                     let materialized = node.clone();
@@ -2086,7 +2117,11 @@ pub fn expand_children(
                     let mut materialized = node.clone();
                     let overlay_key =
                         child_overlay_key(parent_path, &materialized.name);
-                    if !apply_overlay_entry(&mut materialized, overlay.get(&overlay_key)) {
+                    // Check primary overlay first, then secondary.
+                    let entry = overlay.get(&overlay_key).or_else(|| {
+                        secondary_overlay.and_then(|s| s.get(&overlay_key))
+                    });
+                    if !apply_overlay_entry(&mut materialized, entry) {
                         continue;
                     }
                     if !node_visible(&materialized, ctx) {
