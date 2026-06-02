@@ -376,6 +376,8 @@ Records one `augment` statement contributed by a module to some other module's t
 | `nodes` | `Vec<SchemaNode>` | The nodes injected at that path. |
 | `when` | `Vec<WhenExpr>` | `when` constraints on the augment. |
 | `if_features` | `Vec<IfFeatureExpr>` | `if-feature` guards on the augment. |
+| `status` | `Status` | Status from the `augment` statement; restricts the status of all injected nodes. |
+| `pos` | `Pos` | Source position of the `augment` statement. A module's `augments` are kept sorted by definition site (`pos.orig_file()`, `pos.orig_line()`) so backends can apply them in source order. |
 
 ### `ModuleRegistry`
 
@@ -590,6 +592,28 @@ An early-termination variant of child expansion: stops as soon as the first visi
 child with `name == target_name` is found, lazily expanding `uses` groupings only as
 needed. Useful for navigating augment target paths step-by-step in large modules
 without the O(n) cost of a full `children(ctx)` expansion.
+
+### Optional resolution & navigation facilities
+
+The helpers above cover the common case of walking the expanded tree. Backends that
+also need to reason about *types*, *leafref targets*, or *XPath dependencies* can use
+the following subsystems. They are **opt-in**: each is constructed on demand from an
+already-compiled `ModuleRegistry`/`ExpansionCtx`, and nothing in the compile path or
+in `children(ctx)` touches them — so plugins that do not need them (such as `tree`)
+pay nothing. Unlike the types in this section, these live outside
+`yangest_core::compiler`, in the modules named below.
+
+| Facility | Module | What it does |
+|----------|--------|--------------|
+| `TypeRegistry` | `yangest_core::types_registry` | Resolve a `type` statement to a `ResolvedType` — the built-in base plus the flattened typedef-derivation chain, accumulated `range`/`length`/`pattern` restrictions, and union members / enum / bits / identity bases. `lookup` and `lookup_builtin` resolve typedefs and built-ins directly. |
+| `TypeRegistry::follow_leafref` | `yangest_core::types_registry::leafref` | Given a leafref `type` and a `Cursor` positioned at the leaf, walk to the target node and resolve its (fully-dereferenced) type; reports whether the target is a `leaf-list` so a backend can emit the target type rather than an undefined one. |
+| `Cursor` | `yangest_core::cursor` | Stateful navigation of the *logical* schema tree, where `choice`/`case` are transparent and cross-module augments are applied. Supports `find_child` / `move_step` / `follow_path` / `ancestors`, a `FloatingCursor` for multi-position contexts, and a pinned XPath root for relative resolution. |
+| `compile_dep_paths` | `yangest_core::xpath::deps` | Normalise a `when`/`must` `XPathExpr` into dependency keypaths, collapsing transparent `choice`/`case` (so a sibling reference inside a `case` resolves correctly) and preserving each step's namespace across module boundaries. |
+
+For incremental namespace registration during type resolution, implement
+`types_registry::TypeResolutionObserver` and pass it to `resolve_with_observer` /
+`follow_leafref_with_observer`; the default resolution paths use a zero-cost no-op
+observer.
 
 ---
 

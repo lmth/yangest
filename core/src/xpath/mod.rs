@@ -10,6 +10,9 @@
 //! 3. Function whitelist checking (RFC 7950 §10.5)
 //! 4. Schema-path extraction for `path` (leafref) statements
 //!
+//! The [`deps`] submodule builds on the parsed AST to normalise `when`/`must`
+//! expressions into dependency keypaths (used by backends, not during compile).
+//!
 //! Reference: XPath 1.0 §1-4 (https://www.w3.org/TR/xpath-10/)
 
 use std::collections::HashSet;
