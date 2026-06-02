@@ -358,6 +358,12 @@ pub struct AugmentEntry {
     /// Status from the `augment` statement (RFC 6020 §7.15).
     /// All nodes added by this augment have their status restricted to this value.
     pub status: Status,
+    /// Source position of the `augment` statement, carried so backends can apply
+    /// augments in source order. The reference compiler orders CS records and
+    /// hash-dictionary insertions by source position, which differs from
+    /// "module name then keyword". Use [`Pos::orig_file`]/[`Pos::orig_line`] to
+    /// order by definition site for augments injected through a grouping.
+    pub pos: Pos,
 }
 
 /// Overlay carried by a `uses` node: use-site refinements, local augments,
@@ -426,10 +432,22 @@ pub struct Annotation {
     pub source_plugin: &'static str,
 }
 
-/// Overlay maps use name-only paths (no prefix) as keys so that nodes from
-/// expanded groupings (which may retain a different module prefix than the one
-/// used in the deviation/annotation path) are still matched correctly.
-pub type OverlayKey = Vec<String>;
+/// Overlay map key: a name-only path plus an optional *leaf module*
+/// qualifier (the module that owns the target leaf node).
+///
+/// The name-only path lets nodes from expanded groupings (which may retain a
+/// different module prefix than the one used in the deviation/annotation path)
+/// still match. The optional leaf-module disambiguates same-named siblings that
+/// come from different modules — e.g. two augments contributing a `interface`
+/// node under the same target — which would otherwise collide on the name path
+/// alone and apply the wrong (or both) annotations.
+///
+/// Every entry is stored under both a qualified key `(path, Some(module))` and
+/// an unqualified key `(path, None)`. Lookups try the qualified key first (using
+/// the node's own module) and fall back to the unqualified key, so the precise
+/// match wins where modules are known while the legacy name-only behaviour is
+/// preserved wherever they are not. See [`crate::compiler::overlay_name_path`].
+pub type OverlayKey = (Vec<String>, Option<String>);
 pub type NodeOverlayMap = HashMap<OverlayKey, NodeOverlay>;
 
 pub type PrefixMap = indexmap::IndexMap<String, String>;
