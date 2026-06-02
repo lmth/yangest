@@ -15,6 +15,8 @@
 use std::collections::HashSet;
 use std::fmt;
 
+pub mod deps;
+
 // ── Public AST types ──────────────────────────────────────────────────────────
 
 /// A qualified name, e.g. `prefix:local` or bare `local`.

@@ -14,7 +14,7 @@ use super::{
     AppliedAnnotations, AppliedDeviations, AugmentEntry, CompilationFlags, CompiledModule,
     ExpansionCtx, ExtensionInstance, Feature, Grouping, Identity, IfFeatureExpr,
     LocalAugmentEntry, ModuleRegistry, MustExpr, NodeOverlay, NodeOverlayMap, OrderedBy,
-    OverlayKey, PathStep, PrefixMap, SchemaNode, SchemaNodeKind, SchemaPath, Status, Typedef,
+    PathStep, PrefixMap, SchemaNode, SchemaNodeKind, SchemaPath, Status, Typedef,
     UsesOverlay, WhenExpr, YangVersion,
 };
 use indexmap::IndexMap;
@@ -679,10 +679,34 @@ fn collect_augments(
                 ignore_unknown,
             ),
             status: aug_status,
+            pos: augment.pos.clone(),
         });
     }
 
+    // Canonicalise to source order. Augments collected from a single module
+    // statement are already in declaration order, so this is a no-op in the
+    // common case; the stable sort guarantees the invariant regardless of how
+    // the list was assembled (e.g. if submodule augments are ever merged in),
+    // and lets every consumer rely on `CompiledModule::augments` being ordered
+    // by definition site. Cheap: runs once at compile over a tiny list.
+    sort_augments_by_source(&mut augments);
+
     augments
+}
+
+/// Order augments by source position (definition site), so backends can apply
+/// them in the same order as the reference compiler. Stable: augments sharing a
+/// position keep their relative (declaration) order.
+fn sort_augments_by_source(augments: &mut [AugmentEntry]) {
+    if augments.len() < 2 {
+        return;
+    }
+    augments.sort_by(|a, b| {
+        a.pos
+            .orig_file()
+            .cmp(b.pos.orig_file())
+            .then(a.pos.orig_line().cmp(&b.pos.orig_line()))
+    });
 }
 
 /// Inline a self-augment's nodes into the target node's children list.
@@ -2115,12 +2139,16 @@ fn expand_children_inner(
                     }
                 } else {
                     let mut materialized = node.clone();
-                    let overlay_key =
-                        child_overlay_key(parent_path, &materialized.name);
-                    // Check primary overlay first, then secondary.
-                    let entry = overlay.get(&overlay_key).or_else(|| {
-                        secondary_overlay.and_then(|s| s.get(&overlay_key))
-                    });
+                    let overlay_path =
+                        overlay_name_path(parent_path, &materialized.name);
+                    // Check primary overlay first, then secondary; each tries the
+                    // module-qualified key before the unqualified fallback.
+                    let entry = lookup_overlay(overlay, &overlay_path, &materialized.module_name)
+                        .or_else(|| {
+                            secondary_overlay.and_then(|s| {
+                                lookup_overlay(s, &overlay_path, &materialized.module_name)
+                            })
+                        });
                     if !apply_overlay_entry(&mut materialized, entry) {
                         continue;
                     }
@@ -2172,8 +2200,9 @@ pub fn expand_children_all(
                 // Nodes with `not-supported` deviations are still excluded.
                 let mut materialized = node.clone();
                 if ctx.has_any_overlay && !overlay.is_empty() {
-                    let overlay_key = child_overlay_key(&[], &materialized.name);
-                    if !apply_overlay_entry(&mut materialized, overlay.get(&overlay_key)) {
+                    let overlay_path = overlay_name_path(&[], &materialized.name);
+                    let entry = lookup_overlay(overlay, &overlay_path, &materialized.module_name);
+                    if !apply_overlay_entry(&mut materialized, entry) {
                         continue;
                     }
                 }
@@ -2245,8 +2274,9 @@ pub fn expand_children_and_all(
                     }
                 } else {
                     let mut materialized = node.clone();
-                    let overlay_key = child_overlay_key(parent_path, &materialized.name);
-                    if !apply_overlay_entry(&mut materialized, overlay.get(&overlay_key)) {
+                    let overlay_path = overlay_name_path(parent_path, &materialized.name);
+                    let entry = lookup_overlay(overlay, &overlay_path, &materialized.module_name);
+                    if !apply_overlay_entry(&mut materialized, entry) {
                         // `not-supported` deviated — exclude from both.
                         continue;
                     }
@@ -2281,14 +2311,44 @@ fn child_path(parent_path: &[PathStep], module_prefix: &str, name: &str) -> Sche
     path
 }
 
-/// Build a name-only overlay key for looking up deviations/annotations.
-/// Prefixes are omitted so that nodes from expanded groupings (which may retain
-/// their source module's prefix) still match deviation paths that use the
-/// importing module's prefix.
-fn child_overlay_key(parent_key: &[PathStep], name: &str) -> OverlayKey {
-    let mut key: OverlayKey = parent_key.iter().map(|s| s.name.clone()).collect();
-    key.push(name.to_string());
-    key
+/// Build a name-only overlay path (no prefixes) from a parent path and a child
+/// name. Prefixes are omitted so that nodes from expanded groupings (which may
+/// retain their source module's prefix) still match deviation/annotation paths
+/// that use the importing module's prefix; module disambiguation is layered on
+/// top via the [`OverlayKey`]'s optional leaf-module qualifier.
+pub fn overlay_name_path(parent_key: &[PathStep], name: &str) -> Vec<String> {
+    let mut path: Vec<String> = parent_key.iter().map(|s| s.name.clone()).collect();
+    path.push(name.to_string());
+    path
+}
+
+/// Look up an overlay entry for a node, trying the module-qualified key first
+/// (so same-named siblings from different modules don't collide) and falling
+/// back to the unqualified key (preserving grouping-expansion matches where the
+/// node's module differs from the path prefix).
+fn lookup_overlay<'a>(
+    map: &'a NodeOverlayMap,
+    path: &[String],
+    node_module: &str,
+) -> Option<&'a NodeOverlay> {
+    map.get(&(path.to_vec(), Some(node_module.to_string())))
+        .or_else(|| map.get(&(path.to_vec(), None)))
+}
+
+/// Insert into / update an overlay under both the module-qualified key (when the
+/// leaf module is known) and the unqualified key, so qualified lookups
+/// disambiguate while unqualified lookups still match. `update` is applied to
+/// each bucket's [`NodeOverlay`].
+fn overlay_entry_mut<F: FnMut(&mut NodeOverlay)>(
+    overlay: &mut NodeOverlayMap,
+    path: Vec<String>,
+    leaf_module: Option<String>,
+    mut update: F,
+) {
+    if let Some(m) = leaf_module {
+        update(overlay.entry((path.clone(), Some(m))).or_default());
+    }
+    update(overlay.entry((path, None)).or_default());
 }
 
 /// Find a named child in a raw node list with early termination, expanding
@@ -3267,16 +3327,17 @@ fn apply_deviations(
             };
 
             let target_found = find_node_mut(children, &target_path).is_some();
+            let leaf_module = deviation.target_leaf_module_name.clone();
             if !target_found {
-                let overlay_key: OverlayKey =
-                    target_path.iter().map(|s| s.name.clone()).collect();
-                let entry = overlay.entry(overlay_key).or_default();
-                if entry.source_module.is_none() {
-                    entry.source_module = Some(deviation.from_module.name.clone());
-                }
-                entry
-                    .deviate_stmts
-                    .extend(deviation.deviate_stmts.iter().cloned());
+                let path = target_path.iter().map(|s| s.name.clone()).collect();
+                overlay_entry_mut(overlay, path, leaf_module, |entry| {
+                    if entry.source_module.is_none() {
+                        entry.source_module = Some(deviation.from_module.name.clone());
+                    }
+                    entry
+                        .deviate_stmts
+                        .extend(deviation.deviate_stmts.iter().cloned());
+                });
                 continue;
             }
 
@@ -3284,13 +3345,13 @@ fn apply_deviations(
                 match deviate.arg.as_deref() {
                     Some("not-supported") => {
                         if !remove_node_at_path(children, &target_path) {
-                            let overlay_key: OverlayKey =
-                                target_path.iter().map(|s| s.name.clone()).collect();
-                            let entry = overlay.entry(overlay_key).or_default();
-                            if entry.source_module.is_none() {
-                                entry.source_module = Some(deviation.from_module.name.clone());
-                            }
-                            entry.deviate_stmts.push(deviate.clone());
+                            let path = target_path.iter().map(|s| s.name.clone()).collect();
+                            overlay_entry_mut(overlay, path, leaf_module.clone(), |entry| {
+                                if entry.source_module.is_none() {
+                                    entry.source_module = Some(deviation.from_module.name.clone());
+                                }
+                                entry.deviate_stmts.push(deviate.clone());
+                            });
                         }
                     }
                     Some("add") => apply_deviation_edit(
@@ -3373,13 +3434,16 @@ fn apply_annotations(
             apply_annotation_to_node(node, ann);
         } else {
             // Target is inside an unexpanded `uses` — defer to overlay.
-            let overlay_key: OverlayKey =
-                target_path.iter().map(|s| s.name.clone()).collect();
-            overlay
-                .entry(overlay_key)
-                .or_default()
-                .annotations
-                .push(crate::compiler::types::Annotation {
+            let path = target_path.iter().map(|s| s.name.clone()).collect();
+            // The leaf module disambiguates same-named siblings from different
+            // modules (e.g. two augments under the same target).
+            let leaf_module = target_path
+                .last()
+                .and_then(|s| s.prefix.as_ref())
+                .and_then(|p| ann.prefix_map.get(p))
+                .cloned();
+            overlay_entry_mut(overlay, path, leaf_module, |entry| {
+                entry.annotations.push(crate::compiler::types::Annotation {
                     instances: ann.instances.clone(),
                     when_stmts: ann.when_stmts.clone(),
                     must_stmts: ann.must_stmts.clone(),
@@ -3387,6 +3451,7 @@ fn apply_annotations(
                     source_revision: ann.from_module.revision.clone(),
                     source_plugin: ann.source_plugin,
                 });
+            });
         }
     }
 }
@@ -4968,5 +5033,122 @@ module bad-use {
         .expect("if-feature expression should parse");
         assert!(ignored_errors.is_empty());
         assert!(!ctx.eval_if_feature(&ignored_expr, "self-mod"));
+    }
+
+    // ── #5 source-position augment ordering ──────────────────────────────────
+
+    fn aug_entry(file: &str, line: u32) -> AugmentEntry {
+        AugmentEntry {
+            target_path: vec![],
+            nodes: vec![],
+            when: vec![],
+            if_features: vec![],
+            status: Status::Current,
+            pos: Pos::FilePos { file: Arc::from(file), line },
+        }
+    }
+
+    #[test]
+    fn sort_augments_orders_by_source_position_stably() {
+        // Out-of-order by line, plus two sharing a position to check stability.
+        let mut augments = vec![
+            aug_entry("b.yang", 5), // 0
+            aug_entry("a.yang", 30), // 1
+            aug_entry("a.yang", 10), // 2
+            aug_entry("a.yang", 10), // 3 (same pos as 2 — must stay after it)
+        ];
+        // Tag stable identity via nodes length is awkward; use `when` len as a marker.
+        augments[3].when.push(WhenExpr {
+            xpath: "marker".into(),
+            description: None,
+            reference: None,
+            source_module: String::new(),
+            source_revision: None,
+            non_local: false,
+        });
+
+        sort_augments_by_source(&mut augments);
+
+        let order: Vec<(&str, u32)> = augments
+            .iter()
+            .map(|a| (a.pos.orig_file().as_ref(), a.pos.orig_line()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![("a.yang", 10), ("a.yang", 10), ("a.yang", 30), ("b.yang", 5)]
+        );
+        // Stability: the marked entry (originally index 3) stays after the
+        // unmarked same-position entry.
+        assert!(augments[0].when.is_empty());
+        assert_eq!(augments[1].when.len(), 1);
+    }
+
+    #[test]
+    fn overlay_key_disambiguates_by_leaf_module_with_fallback() {
+        fn marker(tag: &str) -> Stmt {
+            Stmt::new(
+                Keyword::BuiltIn(BuiltInKeyword::Leaf),
+                Some(tag.to_string()),
+                Pos::FilePos { file: Arc::from("t"), line: 1 },
+                vec![],
+            )
+        }
+        let mut map = NodeOverlayMap::new();
+        let path = vec!["top".to_string(), "iface".to_string()];
+        // Two same-named-sibling targets from different modules (e.g. two augments).
+        overlay_entry_mut(&mut map, path.clone(), Some("modA".into()), |e| {
+            e.deviate_stmts.push(marker("A"))
+        });
+        overlay_entry_mut(&mut map, path.clone(), Some("modB".into()), |e| {
+            e.deviate_stmts.push(marker("B"))
+        });
+
+        // A node in modA gets only modA's entry (disambiguated — no collision).
+        let a = lookup_overlay(&map, &path, "modA").unwrap();
+        assert_eq!(a.deviate_stmts.len(), 1);
+        assert_eq!(a.deviate_stmts[0].arg.as_deref(), Some("A"));
+        // A node in modB gets only modB's entry.
+        let b = lookup_overlay(&map, &path, "modB").unwrap();
+        assert_eq!(b.deviate_stmts.len(), 1);
+        assert_eq!(b.deviate_stmts[0].arg.as_deref(), Some("B"));
+        // A node whose module matches neither falls back to the name-only (`None`)
+        // bucket — preserving the legacy grouping-expansion behaviour.
+        let c = lookup_overlay(&map, &path, "modC").unwrap();
+        assert_eq!(c.deviate_stmts.len(), 2, "fallback bucket aggregates both");
+    }
+
+    #[test]
+    fn collected_augments_carry_source_position_in_order() {
+        // Two external augments: each `pos` reflects its source line and the
+        // stored list is in source order.
+        let stmt = parse_module(
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  import dep { prefix d; }
+  augment "/d:first" {
+    leaf x { type string; }
+  }
+  augment "/d:second" {
+    leaf y { type string; }
+  }
+}
+"#,
+        );
+        let compiled = compile_module(
+            &ModuleKey::latest("m"),
+            stmt,
+            &ModuleRegistry::default(),
+            &DeviationIndex::default(),
+            &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
+        );
+        assert_eq!(compiled.augments.len(), 2, "both augments are external");
+        let lines: Vec<u32> = compiled.augments.iter().map(|a| a.pos.orig_line()).collect();
+        assert!(lines[0] < lines[1], "augments ordered by source line: {lines:?}");
+        // Targets preserved in source order.
+        assert_eq!(compiled.augments[0].target_path.last().unwrap().name, "first");
+        assert_eq!(compiled.augments[1].target_path.last().unwrap().name, "second");
     }
 }

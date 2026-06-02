@@ -22,5 +22,14 @@ rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
+[features]
+# Enables an in-process peak-allocation tracker in the bundle_tree benchmark.
+bench-alloc = []
+
 [dev-dependencies]
 # integration tests use the binary via CARGO_BIN_EXE_yangest
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "bundle_tree"
+harness = false
