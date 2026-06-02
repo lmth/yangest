@@ -224,7 +224,11 @@ impl<'a> Parser<'a> {
                     Some(b'\\') => {
                         self.advance(); // consume backslash
                         match self.peek() {
-                            Some(b'n') => { self.advance(); buf.push('\n'); }
+                            // Use placeholder \x00 for escape-created newlines so that
+                            // normalize_double_quoted (which strips physical-line indentation)
+                            // does not remove whitespace after \n escapes. The placeholder
+                            // is converted back to a real newline after normalization.
+                            Some(b'n') => { self.advance(); buf.push('\x00'); }
                             Some(b't') => { self.advance(); buf.push('\t'); }
                             Some(b'"') => { self.advance(); buf.push('"'); }
                             Some(b'\\') => { self.advance(); buf.push('\\'); }
@@ -252,6 +256,10 @@ impl<'a> Parser<'a> {
         // Apply multi-line indentation stripping for double-quoted strings
         if quote == b'"' {
             buf = Self::normalize_double_quoted(&buf, col);
+        }
+        // Convert escape-newline placeholders to actual newlines.
+        if buf.contains('\x00') {
+            buf = buf.replace('\x00', "\n");
         }
         buf
     }
@@ -789,6 +797,22 @@ module foo {
         let (stmts, errors) = parse_yang(src, file());
         assert!(errors.is_empty(), "errors: {:?}", errors);
         assert_eq!(stmts[0].arg_str(), "line1\nline2");
+    }
+
+    #[test]
+    fn parse_double_quoted_escape_n_preserves_following_whitespace() {
+        // Regression: \n escape inside a double-quoted, indented multi-line
+        // string used to interact with the RFC 7950 §6.1.3 indentation
+        // normaliser — the post-\n leading spaces were stripped along with
+        // continuation-line indentation, even though the spaces came from the
+        // escape (which inserts a virtual newline) rather than from physical
+        // file indentation.  The fix uses an internal NUL placeholder for
+        // escape-created newlines, runs normalize_double_quoted, then swaps
+        // the placeholder back to '\n', leaving following spaces intact.
+        let src = "  description \"foo\\n  bar\";";
+        let (stmts, errors) = parse_yang(src, file());
+        assert!(errors.is_empty(), "errors: {:?}", errors);
+        assert_eq!(stmts[0].arg_str(), "foo\n  bar");
     }
 
     #[test]
