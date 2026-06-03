@@ -3,7 +3,7 @@
 //! YIN output plugin (`--format yin`).
 //!
 //! Converts the raw parsed YANG AST into its YIN XML representation per
-//! RFC 7950 §13, following the same output style as `yanger -f yin`.
+//! RFC 7950 §13.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -197,8 +197,7 @@ fn collect_imports_ordered(
             }
         }
     }
-    // yanger builds its import list by prepending (Erlang cons),
-    // so the internal order is the reverse of document order.
+    // Emit the xmlns attributes in reverse import-declaration order.
     result.reverse();
     result
 }
@@ -299,7 +298,7 @@ fn print_module_stmt(
     _b: BuiltInKeyword,
 ) -> std::io::Result<()> {
     let ind = indent_str(lvl);
-    // xmlns attributes are indented at (lvl+4)*2 spaces, matching yanger.
+    // xmlns attributes are indented at (lvl+4)*2 spaces.
     let xmlns_ind = indent_str(lvl + 4);
     let mod_name = stmt.arg.as_deref().unwrap_or("");
 
@@ -394,7 +393,7 @@ fn emit_block_or_empty(
     }
 }
 
-/// Emit `<{attr}>{content}</{attr}>` matching yanger's non-pretty format:
+/// Emit `<{attr}>{content}</{attr}>` in a non-pretty format:
 /// - First line of content immediately after `<{attr}>`
 /// - Continuation lines start at column 0 (no indent)
 /// - Closing `</{attr}>` immediately after the last content character

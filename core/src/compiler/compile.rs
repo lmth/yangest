@@ -34,8 +34,8 @@ struct NodeCommon {
     /// extensions in declaration order. Used by emit plugins for output ordering.
     status_before_ext_meta: bool,
     /// True if the `status` statement appears in the substmts before the `units`
-    /// statement. yanger's `get_simple` prepends items, so last-declared item
-    /// appears first: when status is declared before units, units ends up first.
+    /// statement. Emit plugins that reverse declaration order (last-declared
+    /// first) use this so that, when status precedes units, units ends up first.
     units_before_status: bool,
 }
 
@@ -829,8 +829,7 @@ fn compile_schema_children(
     nodes
 }
 
-/// Collect the statuses of groupings directly referenced by `uses` in a node's children,
-/// following the same recursive behavior as yanger_fxs's `get_simple`/`recurse_grouping`:
+/// Collect the statuses of groupings directly referenced by `uses` in a node's children:
 /// when a grouping itself contains `uses` stmts, recurse into those groupings and collect
 /// their statuses too (using the current module's local groupings for resolution).
 fn collect_uses_grouping_statuses(
@@ -868,8 +867,8 @@ fn collect_uses_grouping_statuses(
 }
 
 /// Recursively collect non-current statuses from a grouping and any `uses` it contains.
-/// Mirrors yanger_fxs `get_simple` recursion: adds the grouping's own status (if non-current),
-/// then recurses into any prefix-less `uses` stmts within the grouping body.
+/// Adds the grouping's own status (if non-current), then recurses into any prefix-less
+/// `uses` stmts within the grouping body.
 fn collect_grouping_uses_statuses(
     grouping: &Grouping,
     local_groupings: &IndexMap<String, Grouping>,
@@ -883,8 +882,8 @@ fn collect_grouping_uses_statuses(
         if sub.keyword.is_builtin(BuiltInKeyword::Uses) {
             let uses_arg = sub.arg.as_deref().unwrap_or("");
             let (prefix, name) = split_prefixed_name(uses_arg);
-            // Only recurse into prefix-less uses (same-module groupings), mirroring yanger's
-            // `recurse_grouping` which skips NCS and cross-module groupings.
+            // Only recurse into prefix-less uses (same-module groupings); skip
+            // cross-module groupings.
             if prefix.is_none() {
                 if let Some(nested) = local_groupings.get(&name) {
                     collect_grouping_uses_statuses(nested, local_groupings, statuses);
@@ -1432,9 +1431,9 @@ fn compute_status_before_ext_meta(
 }
 
 /// Returns true if the `status` statement is declared before the `units` statement
-/// in `stmt`'s substmts.  yanger_fxs processes substmts in declaration order using
-/// prepend (cons), so last-declared items end up first in the output CsExtra list.
-/// When status is declared before units, units ends up first in the output.
+/// in `stmt`'s substmts.  Emit plugins that reverse declaration order (last-declared
+/// items first) use this: when status is declared before units, units ends up first
+/// in the output.
 fn compute_units_before_status(stmt: &Stmt) -> bool {
     let mut status_idx: Option<usize> = None;
     let mut units_idx: Option<usize> = None;
@@ -2201,8 +2200,7 @@ fn expand_children_inner(
 
 /// Like [`expand_children`] but skips the if-feature visibility check, including
 /// feature-gated nodes in the result.  Used for collecting enum types from all nodes
-/// (matching yanger_fxs's `add_enumeration_types` which walks the full #sn{} tree
-/// regardless of if-feature state).
+/// (the full schema tree is walked regardless of if-feature state).
 pub fn expand_children_all(
     raw: &[SchemaNode],
     overlay: &NodeOverlayMap,
@@ -3249,12 +3247,11 @@ fn propagate_uses_constraints(
 ) {
     // Per RFC 7950 Section 7.13.2, when a "uses" has a "when" expression it is
     // added only to the TOP-LEVEL schema nodes of the expanded grouping — NOT
-    // recursively to their descendants.  Yanger's expand_uses applies WhenL
-    // only to `Grouping#grouping.children` (one level).
+    // recursively to their descendants (one level only).
     if !inherited_when.is_empty() {
         // Mark inherited when expressions as non_local — they originated from a `uses`
-        // or `augment` statement, so F_WHEN_CTX_NODE_UP must be set in the FXS encoding
-        // and deps must be adjusted by adding a parent step.
+        // or `augment` statement, so they are evaluated from the parent context and
+        // deps must be adjusted by adding a parent step.
         let mut combined: Vec<WhenExpr> = inherited_when
             .iter()
             .map(|w| WhenExpr { non_local: true, ..w.clone() })
@@ -3585,8 +3582,8 @@ fn annotation_leaf_targets_module(
 /// The target module name was resolved from the deviating module's imports at
 /// devindex build time, so no registry lookup or prefix-string comparison is
 /// needed.  Using the pre-resolved name is also correct when many modules share
-/// the same self-declared prefix letter (e.g. all Cisco-IOS-XE submodules use
-/// `prefix ios`).
+/// the same self-declared prefix letter (e.g. a family of submodules that all
+/// use `prefix ex`).
 /// Returns `true` if `deviation` should be applied when compiling module `key`.
 ///
 /// Routing is based on the **last** path step's prefix (the module that owns
@@ -3789,7 +3786,7 @@ fn apply_node_mutation(
                 }
             }
             _ => {
-                // Handle extension statements (e.g. tailf:cli-mode-name in a refine).
+                // Handle extension statements (e.g. a plugin extension in a refine).
                 if let Some((own_prefix, prefix_map)) = prefix_ctx {
                     if let Some((module, name)) = resolve_kw(&stmt.keyword, own_prefix, source_module_name, prefix_map) {
                         let ext = ExtensionInstance {
@@ -3846,9 +3843,9 @@ fn mutate_must_exprs(list: &mut Vec<MustExpr>, stmt: &Stmt, mode: MutationMode, 
         description: opt_substmt_arg(stmt, BuiltInKeyword::Description),
         source_module: source_module_name.to_string(),
         source_revision,
-        // tailf:dependency sub-stmts from annotation-injected musts are not available
-        // in the mutate path (no own_prefix/prefix_map). Leave empty; callers can
-        // fix this up if needed.
+        // explicit-dependency sub-statements from annotation-injected musts are not
+        // available in the mutate path (no own_prefix/prefix_map). Leave empty;
+        // callers can fix this up if needed.
         explicit_deps: vec![],
         override_auto_deps: false,
     };
@@ -4411,7 +4408,7 @@ fn collect_applied_deviations(key: &ModuleKey, dev_index: &DeviationIndex) -> Ap
                     return true;
                 }
                 // Also check the last prefix-qualified step: a deviation path like
-                // `/ios-sm:netconf-yang/cisco-ia:cisco-ia` targets `cisco-ia`, not `ios-sm`.
+                // `/a:root/b:sub` targets `b`, not `a`.
                 let mut ignored = Vec::new();
                 if let Some(path) = parse_path_internal(&d.target_path, true, &d.pos, &mut ignored)
                 {
@@ -4457,17 +4454,9 @@ fn collect_applied_annotations(
         (Option<String>, PrefixMap, bool, bool, std::collections::HashSet<String>),
     > = std::collections::HashMap::new();
     if let Some(pending) = ann_index.by_target_module.get(&key.name) {
-        if std::env::var("YANGEST_DEBUG_ANN").is_ok() && key.name == "Cisco-IOS-XE-aaa" {
-            eprintln!("DEBUG collect_applied_annotations for {} — {} pending entries", key.name, pending.len());
-            for ann in pending.iter().take(3) {
-                eprintln!("  from={} target_path={} when_stmts={} must_stmts={}",
-                    ann.from_module.name, ann.target_path,
-                    ann.when_stmts.len(), ann.must_stmts.len());
-            }
-        }
         for ann in pending {
             let has_wm = !ann.when_stmts.is_empty() || !ann.must_stmts.is_empty();
-            // Collect prefixes used in extension instance arguments (e.g. cli-diff-* paths).
+            // Collect prefixes used in extension instance arguments (e.g. dependency paths).
             let inst_prefixes: std::collections::HashSet<String> = ann
                 .instances
                 .iter()
@@ -4549,8 +4538,8 @@ fn extract_yang_path_prefixes(s: &str) -> Vec<String> {
 /// Returns true if the annotation's `target_path` starts with a prefix that resolves
 /// to `target_module_name` via the annotation module's `prefix_map`.
 ///
-/// Example: path `/cisco-smart-license:licensing`, prefix_map has `cisco-smart-license → cisco-smart-license`
-/// → first prefix = `cisco-smart-license`, resolves to module `cisco-smart-license` → `root_is_self = true`.
+/// Example: path `/ex:root`, prefix_map has `ex → ex`
+/// → first prefix = `ex`, resolves to module `ex` → `root_is_self = true`.
 fn annotation_root_is_target(
     target_path: &str,
     ann_prefix_map: &HashMap<String, String>,

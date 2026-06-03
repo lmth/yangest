@@ -267,9 +267,8 @@ impl<'a> Parser<'a> {
     /// Strip common leading whitespace from a multi-line double-quoted string
     /// per RFC 7950 §6.1.3 (trim leading spaces up to the column of the
     /// opening quote on continuation lines).  Additionally, trailing whitespace
-    /// is stripped from all interior lines (before a newline) to match confdc's
-    /// normalisation behaviour; trailing whitespace on the final line is
-    /// preserved.
+    /// is stripped from all interior lines (before a newline); trailing
+    /// whitespace on the final line is preserved.
     fn normalize_double_quoted(s: &str, indent: usize) -> String {
         let lines: Vec<&str> = s.split('\n').collect();
         if lines.len() <= 1 {
@@ -837,9 +836,9 @@ module foo {
     #[test]
     fn parse_unquoted_arg_with_bracket_predicate() {
         // RFC 7950 §6.1.3: single-quote is not a stop character for unquoted
-        // strings.  tailf:annotate-statement uses this syntax to target
+        // strings.  acme:annotate-statement uses this syntax to target
         // specific grouping/list instances by name.
-        let src = r#"tailf:annotate-statement "grouping[name='foo']" { tailf:info "x"; }"#;
+        let src = r#"acme:annotate-statement "grouping[name='foo']" { acme:info "x"; }"#;
         let (stmts, errors) = parse_yang(src, file());
         assert!(errors.is_empty(), "errors: {:?}", errors);
         assert_eq!(stmts[0].arg_str(), "grouping[name='foo']");

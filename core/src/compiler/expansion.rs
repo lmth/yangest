@@ -28,7 +28,7 @@ pub struct ExpansionCtx<'a> {
     pub enabled_features: &'a HashSet<(String, String)>,
     /// Globally-enabled features: a bare feature name that enables the feature in every module
     /// that declares it.  When both this and `enabled_features` are empty, all features are
-    /// considered enabled (default/yanger-compatible behaviour).
+    /// considered enabled (the default behaviour).
     pub global_features: &'a HashSet<String>,
     pub registry: &'a ModuleRegistry,
     /// If Some, prune schema nodes whose status exceeds this value at expansion time.
@@ -264,8 +264,8 @@ impl CompiledModule {
     }
 
     /// Like [`children`](Self::children) but includes feature-gated nodes.  Used for
-    /// collecting inline enum types from the full schema tree (matching yanger_fxs which
-    /// walks all #sn{} nodes regardless of if-feature state).
+    /// collecting inline enum types from the full schema tree (all nodes are
+    /// walked regardless of if-feature state).
     pub fn all_children(&self, ctx: &ExpansionCtx<'_>) -> Vec<SchemaNode> {
         let empty_overlay = NodeOverlayMap::new();
         let overlay = if self.overlay.is_empty() {
@@ -397,11 +397,8 @@ impl SchemaNode {
     }
 
     /// Like [`children`](Self::children) but includes feature-gated nodes (if-feature
-    /// conditions are NOT evaluated).  Used for type collection, mirroring yanger_fxs's
-    /// `add_enumeration_types` which walks the full #sn{} tree regardless of if-feature.
-    /// Like [`children`](Self::children) but includes feature-gated nodes (if-feature
-    /// conditions are NOT evaluated). Used for type collection, mirroring yanger_fxs's
-    /// `add_enumeration_types` which walks the full #sn{} tree regardless of if-feature.
+    /// conditions are NOT evaluated). Used for type collection, where the full
+    /// schema tree must be walked regardless of if-feature state.
     ///
     /// Unlike the old implementation, this DOES apply `deviate not-supported` overlays
     /// (using the module's overlay map with the node's schema_path for key matching),

@@ -4,7 +4,7 @@
 ///
 /// Each test runs the yangest binary (via `CARGO_BIN_EXE_yangest`) on test YANG
 /// files located in `tests/yang/` and checks that the output matches the
-/// expected output from yanger.
+/// expected reference output.
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -425,8 +425,8 @@ fn depend_recurse_include_path_extension() {
 }
 
 /// --depend-target: custom makefile target name replaces the source file name.
-/// Only a.yang is passed (similar to yanger's lux test); imports are unresolved
-/// but the depend output is still correct from the raw declared imports.
+/// Only a.yang is passed; imports are unresolved but the depend output is still
+/// correct from the raw declared imports.
 #[test]
 fn depend_custom_target() {
     let (stdout, _stderr, _code) = run(

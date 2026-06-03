@@ -445,7 +445,7 @@ impl fmt::Display for YError {
     }
 }
 
-/// Symbolic error codes, matching yanger's atom-keyed error table.
+/// Symbolic error codes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     // Parse errors

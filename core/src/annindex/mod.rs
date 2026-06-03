@@ -139,7 +139,7 @@ fn scan_stmts(
 }
 
 /// Inner recursive scanner that carries a `parent_path` for nested annotations.
-/// When a `tailf:annotate` contains another `tailf:annotate` as a sub-statement,
+/// When a `acme:annotate` contains another `acme:annotate` as a sub-statement,
 /// the inner annotation's path is relative to the outer one.  We concatenate them
 /// to produce the full absolute path.
 fn scan_stmts_with_parent_path(
@@ -294,7 +294,7 @@ fn resolve_ext_instances(
 }
 
 /// Like [`resolve_ext_instances`] but excludes sub-statements that match a
-/// registered overlay extension (i.e., nested `tailf:annotate` calls).  Those
+/// registered overlay extension (i.e., nested `acme:annotate` calls).  Those
 /// are handled recursively by `scan_stmts_with_parent_path` instead.
 fn resolve_ext_instances_excluding_overlays(
     body_stmts: &[Stmt],
@@ -343,8 +343,7 @@ fn resolve_ext_instances_excluding_overlays(
 /// Returns the prefix of the deepest (last) prefix-qualified path step, if any.
 ///
 /// Using the deepest prefix correctly identifies the target module even when the path
-/// crosses module boundaries, e.g. `/ios-sm:netconf-yang/cisco-ia:cisco-ia/...`
-/// targets `cisco-ia`, not `ios-sm`.
+/// crosses module boundaries, e.g. `/a:root/b:sub/...` targets `b`, not `a`.
 fn extract_first_prefix(path: &str) -> Option<String> {
     path.trim_start_matches('/')
         .split('/')

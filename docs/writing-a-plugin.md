@@ -780,7 +780,7 @@ to support `--outputs` — it uses the same per-module `emit` call as `--output-
 ## 7. The tree plugin — a complete walkthrough
 
 The tree plugin (`plugins/tree/src/lib.rs`) emits RFC 8340 YANG tree diagrams.  It is
-the primary verification format used to check that yangest's output matches yanger's.
+the primary verification format used to check yangest's output against the reference.
 This chapter follows the source top-to-bottom, explaining every function in detail.
 
 ### 7.1 Overview and plugin entry point
@@ -901,7 +901,7 @@ fn format_augment_path(path: &[PathStep]) -> String {
 
 `format_augment_path` converts a `Vec<PathStep>` into the canonical
 `/prefix:name/name/name` form. The first step in an augment path always carries the
-target module's prefix (e.g. `/oc-if:interfaces`); subsequent steps within the same
+target module's prefix (e.g. `/ex:interfaces`); subsequent steps within the same
 module are typically unqualified (they inherit the previous step's namespace context).
 
 ### 7.3 Collecting incoming augments
@@ -956,8 +956,8 @@ targeting a path are appended to the module's own children at that path, in sour
 
 #### Augment ordering: the first-claim algorithm
 
-Yanger preserves the order in which augmented nodes appear at a given location in the
-tree based on the source order of `augment` statements. When module A augments path
+The tree plugin preserves the order in which augmented nodes appear at a given location
+in the tree based on the source order of `augment` statements. When module A augments path
 `P/X` and a later statement augments path `P` directly adding node `Y`, the position
 of `Y` in the rendered tree at `P` is determined by the first time any `augment`
 statement mentioned something at `P` — which was the `P/X` augment.
@@ -1069,8 +1069,7 @@ fn mk_name(name_with_suffix: &str, max_name_width: usize) -> String {
 `mk_name` pads a name (including any trailing suffix like `?` or `*`) to at least
 `max_name_width + 1` characters, then appends three spaces before the type annotation.
 Names that are already at or beyond the minimum width still get three spaces — so the
-type column is never closer than three characters to the name, matching yanger's
-`mk_str/2` Erlang function.
+type column is never closer than three characters to the name.
 
 ### 7.6 Recursive tree rendering
 
@@ -1380,9 +1379,9 @@ Most leaf types are displayed simply as their YANG type name (e.g. `string`,
 as `-> path` rather than the bare keyword. The path is read from the `path` sub-statement
 of the `type leafref` AST node.
 
-Because leafref paths can be verbose, yanger normalises them by stripping redundant
-module prefixes from consecutive path steps that stay in the same namespace. The tree
-plugin replicates this with `normalize_leafref_path`:
+Because leafref paths can be verbose, the tree plugin normalises them by stripping
+redundant module prefixes from consecutive path steps that stay in the same namespace,
+in `normalize_leafref_path`:
 
 ```rust
 fn normalize_leafref_path(path: &str, module_prefix: &str) -> String {
@@ -1413,20 +1412,20 @@ fn normalize_leafref_path(path: &str, module_prefix: &str) -> String {
 }
 ```
 
-The algorithm mirrors yanger's `leafref_ptr/2` in `yanger_tree.erl`:
+The algorithm:
 
-- Split the path on `/`, discarding empty segments (Erlang's `string:tokens` behaviour).
+- Split the path on `/`, discarding empty segments.
 - Track a *current prefix*, initialised to the module's own prefix.
 - For each segment, split on `:`:
   - **Two tokens, same prefix as current** — the prefix is redundant; output just the
     local name and keep `cur_prefix` unchanged.
   - **Two tokens, different prefix** — output the full `prefix:name` and update
     `cur_prefix` to the new prefix, since subsequent steps may now be in that namespace.
-  - **Any other token count** (unqualified steps, or predicate segments like `[ios:key='value']`
-    which split into more than two pieces) — concatenate all tokens with no separator,
-    matching Erlang's iolist flattening behaviour, and leave `cur_prefix` unchanged.
+  - **Any other token count** (unqualified steps, or predicate segments like `[ex:key='value']`
+    which split into more than two pieces) — concatenate all tokens with no separator
+    and leave `cur_prefix` unchanged.
 - Reassemble with `/` and restore the leading `/` if the original path had one.
 
 This produces compact, readable leafref displays like
-`-> /ios:native/interface/GigabitEthernet/name` instead of the fully-qualified
-`-> /ios:native/ios:interface/ios:GigabitEthernet/ios:name`.
+`-> /ex:root/interface/ethernet/name` instead of the fully-qualified
+`-> /ex:root/ex:interface/ex:ethernet/ex:name`.

@@ -64,7 +64,7 @@ struct Cli {
     max_status: Option<String>,
 
     /// Apply deviations from FILE without emitting output for it (may be
-    /// repeated).  Equivalent to yanger's --deviation-module.
+    /// repeated).
     #[arg(long = "deviation-module", value_name = "FILE")]
     deviation_modules: Vec<PathBuf>,
 
@@ -450,8 +450,8 @@ fn main() {
             ctx = ctx.with_global_features(&global_features);
         }
         // When module-qualified --feature flags are given, unlisted modules keep all their
-        // features enabled (confdc-compatible semantics: --feature M:F restricts only M,
-        // other modules are unrestricted).  Same applies in bundle mode.
+        // features enabled (--feature M:F restricts only M, other modules are
+        // unrestricted).  Same applies in bundle mode.
         if is_bundle_mode || !enabled_features.is_empty() {
             ctx = ctx.with_unlisted_modules_enabled();
         }

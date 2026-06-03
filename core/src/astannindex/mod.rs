@@ -3,8 +3,8 @@
 //! AST-level annotation index.
 //!
 //! Scans annotation modules for plugin-declared *module-selector* extensions
-//! (e.g. `tailf:annotate-module`) and their nested *statement-selector*
-//! extensions (e.g. `tailf:annotate-statement`), then builds a per-module
+//! (e.g. `acme:annotate-module`) and their nested *statement-selector*
+//! extensions (e.g. `acme:annotate-statement`), then builds a per-module
 //! patch set.  Each patch is applied to the target module's raw [`Stmt`] tree
 //! **before** [`compile_module`] is called, making injected statements visible
 //! to type resolution, grouping instantiation, and constraint checking.
@@ -55,7 +55,7 @@ pub struct ModuleAnnotation {
 pub struct AstAnnotationIndex {
     by_module: HashMap<String, ModuleAnnotation>,
     /// Maps target module name → list of `(ann_module_key, prefix_map)` for
-    /// every annotation module that targets it via `tailf:annotate-module`.
+    /// every annotation module that targets it via `acme:annotate-module`.
     /// Used by plugins to look up which annotation modules contributed
     /// extension-arg imports to a given target module.
     ann_sources: HashMap<String, Vec<(ModuleKey, HashMap<String, String>)>>,
@@ -130,7 +130,7 @@ impl AstAnnotationIndex {
     }
 
     /// Returns the list of `(ann_module_key, prefix_map)` for every annotation
-    /// module that targets `module_name` via `tailf:annotate-module`.
+    /// module that targets `module_name` via `acme:annotate-module`.
     pub fn sources_for(&self, module_name: &str) -> &[(ModuleKey, HashMap<String, String>)] {
         self.ann_sources.get(module_name).map_or(&[], Vec::as_slice)
     }

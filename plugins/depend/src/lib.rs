@@ -10,7 +10,7 @@ use clap::{Arg, ArgMatches};
 use yangest_core::compiler::{CompiledModule, ExpansionCtx, ModuleRegistry};
 use yangest_core::plugin::{EmitState, Plugin};
 
-/// Options for the depend plugin (equivalent to yanger's `--depend-*` flags).
+/// Options for the depend plugin (the `--depend-*` flags).
 #[derive(Debug, Clone, Default)]
 pub struct DependOptions {
     /// Exclude submodule (include) dependencies from output.
@@ -75,8 +75,8 @@ impl DependPlugin {
     /// Collect all dependency names for `module`.
     ///
     /// Without `--depend-recurse`: returns direct deps in declaration order.
-    /// With `--depend-recurse`: returns all transitive deps, sorted (matching
-    /// yanger's `usort` behaviour). Ignored modules are NOT filtered here —
+    /// With `--depend-recurse`: returns all transitive deps, sorted and
+    /// deduplicated. Ignored modules are NOT filtered here —
     /// they are filtered at emit time so their transitive deps are still
     /// included.
     fn collect_deps(&self, module: &CompiledModule, registry: &ModuleRegistry) -> Vec<String> {

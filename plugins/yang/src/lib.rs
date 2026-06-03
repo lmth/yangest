@@ -2,13 +2,13 @@
 // Copyright 2026 Magnus Thoäng
 //! YANG pretty-printer plugin (`--format yang`).
 //!
-//! Re-serializes the raw parsed AST back into YANG text, following the same
-//! conventions as yanger's `yang` output format:
+//! Re-serializes the raw parsed AST back into YANG text using these
+//! conventions:
 //! - 2-space indentation
 //! - Blank lines between module-level sections (header → linkage → meta → defs, etc.)
 //! - `description`, `organization`, `contact` arguments on a new "hanging" line
 //! - Single quotes preferred for `pattern` / `when` / `must`
-//! - Quoting rules matching yanger's `quote_pattern()`
+//! - A fixed set of substrings that force a value to be quoted
 
 mod expanded;
 pub use expanded::YangExpandedPlugin;
@@ -41,7 +41,7 @@ impl Plugin for YangPlugin {
     }
 }
 
-// ── Keyword classification (mirrors yanger's kwd_class / kwd_with_trailing_nl) ─
+// ── Keyword classification (controls grouping and trailing blank lines) ───────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KwdClass {
@@ -106,7 +106,7 @@ fn force_newline_arg(kw: &Keyword) -> bool {
     )
 }
 
-/// Argument style for a YANG keyword, mirroring yanger's `classify_quoting`.
+/// Argument style for a YANG keyword (controls how its argument is quoted).
 enum ArgStyle {
     /// Never quote (e.g. `yang-version`).
     NeverQuote,
@@ -162,7 +162,7 @@ fn prefer_single_quote(kw: &Keyword) -> bool {
 }
 
 /// Returns true when the argument string requires quoting.
-/// Matches yanger's `quote_pattern()` — any of these substrings force a quote.
+/// Any of these substrings force a quote.
 fn needs_quotes(s: &str) -> bool {
     if s.is_empty() {
         return true;

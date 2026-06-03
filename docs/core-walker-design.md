@@ -17,7 +17,7 @@ at the right moments.
 
 This document specifies that driver: the **`SchemaWalker`** — and its
 contract with backends. It is the missing piece between the
-already-present observer and a working byte-faithful fxs (or any
+already-present observer and a working byte-faithful (or any
 order-sensitive) backend.
 
 ---
@@ -67,7 +67,7 @@ contract already gives them.
 ## 2. What "encounter order" actually means
 
 The reference compiler's order is not a single tree-walk pattern.
-Captured behaviour from the ios-xe yangbundle reference outputs shows
+Captured behaviour from the reference yangbundle outputs shows
 the following composite ordering rules:
 
 1. **Per-module entry point**: the walker starts at the module root
@@ -322,7 +322,7 @@ SchemaWalker::new(module, registry, types, ctx).walk(&mut collector);
 write_ns_to_prefix_maps(&collector.seen, &mut output);
 ```
 
-The fxs plugin's current `build_ns_to_prefix_maps` —
+A byte-faithful backend's current `build_ns_to_prefix_maps` —
 `collect_source_modules`, the manual deviation/annotation insertions,
 the `intermediate.reverse()` post-pass — all collapse into the
 collector's `seen` field. That is the goal.
@@ -345,13 +345,13 @@ Three layers of tests live alongside the walker:
 3. **Reference-parity tests** (in `tests/`, gated on the `ref-data`
    feature so CI without reference outputs still passes) walk a fixed
    set of modules from a checked-in yangbundle and assert that the
-   collected `ns_to_prefix_maps` matches the reference `.fxs` exactly.
+   collected `ns_to_prefix_maps` matches the reference output exactly.
    These are end-to-end and slow; they are the canary for regressions
    in real backends.
 
-The fxs plugin's existing `tests/bundle/` harness becomes the de-facto
-acceptance test for this work: passing all 461 modules requires the
-walker contract to hold for the full ios-xe yangbundle.
+A byte-faithful backend's existing bundle-test harness becomes the
+de-facto acceptance test for this work: passing all 461 modules requires
+the walker contract to hold for the full reference yangbundle.
 
 ---
 
@@ -376,13 +376,14 @@ commits, each independently mergeable:
    splicing in `compile`); if #8 is already in flight, this commit
    blocks on it.
 4. **Reference-parity tests** — add the `ref-data`-gated tests in §9.3
-   using a small representative slice of the ios-xe yangbundle, so
+   using a small representative slice of the reference yangbundle, so
    regressions show up in the upstream CI rather than waiting for the
-   downstream fxs migration to flag them.
+   downstream backend migration to flag them.
 
-After step 4 the upstream is "fxs-ready". The downstream migration
-(rewriting fxs's `build_ns_to_prefix_maps` against `SchemaWalker`)
-happens in `lib/yangest` and does not touch upstream further.
+After step 4 the upstream is ready for byte-faithful backends. The
+downstream migration (rewriting the backend's `build_ns_to_prefix_maps`
+against `SchemaWalker`) happens separately and does not touch upstream
+further.
 
 ### Open questions
 

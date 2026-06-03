@@ -3,7 +3,7 @@
 //! Swagger 2.0 (OpenAPI 2.0) output plugin for yangest.
 //!
 //! Converts a single YANG module into a RESTCONF-compatible Swagger 2.0
-//! document, matching the output of yanger's `yanger_swagger` plugin.
+//! document.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -990,7 +990,7 @@ fn node_schema(
             }
             // Return each child separately — or skip (choice itself has no schema)
             // We can't return multiple items, so we emit them inline as a synthetic object
-            // Yanger flattens choice children into the parent
+            // Flatten choice children into the parent
             for (n, s) in merged {
                 // We can only return one — collect all to parent manually
                 let _ = (n, s);

@@ -31,8 +31,8 @@ pub struct DepNode {
 pub struct DepGraph {
     pub nodes: HashMap<ModuleKey, DepNode>,
     /// Input file order — the order modules were presented to `build`.
-    /// `topo_sort` uses this as the DFS entry-point order, matching yanger's
-    /// depth-first-from-input-files compilation strategy.
+    /// `topo_sort` uses this as the DFS entry-point order (depth-first from the
+    /// input files).
     pub input_order: Vec<ModuleKey>,
 }
 
@@ -55,8 +55,8 @@ impl DepGraph {
     ///
     /// Visits input files in the order they were provided (alphabetical path
     /// sort by the caller), recursively compiling each module's imports before
-    /// the module itself.  This mirrors yanger's `add_file` recursive strategy
-    /// and produces identical augment-application ordering.
+    /// the module itself. This produces a deterministic augment-application
+    /// ordering.
     ///
     /// Returns `Ok(order)` where `order[0]` has no dependencies and can be
     /// compiled first.  Returns `Err(cycle)` if a cycle is detected.

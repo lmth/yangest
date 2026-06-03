@@ -165,8 +165,8 @@ pub struct WhenExpr {
     /// owning node's module revision). Set for annotation-originated when conditions.
     pub source_revision: Option<String>,
     /// True when this when expression was inherited from a `uses` or `augment` statement
-    /// (non-local origin). When true, `F_WHEN_CTX_NODE_UP` must be set in the FXS
-    /// when tuple, and deps need a parent step prepended.
+    /// (non-local origin). When true, the expression is evaluated from the parent
+    /// context, so dependency analysis must prepend a parent step.
     pub non_local: bool,
     /// Explicit dependency paths from sub-statements of the configured
     /// dependency extension (see [`CompilationFlags::dependency_extension`]).
@@ -180,7 +180,7 @@ pub struct WhenExpr {
 /// An extension statement applied to a schema node or module during compilation.
 #[derive(Debug, Clone)]
 pub struct ExtensionInstance {
-    /// The resolved module name of the extension (e.g. `"tailf-common"`).
+    /// The resolved module name of the extension (e.g. `"acme-ext"`).
     pub module: String,
     /// The local extension name (e.g. `"callpoint"`).
     pub name: String,
@@ -494,11 +494,10 @@ pub struct AppliedDeviations(pub Vec<(String, Option<String>, PrefixMap, bool)>)
 /// Each entry: `(name, rev, prefix_map, has_wm, root_is_self, ext_prefixes)` where:
 /// - `root_is_self` is `true` if the annotation module's annotate paths start with
 ///   a prefix that resolves to the target (base) module itself — meaning the annotation
-///   targets the base module's own nodes directly, so yanger calls `combine_prefix_maps`
-///   on the base module and the annotation module's namespace should appear in the
-///   base module's `ns_to_prefix_maps` entry.
+///   targets the base module's own nodes directly, so the annotation module's namespace
+///   should appear in the base module's namespace-to-prefix map entry.
 /// - `ext_prefixes` is the sorted, deduplicated list of YANG prefixes found in extension
-///   instance arguments (e.g. `cli-diff-dependency` path args like `/ios:native/ios-aaa:...`).
+///   instance arguments (e.g. dependency-path arguments like `/a:root/b:sub:...`).
 ///   These prefixes must be added to the target module's yang_header imports even when there
 ///   are no when/must expressions (`has_wm` is false).
 pub struct AppliedAnnotations(pub Vec<(String, Option<String>, PrefixMap, bool, bool, Vec<String>)>);
