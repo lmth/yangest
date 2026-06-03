@@ -357,6 +357,13 @@ the walker contract to hold for the full reference yangbundle.
 
 ## 10. Migration plan
 
+**Status:** steps 1–2 are implemented in [`core::walker`](../core/src/walker/mod.rs)
+(`SchemaWalker`, `WalkOptions`, `walk`, `walk_with_visitor`, observer firing at
+type-resolution sites) with the §9.1/§9.2 unit and observer-event tests. Steps 3
+(augment-splicing / deviation-inlining at the walk level) and 4 (`ref-data`-gated
+reference-parity tests) are not yet done: step 3 depends on indexset-based augment
+splicing in `compile`, and step 4 needs checked-in reference outputs.
+
 This is upstream-only design work. Implementation proceeds in four
 commits, each independently mergeable:
 

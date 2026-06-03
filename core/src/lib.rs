@@ -11,6 +11,7 @@ pub mod grammar;
 pub mod parser;
 pub mod plugin;
 pub mod types_registry;
+pub mod walker;
 pub mod xpath;
 
 pub use compiler::ExpansionCtx;
