@@ -34,6 +34,11 @@ order-sensitive) backend.
 8. [Backend integration pattern](#8-backend-integration-pattern)
 9. [Testing strategy](#9-testing-strategy)
 10. [Migration plan](#10-migration-plan)
+11. [Step 3 detail — own-augment traversal](#11-step-3-detail--what-augment-splicing-must-actually-do)
+12. [Step 5 — `on_constraint_source` (DONE)](#12-step-5--whenmust-source-module-exposure-done)
+13. [Open questions](#13-open-questions-revised)
+14. [Verification plan + results](#14-verification-plan-for-the-partial-implementation)
+15. [Step 6 — `on_extension_attached`](#15-step-6--on_extension_attached-event)
 
 ---
 
@@ -353,19 +358,72 @@ A byte-faithful backend's existing bundle-test harness becomes the
 de-facto acceptance test for this work: passing all 461 modules requires
 the walker contract to hold for the full reference yangbundle.
 
+### Step 4 implementation specification
+
+For a maintainer picking up step 4:
+
+* **Cargo feature**: add `ref-data = []` to `core/Cargo.toml`. Tests
+  guarded with `#[cfg(feature = "ref-data")]` so default `cargo
+  test` skips them. CI can opt in with `--features ref-data`.
+* **Fixture layout**: `core/tests/ref-data/` holds the YANG sources
+  (a curated slice of ~15 modules from a real reference yangbundle —
+  see *suggested slice* below) plus a `expected/` subdirectory with
+  `<module>.ns_to_prefix_maps.json` files: the de-duplicated
+  source-module sequence the walker should emit for each fixture
+  module, when driven by a reference observer that records typedef +
+  leafref + constraint-source events.
+* **Suggested slice** (chosen to exercise every walker code path with
+  minimal LOC):
+    * One simple typedef-only module (e.g. an `*-types` module).
+    * One module with a leafref crossing into another module.
+    * One module with augments out into a host module (exercises
+      step 3).
+    * One annotation module + its target module (exercises §6 +
+      step 5 + step 6).
+    * One module with a deviation injecting a `when` into another
+      module's node.
+    * Two modules that exhibit the pure-2-element-reverse and the
+      complex-shuffle patterns observed in real bundles.
+* **Test harness**: `core/tests/ref_parity.rs` reads each
+  `expected/<module>.ns_to_prefix_maps.json`, parses fixtures with
+  `parse_yang` + `compile_module` (or constructs a
+  `ModuleRegistry` from the slice), instantiates a recording
+  observer, drives `SchemaWalker::walk` per module, dedups the
+  observer's events into `(source_module)` order, and asserts
+  equality against the expected JSON.
+* **Diff output**: on failure, print the longest common subsequence
+  of expected vs actual so the maintainer can see "missing X here,
+  extra Y there" without re-deriving by eye. Use `similar` or
+  hand-rolled LCS — keep it dependency-light.
+* **Updating expectations**: a `REGEN_REF_PARITY=1` env flag should
+  rewrite the JSON files from the current walker output, so updating
+  the slice doesn't require manual JSON editing. CI runs without the
+  flag set.
+
 ---
 
 ## 10. Migration plan
 
-**Status:** steps 1–2 are implemented in [`core::walker`](../core/src/walker/mod.rs)
-(`SchemaWalker`, `WalkOptions`, `walk`, `walk_with_visitor`, observer firing at
-type-resolution sites) with the §9.1/§9.2 unit and observer-event tests. Steps 3
-(augment-splicing / deviation-inlining at the walk level) and 4 (`ref-data`-gated
-reference-parity tests) are not yet done: step 3 depends on indexset-based augment
-splicing in `compile`, and step 4 needs checked-in reference outputs.
+### Status (as of 2026-06-03)
 
-This is upstream-only design work. Implementation proceeds in four
-commits, each independently mergeable:
+| Step | Description | Status |
+|---|---|---|
+| 1 | `core::walker` skeleton | **Done** (`ea920e4`) |
+| 2 | Wire observer firing at resolution sites | **Done** (`ea920e4`) |
+| 3 | `walk_own_augments` (own-augment traversal) | **Pending** — see §11 |
+| 4 | `ref-data`-gated parity tests | **Pending** — see §9 |
+| 5 | `on_constraint_source` for `when`/`must` | **Done** (`53062f7`) |
+| 6 | `on_extension_attached` for foreign-module extensions | **Pending** — see §15 |
+
+Steps 3, 4, 6 are independent; any order is fine. Empirical
+evidence from a downstream walker probe (§14) gives priority to
+step 3 (~14 modules) and step 6 (~14 modules), with step 4 third
+(insurance against future regressions).
+
+### Original step descriptions
+
+This was upstream-only design work; implementation proceeds in
+independently mergeable commits:
 
 1. **Add `core::walker` module skeleton** — `SchemaWalker`,
    `WalkOptions`, `walk` and `walk_with_visitor` methods. The walker
@@ -376,21 +434,15 @@ commits, each independently mergeable:
    `types.resolve_with_observer` at each node with a type. Add the
    unit and observer-event tests from §9.1 and §9.2. No backend
    migrated yet.
-3. **Augment-splicing and deviation-inlining ordering** — make
-   `WalkOptions::follow_deviations` actually inline deviation subtrees
-   and verify augment children appear at their splice site. This is
-   the work that depends on feature #8 (indexset-based augment
-   splicing in `compile`); if #8 is already in flight, this commit
-   blocks on it.
-4. **Reference-parity tests** — add the `ref-data`-gated tests in §9.3
-   using a small representative slice of the reference yangbundle, so
-   regressions show up in the upstream CI rather than waiting for the
-   downstream backend migration to flag them.
+3. **Augment-splicing and deviation-inlining ordering** — see §11.
+4. **Reference-parity tests** — see §9.
+5. **`on_constraint_source` event** — see §12.
+6. **`on_extension_attached` event** — see §15.
 
-After step 4 the upstream is ready for byte-faithful backends. The
-downstream migration (rewriting the backend's `build_ns_to_prefix_maps`
-against `SchemaWalker`) happens separately and does not touch upstream
-further.
+After steps 3, 4, 6 land the upstream is fully ready for
+byte-faithful backends. The downstream migration (rewriting the
+backend's `build_ns_to_prefix_maps` against `SchemaWalker`) happens
+separately and does not touch upstream further.
 
 ---
 
@@ -456,9 +508,160 @@ visits. Whether a node was reached through `walk_own_tree` or
 `walk_own_augments` is invisible to the observer — exactly what an
 order-encounter consumer wants.
 
+### Step 3 implementation specification
+
+For a maintainer picking up step 3 cold, the following is the full
+spec.
+
+**Data sources** (already populated by `compile_module`):
+
+* `CompiledModule::augments: Vec<AugmentEntry>` — the augments this
+  module declares into other modules' trees.
+* `AugmentEntry::target_path: SchemaPath` — `Vec<PathStep>`
+  with `{prefix, name}` per step. The first step's prefix is the
+  module's own prefix or an imported prefix; resolve via
+  `module.prefix_map`.
+* `AugmentEntry::nodes: Vec<SchemaNode>` — children to splice at the
+  target. These nodes already carry the correct `module_name`
+  (= the augmenting module) and have their `when`/`musts` populated.
+* `AugmentEntry::when` / `if_features` — augment-level guards. An
+  augment skipped by an `if-feature` failure should fire **no**
+  observer events. Use `crate::compiler::is_feature_enabled` to
+  evaluate.
+* `AugmentEntry::pos` — source position. Iterate `module.augments`
+  in `Vec` order (which is source-declaration order); the reference
+  compiler does not re-sort.
+
+**Iteration order**: `module.augments.iter()`, then for each augment
+the body in `nodes.iter()` declaration order. No alphabetical sort,
+no target-path sort.
+
+**Cursor positioning**:
+
+```rust
+fn cursor_for_augment_target(
+    target_path: &SchemaPath,
+    module: &CompiledModule,           // augmenting module (for prefix_map)
+    registry: &ModuleRegistry,
+    ctx: &ExpansionCtx<'_>,
+) -> Option<Cursor<'_>> {
+    let first = target_path.first()?;
+    let host_name = first.prefix.as_deref()
+        .and_then(|p| module.prefix_map.get(p))
+        .or(Some(&module.key.name))?;
+    let host = registry.resolve_import(host_name, None)?;
+    let mut cur = Cursor::root_of(&host, ctx);
+    let axes: Vec<Axis> = target_path.iter()
+        .map(|step| Axis::Child(QName {
+            module: Some(/* resolved module for step.prefix */),
+            name: step.name.clone(),
+        }))
+        .collect();
+    cur.follow_path(&axes).ok()?;
+    Some(cur)
+}
+```
+
+If the cursor cannot be positioned (e.g. host module not loaded,
+target node missing), skip that augment silently and continue.
+Backends asking for byte-faithful output can detect this via the
+existing diagnostics path; the walker is best-effort and never
+panics on schema gaps.
+
+**Choice/case targets**: an augment may target a `case` inside a
+`choice`. The same transparent-choice/case logic the existing
+`visit_node` uses applies — pass the augment's children to
+`visit_node` with `data_cursor` positioned at the enclosing data
+node, not the case.
+
+**Recursive bodies**: if an augment body contains `Uses` nodes, they
+expand transparently via `node.children(ctx)` exactly like in
+own-tree walking; no special handling needed.
+
+**Cross-module augment chains**: when otv augments into ethernet,
+and ethernet augments into interfaces, the otv walk visits otv's
+augment into ethernet *only*. ethernet's augment into interfaces is
+ethernet's responsibility, fired during ethernet's own walk. This
+matches the reference compiler's per-module compilation model.
+
+**Suggested implementation skeleton**:
+
+```rust
+pub fn walk_own_augments<O: TypeResolutionObserver>(&self, observer: &mut O) {
+    for aug in &self.module.augments {
+        if !self.augment_is_enabled(aug) {
+            continue;
+        }
+        let Some(target_cursor) = cursor_for_augment_target(
+            &aug.target_path, self.module, self.registry, self.ctx
+        ) else { continue };
+
+        // Augment-level when/musts also need on_constraint_source;
+        // they fire once per augment, with the augmenting module as source.
+        for w in &aug.when {
+            // The "node" we report is the first child the augment splices,
+            // because the augment statement itself has no SchemaNode.
+            // Backends that care about exact attribution can look at the
+            // node's ancestry. (Open question — see §13.)
+        }
+
+        for child in &aug.nodes {
+            self.visit_node(child, &target_cursor, observer, &mut |_| {});
+        }
+    }
+}
+
+fn augment_is_enabled(&self, aug: &AugmentEntry) -> bool {
+    aug.if_features.iter().all(|f|
+        crate::compiler::is_feature_enabled(self.ctx, &self.module.key.name, f)
+    )
+}
+```
+
+The `walk_with_visitor` variant follows the same pattern but threads
+the visitor through.
+
+**Tests to add** (`core/src/walker/tests.rs`):
+
+1. `own_augments_fire_in_declaration_order` — module M with two
+   augments into module H; assert events from M's walk include
+   leafs from both, in source order.
+2. `own_augments_skipped_if_feature_disabled` — augment guarded by
+   `if-feature foo` where `foo` is disabled; assert no events.
+3. `own_augments_position_cursor_at_target` — augment target is
+   nested under a container in the host; assert a leafref in the
+   augment body resolving via `..` finds a sibling in the *host*
+   (not the augmenting module).
+4. `cross_module_augment_chain_per_module_attribution` — three
+   modules A, B, C where A augments B, B augments C; walking A
+   fires events only for A's augment; walking B fires events for
+   B's own tree + B's augment into C; walking C fires events for
+   its own tree.
+5. `walk_calls_own_tree_then_own_augments` — assert event order
+   from `walk()` equals `walk_own_tree()` events followed by
+   `walk_own_augments()` events.
+
+**Bundle-level smoke-test target**: with step 3 in place, the fxs
+backend (using the `YANGEST_FXS_NS_DUMP=1` probe in the downstream
+yangest-experiments tree) should drop the count of *miss-only*
+modules from 23 → ~9 (the *-ann cases that need step 6) and "both"
+from 1 → 0.
+
 ---
 
-## 12. Step 5 — when/must source-module exposure (new step)
+## 12. Step 5 — when/must source-module exposure (DONE)
+
+**Status: implemented in commit `53062f7`.** `ConstraintKind { When,
+Must }` and `TypeResolutionObserver::on_constraint_source` are
+upstream and synced; `SchemaNode::musts()` accessor added; walker
+fires when-then-must events at each visited node before type
+resolution. Three tests added; full suite (45 integration + 80
+core unit) passes.
+
+The original specification of this step is preserved below for
+historical reference and to document the design rationale.
+
+---
 
 Section 6 of the spec deferred exposing `when`/`must` source modules
 because the trait-extension cost was uncertain. Empirical evidence
@@ -626,3 +829,147 @@ alone cannot see leafs `M` contributes to other modules' trees.
    filter-tail of 6 = up to 157 cases.
 
 Total expected coverage if all three land: 281 + 23 + 151 + 6 = 461.
+
+---
+
+## 15. Step 6 — `on_extension_attached` event
+
+### Why this step is needed
+
+The walker probe (§14) classified 23 modules as miss-only after
+step 5 landed. Inspection showed two distinct causes:
+
+1. The augment-out tail (modules like `Cisco-IOS-XE-native` whose
+   typed leafs live under hosts the walker never sees from
+   `native`'s root). Step 3 (§11) addresses this.
+2. Annotation modules (`*-ann`) that attach **extension instances**
+   such as `tailf:callpoint`, `tailf:hidden`, `tailf:dependency`,
+   etc. to nodes in a target module. These are NOT `when`/`must`
+   constraints — they're orthogonal extension attachments. They
+   are observable at `SchemaNode::extensions` after the annotation
+   pass merges them in, but the walker has no event surface to
+   notify observers when a foreign-module extension is attached
+   to a visited node.
+
+Empirically, 14 of the 23 miss-only cases on the reference bundle
+are exclusively in this second category (acl-ann, aaa-ann,
+dhcp-ann, ethernet-ann, native-ann, pnp-ann, pppoe-ann,
+spanning-tree-ann, atm-ann, voice-ann, …). Without step 6 a
+backend cannot reach byte-faithful output for any module that
+imports an annotation overlay.
+
+### Trait surface (proposed)
+
+Default-method extension on `TypeResolutionObserver`, mirroring the
+shape of `on_constraint_source`:
+
+```rust
+pub trait TypeResolutionObserver {
+    // ...existing methods...
+
+    /// Called once per foreign-module extension instance attached
+    /// to `node`, in declaration order within `node.extensions`.
+    /// Fired *after* `on_constraint_source` events at the same
+    /// node and *before* type resolution + child descent.
+    ///
+    /// `source_module` is `ext.module` — the module that declared
+    /// the extension instance. By contract, this method only fires
+    /// when `ext.module != node.module_name`; observers do not need
+    /// to filter same-module extensions.
+    fn on_extension_attached(
+        &mut self,
+        _source_module: &str,
+        _ext: &ExtensionInstance,
+        _node: &SchemaNode,
+    ) {}
+}
+```
+
+`ExtensionInstance` already exists in `core/src/compiler/types.rs`
+and carries `module: String` (the source module of the extension
+instance, not necessarily the module of the extension *definition*),
+`name: String`, `arg: Option<String>`, and substatement information.
+No new data needed.
+
+### Walker-side firing rule
+
+In `SchemaWalker::visit_node`, after the `on_constraint_source`
+loop and before `resolve_node_type`:
+
+```rust
+for ext in &node.extensions {
+    if ext.module != node.module_name {
+        observer.on_extension_attached(&ext.module, ext, node);
+    }
+}
+```
+
+The same-module filter is intentional: backends consuming this
+event for `ns_to_prefix_maps` only care about *foreign* sources.
+A backend that needs to see same-module extensions should walk
+`node.extensions` directly — that's a node-property query, not an
+encounter-order event.
+
+### Order guarantees
+
+* Within a node: `node.extensions.iter()` is the declaration order
+  the annotation merge produces. Stable across runs.
+* Between nodes: standard DFS encounter order, identical to all
+  other events.
+* Relative to other events at the same node:
+  `on_constraint_source` first, then `on_extension_attached`,
+  then `on_typedef_resolved` / `on_leafref_resolved`.
+
+### Tests
+
+In `core/src/walker/tests.rs`:
+
+1. `fires_on_extension_attached_for_foreign_module_only` — build
+   two modules `A` and `B`. `A`'s leaf `x` has its own-module
+   extension `A:hint` and a foreign-module extension
+   `B:callpoint`. Walking `A` fires exactly one
+   `on_extension_attached("B", _, _)` event for `x`.
+2. `fires_extensions_in_declaration_order` — leaf with three
+   foreign-module extensions, attached in order `B:a`, `C:b`,
+   `B:c`. Assert events arrive in exactly that order, source
+   modules `["B", "C", "B"]` (no per-source dedup at the walker
+   layer — that's the observer's job).
+3. `default_observer_method_means_no_extension_events` — trait
+   default method does nothing; an observer that doesn't override
+   it sees zero `on_extension_attached` calls (verified via a
+   recording observer that logs every method call).
+4. `fires_after_constraint_before_resolution` — leaf with a `when`
+   from foreign module `B` AND a `tailf:callpoint` from foreign
+   module `C` AND a leafref to foreign module `D`. Recording
+   observer: assert event order is `on_constraint_source(B,
+   When, _)`, `on_extension_attached(C, _, _)`,
+   `on_leafref_resolved(_, target in D)`.
+
+### Out of scope
+
+* Same-module extension events. Backends wanting them can walk
+  `node.extensions` directly.
+* Extension-substatement traversal. If an extension carries
+  substatements that themselves contain `when` or `must`
+  constraints, those are a separate question; current backends
+  don't need them.
+* Per-extension hash-key uniqueness or dedup. The walker fires
+  once per occurrence in `node.extensions`; observers that want
+  uniqueness use an `IndexSet` keyed on whatever they care about.
+
+### Expected metric movement
+
+After step 6 lands and a backend consumes it:
+
+* Probe miss-only: 23 → ~9 (the 14 `*-ann`-driven cases
+  unblocked).
+* Combined with step 3: miss-only → 0.
+* "extra-only" cases unaffected — they need a backend-side import
+  filter, which is a downstream concern.
+
+After step 3 + step 6 + the backend rewrite, the full 461 modules
+on the reference bundle are reachable: 281 already-OK + 23
+unblocked by step 5 (already implemented) + step 3 + step 6 + 156
+unblocked by the import filter = 460+, with the remaining 1–2
+"OTHER" failures being non-`ns_to_prefix_maps` issues investigated
+separately.
