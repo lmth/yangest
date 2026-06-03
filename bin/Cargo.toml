@@ -33,3 +33,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "bundle_tree"
 harness = false
+
+[[bench]]
+name = "walker_probe"
+harness = false

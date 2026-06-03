@@ -651,13 +651,37 @@ perceived robustness:**
    the per-augment-body iteration.
 
 Path (1) is the most defensive; (3) is closest in spirit to the
-host-tree-iteration rule the upstream tests pin. Both need fresh
+host-tree-iteration rule the upstream tests pin. All need fresh
 heavy-bundle bench numbers before declaring done.
+
+**Path (1) empirically ruled out (measured, not landed).** Path (1)
+was implemented (a per-`ExpansionCtx` `expand_augment_body` cache keyed
+on `*const AugmentEntry`, with both `Cursor::augment_children` and the
+walker's body iteration `Arc::clone`-ing the cached expansion) and run
+through `bin/benches/walker_probe` — a parallel, bundle-mode walk of a
+representative ~1071-module vendor bundle. It **reproduces the
+regression**: RSS climbs past 10 GB and never completes. The cache
+removes the *re-expansion*, but not the per-call **deep clone** of the
+expanded body: `Cursor::current_children` rebuilds an owned
+`Vec<SchemaNode>` on *every* `find_child`/`child_nodes` call, and the
+walker calls those O(children) times per node. The baseline walk (no
+Uses expansion at all) already costs ~440 s / ~3.5 GB peak on that
+bundle for exactly this reason — expanding the augment bodies only
+amplifies a cost that is already in `current_children`.
+
+**Implication.** The real fix is not "cache the augment body" — it is
+"stop `current_children` from deep-cloning per descent." Candidates:
+memoize `current_children` by absolute path in the `ExpansionCtx`
+(bounded by tree size, but the fully-expanded forest is itself large —
+needs its own bench), or restructure the cursor to share subtrees by
+`Arc` instead of cloning. This is a cursor-level performance redesign,
+larger than a localized augment helper, and must be validated with
+`walker_probe` against the heavy bundle before landing.
 
 The §14 verification table (post step 3) still applies: even
 without the Uses-body fix, step 3 unblocks two cases. The dominant
 17 Uses-body misses are blocked on this follow-up; do not assume
-they are easy.
+they are easy — and the obvious cache (path 1) is *not* the answer.
 
 **Cross-module augment chains**: when module A augments into B, and B
 augments into C, A's walk visits A's augment into B *only*. B's augment
