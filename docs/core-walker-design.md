@@ -392,20 +392,182 @@ downstream migration (rewriting the backend's `build_ns_to_prefix_maps`
 against `SchemaWalker`) happens separately and does not touch upstream
 further.
 
-### Open questions
+---
+
+## 11. Step 3 detail — what augment splicing must actually do
+
+With steps 1–2 in place, the walker visits `module.children(ctx)`. By
+construction those children include subtrees that *other* modules
+augmented into this module — they appear inline at their splice point,
+correctly carrying the augmenting module's `module_name` on each
+`SchemaNode`. So an observer driving the walker on module *M* already
+sees every typedef and leafref of an augment splice-in into *M* and
+correctly reports the augmenting module as the type's source module.
+
+What the walker does **not** do is, when walking module *M*, descend
+into augments *M itself applies into other modules*. The reference
+compiler's per-module `ns_to_prefix_maps` for module *M* covers the
+types of leafs *M* introduces *anywhere* — including under augments
+*M* contributes to other modules. So step 3 is more naturally framed
+as **own-augment traversal**, not "splicing":
+
+```rust
+impl<'a> SchemaWalker<'a> {
+    /// Visit the module's *own* schema tree (current `walk` behaviour).
+    pub fn walk_own_tree<O: TypeResolutionObserver>(&self, observer: &mut O);
+
+    /// For every augment `module` applies into another module's tree, walk
+    /// the augment's children and fire observer events as if the children
+    /// were part of `module`. The cursor is positioned at the augment
+    /// target so leafref paths resolve correctly.
+    pub fn walk_own_augments<O: TypeResolutionObserver>(&self, observer: &mut O);
+
+    /// Convenience: `walk_own_tree` followed by `walk_own_augments`.
+    /// This becomes the new behaviour of `walk`.
+    pub fn walk<O: TypeResolutionObserver>(&self, observer: &mut O);
+}
+```
+
+Splitting the methods is mandatory, not cosmetic: a backend that is
+already finalising per-module output (the fxs case) must complete
+**all** observer events for module *M* before the next module is
+walked, which means own-augment events have to fire during *M*'s walk
+even though structurally they live under another module's tree.
+
+### Where the augment data lives
+
+The per-module list of own augments is already available via
+`CompiledModule::augments` (alternatively the existing
+`AugmentEntry` / overlay structures — choose whichever exposes the
+augment target path *and* the augment children in source-declaration
+order). Walking own-augments is therefore a structural traversal over
+already-compiled data; it does not need any new compile-time work.
+The walker positions the cursor at the augment target via
+`Cursor::root_of(<host_module>, ctx).follow_path(<augment_path>)`,
+then iterates `augment.children` in declaration order, calling
+`visit_node` exactly as for the own-tree walk.
+
+### Observer-side semantics (no trait change required)
+
+Critically, no changes to `TypeResolutionObserver` are needed for
+step 3. The trait fires events on `(source_module, …)`; the walker
+already records the *correct* source module on each `SchemaNode` it
+visits. Whether a node was reached through `walk_own_tree` or
+`walk_own_augments` is invisible to the observer — exactly what an
+order-encounter consumer wants.
+
+---
+
+## 12. Step 5 — when/must source-module exposure (new step)
+
+Section 6 of the spec deferred exposing `when`/`must` source modules
+because the trait-extension cost was uncertain. Empirical evidence
+from a 461-module reference yangbundle now refutes that deferral: of
+21 modules whose `ns_to_prefix_maps` differs from the reference,
+**three have wrong membership** — meaning typedef+leafref events
+alone cannot reproduce the reference set. The missing signal is the
+source module of `when`/`must` constraints contributed by deviations
+and annotations applied to nodes during compilation.
+
+Concretely, for `Cisco-IOS-XE-native` the reference includes a
+deviation that adds a `when` whose source module is the deviation
+module itself — the reference compiler counts this in the namespace
+map even though the deviation contributes no typed leaf of its own.
+This must be observable via the walker.
+
+Proposed extension (default-method, backward compatible):
+
+```rust
+pub trait TypeResolutionObserver {
+    fn on_typedef_resolved(&mut self, _source_module: &str, _typedef: &Typedef) {}
+    fn on_leafref_resolved(&mut self, _source_module: &str, _target: &SchemaNode) {}
+
+    /// Fired for the source module of every `when`/`must` constraint visited
+    /// at a node, whether the constraint was original or contributed by a
+    /// deviation/annotation. Default impl is empty so existing observers do
+    /// not change behaviour.
+    fn on_constraint_source(
+        &mut self,
+        _source_module: &str,
+        _kind: ConstraintKind,
+        _node: &SchemaNode,
+    ) {}
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ConstraintKind { When, Must }
+```
+
+The walker fires `on_constraint_source` once per `(source_module,
+kind)` pair encountered at a node, *before* descending into the node's
+children. Backends that do not care provide the default no-op and pay
+nothing.
+
+This event is exactly what the fxs plugin's existing
+`AppliedDeviations`/`AppliedAnnotations` pdata reads today — but now
+tied to encounter order, which is the missing dimension.
+
+The migration plan grows a fifth step:
+
+5. **Add `on_constraint_source` event** — extend the trait, fire from
+   the walker at each visited node carrying `when`/`must`. Add
+   observer-event tests covering: (a) original constraint, (b)
+   deviation-injected constraint, (c) annotation-injected constraint,
+   (d) multi-source nodes (a node with constraints from two different
+   modules).
+
+Step 5 is independent of step 3 and can land before or after it.
+
+---
+
+## 13. Open questions (revised)
 
 * Whether to expose `WalkOptions::deep_typedef_chains`. The reference
   compiler does not deep-walk; no current backend needs it. Add it
-  only if a second backend asks.
+  only if a second backend asks. **Status: unchanged.**
 * Whether `walk_with_visitor`'s `V: FnMut` should also be able to
-  *prune* a subtree (return `enum Action { Recurse, Skip }`).
-  Useful for the `tree` plugin. Probably yes; leaving the signature
-  open in the first commit and tightening it once a second consumer
-  appears.
-* Augment-source-module exposure: does the walker need to expose the
-  augmenting module to a hypothetical `on_node_enter` event, or is
-  observing typedef/leafref source modules enough? For
-  `ns_to_prefix_maps` the latter is sufficient (every augmented
-  subtree contains at least one typed leaf whose source-module is the
-  augmenter). For other potential observers it may not be. Defer
-  until needed.
+  *prune* a subtree (`enum Action { Recurse, Skip }`). The first
+  consumer (fxs ns-map building) does not need pruning; the `tree`
+  plugin would. Add when a second consumer appears.
+  **Status: still deferred; no urgency.**
+* Augment-source-module exposure via `on_node_enter`. **Resolved**
+  by §11: own-augment traversal makes the source-module visible
+  through existing `on_typedef_resolved` / `on_leafref_resolved`
+  events; no `on_node_enter` event is needed.
+* Whether `on_constraint_source` should fire once per visited node
+  *or* once per (source-module, node, kind) triple. Once per triple
+  is safer (it lets the observer dedup later); but it loses the
+  signal "two musts from the same module". Recommend **once per
+  constraint statement** — the natural semantic.
+* Cursor positioning during `walk_own_augments`: the augment target
+  may be inside a `case` of a `choice` in the host module. The walker
+  must use the existing transparent-choice/case logic so leafref
+  paths under the augment resolve through the host's data tree.
+
+---
+
+## 14. Verification plan for the partial implementation
+
+Before step 3 lands, the following can be verified with the current
+walker:
+
+1. **Side-by-side observer dump** — wire a recording observer into
+   the downstream fxs plugin (behind an env flag, not committed),
+   run it on a sample of modules with `ns_to_prefix_maps` currently
+   matching the reference, and confirm the recorded
+   `(source_module, kind)` event sequence is consistent with the
+   reference's namespace order. This validates that the
+   declaration-order DFS from steps 1–2 is correct for modules that
+   do not exercise augments-out or constraint-source events.
+2. **Unit test for transparent choice/case** — already covered by
+   the existing `leafref_inside_case_resolves_sibling_through_transparent_choice`
+   test. Confirmed in upstream `ea920e4`.
+3. **Integration smoke test** — once a backend is wired (even
+   experimentally), the 461-module reference bundle gives a
+   single-number health metric: any *increase* below the current
+   440/461 baseline indicates the walker contract is being violated
+   for some module, and step 3 / step 5 can be planned with concrete
+   per-module data via the existing `ns-map-classifier` tool.
+
+The verification work happens downstream and does not require
+upstream changes.
