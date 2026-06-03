@@ -571,3 +571,58 @@ walker:
 
 The verification work happens downstream and does not require
 upstream changes.
+
+### Verification results (2026-06-03)
+
+The verification described in §14 has been carried out: a recording
+observer was wired into the fxs backend behind an env flag and run
+against the full 461-module reference yangbundle. Results
+(de-duplicated source-module set, own module excluded, comparing
+walker output to the reference `ns_to_prefix_maps`):
+
+| Outcome | Modules | Implication |
+|---|---|---|
+| Set + order match exactly | **281** | Steps 1–2 contract holds verbatim |
+| Walker over-reports (extra-only) | 151 | Backend-side filter (modules already in `yang_header.imports`) — not a walker concern |
+| Walker under-reports (miss-only) | 23 | Step 5 (§12 `on_constraint_source`) territory: annotation, deviation, obsolete-overlay modules |
+| Combination | 6 | Steps 3 + 5 + filter |
+| **Walker order diffs (set-matches only)** | **0** | The walker's encounter order is byte-exact for every module where membership is correct |
+
+The zero-order-diff result is the strongest evidence the §5 visit-order
+contract is correctly specified and implemented: across 281 real-world
+modules, no spurious shuffle was observed. This justifies steps 3 and
+5 advancing on the same ordering machinery; both are *additions* to
+the event stream, not corrections to existing event order.
+
+The miss-only cases break down into:
+
+* `*-ann` modules (annotations contributing `when`/`must`): aaa-ann,
+  acl-ann, dhcp-ann, ethernet-ann, native-ann, pnp-ann, pppoe-ann,
+  spanning-tree-ann, atm-ann, voice-ann, openconfig-network-instance-l3,
+  …
+* `*-deviation`, `*-obsolete` overlays: cts-routing-deviation,
+  eigrp-obsolete, ospf-obsolete, …
+* Augment-out source modules (e.g. `Cisco-IOS-XE-native` is missing
+  hsrp / interfaces / ip / ipv6 / line / location / logging /
+  transport — all modules `native` augments INTO, contributing typed
+  leafs at those modules' splice points).
+
+The first two categories are the §12 use case verbatim. The third
+category confirms §11 own-augment traversal is needed: `walk_own_tree`
+alone cannot see leafs `M` contributes to other modules' trees.
+
+### Updated migration prioritisation
+
+1. **Step 5 first** (`on_constraint_source`) — fixes 23 miss-only
+   cases. Smaller change (default-method trait extension + walker-side
+   firing at `when`/`must`-bearing nodes), no compile-side changes.
+2. **Step 3 second** (`walk_own_augments`) — fixes the augment-out
+   subset of the 6 "both" cases plus the augment-out tail of the
+   miss-only cases overlapping with augmenter modules. Larger change
+   but no compile-side changes either: `CompiledModule::augments` is
+   already populated.
+3. **Backend filter** — drop walker-observed modules already in
+   `yang_header.imports`. Pure downstream work; collapses 151 +
+   filter-tail of 6 = up to 157 cases.
+
+Total expected coverage if all three land: 281 + 23 + 151 + 6 = 461.
