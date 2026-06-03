@@ -28,7 +28,10 @@
 
 use std::sync::Arc;
 
-use crate::compiler::{CompiledModule, ExpansionCtx, PathStep, SchemaNode, SchemaNodeKind};
+use crate::compiler::{
+    expand_children, CompiledModule, ExpansionCtx, NodeOverlayMap, PathStep, SchemaNode,
+    SchemaNodeKind,
+};
 
 /// A resolved node identifier: a node name plus the *module that owns its
 /// namespace*. `module == None` matches by local name only (used when the
@@ -221,11 +224,28 @@ impl<'a> Cursor<'a> {
         if abs.is_empty() {
             return Vec::new();
         }
+        let empty_overlay = NodeOverlayMap::new();
         let mut out = Vec::new();
         for module in self.ctx.registry.modules.values() {
             for aug in &module.augments {
                 if augment_target_matches(module, &aug.target_path, &abs) {
-                    out.extend(aug.nodes.iter().cloned());
+                    // Expand the augment body so that `uses grouping;` shorthand
+                    // (whose `aug.nodes` is a single `SchemaNodeKind::Uses`)
+                    // surfaces the grouping's expanded children to cursor
+                    // consumers. Without this, `child_nodes()` and `find_child`
+                    // would return the raw Uses node — its name does not match
+                    // any host child, so walker name-matching would visit zero
+                    // nodes (see core-walker-design.md §11).
+                    let overlay =
+                        if module.overlay.is_empty() { &empty_overlay } else { &module.overlay };
+                    out.extend(expand_children(
+                        &aug.nodes,
+                        &module.prefix,
+                        &module.key.name,
+                        overlay,
+                        &[],
+                        self.ctx,
+                    ));
                 }
             }
         }

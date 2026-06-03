@@ -51,8 +51,8 @@
 //! nothing in the compile path uses it.
 
 use crate::compiler::{
-    AugmentEntry, CompiledModule, ExpansionCtx, ModuleRegistry, PathStep, SchemaNode,
-    SchemaNodeKind, SchemaPath,
+    expand_children, AugmentEntry, CompiledModule, ExpansionCtx, ModuleRegistry, NodeOverlayMap,
+    PathStep, SchemaNode, SchemaNodeKind, SchemaPath,
 };
 use crate::cursor::{Axis, Cursor, QName};
 use crate::types_registry::{BuiltInType, ConstraintKind, TypeRegistry, TypeResolutionObserver};
@@ -193,8 +193,27 @@ impl<'a> SchemaWalker<'a> {
             // (§11 host-tree-iteration rule). Matching by name (rather than
             // visiting every same-module child) keeps two augments into the same
             // target from double-counting each other's nodes.
+            //
+            // Expand `aug.nodes` first so that augment bodies expressed as
+            // `uses g;` (whose raw `aug.nodes` is a single Uses node named
+            // `__uses__`) iterate the grouping's expanded leaves rather than
+            // the bare Uses (§11 recursive-bodies rule).
             let host_children = target_cursor.child_nodes();
-            for body_node in &aug.nodes {
+            let empty_overlay = NodeOverlayMap::new();
+            let body_overlay = if self.module.overlay.is_empty() {
+                &empty_overlay
+            } else {
+                &self.module.overlay
+            };
+            let body_nodes = expand_children(
+                &aug.nodes,
+                &self.module.prefix,
+                &self.module.key.name,
+                body_overlay,
+                &[],
+                self.ctx,
+            );
+            for body_node in &body_nodes {
                 if let Some(child) = host_children.iter().find(|c| {
                     c.name == body_node.name && c.module_name == self.module.key.name
                 }) {
