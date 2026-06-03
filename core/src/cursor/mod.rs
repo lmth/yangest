@@ -168,6 +168,16 @@ impl<'a> Cursor<'a> {
         self.stack.is_empty()
     }
 
+    /// The logical children at the current position, including nodes spliced in
+    /// by external augments targeting the current node (the data tree is the
+    /// union of every module's contributions). `choice`/`case` are flattened.
+    ///
+    /// This is the same view `find_child` searches; a caller can enumerate it to
+    /// drive its own traversal (e.g. the walker's own-augment pass).
+    pub fn child_nodes(&self) -> Arc<Vec<SchemaNode>> {
+        self.current_children()
+    }
+
     /// The logical children available at the current position, including nodes
     /// spliced in by external augments targeting the current node (the data tree
     /// is the union of every module's contributions).

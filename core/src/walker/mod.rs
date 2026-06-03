@@ -25,24 +25,36 @@
 //! ## Scope
 //!
 //! This implements the design doc's migration steps 1–2 (skeleton + observer
-//! firing), step 5 (`on_constraint_source` for `when`/`must`), and step 6
-//! (`on_extension_attached` for foreign-module extensions). At each node the
-//! walker fires, in order: constraint-source events, foreign-extension events,
-//! then type-resolution events; then it descends.
+//! firing), step 3 (own-augment traversal), step 5 (`on_constraint_source` for
+//! `when`/`must`), and step 6 (`on_extension_attached` for foreign-module
+//! extensions). At each node the walker fires, in order: constraint-source
+//! events, foreign-extension events, then type-resolution events; then it
+//! descends.
 //!
-//! Cross-module **own-augment traversal** (step 3) is not yet performed: the
-//! walk currently visits each module's own `children(ctx)`, so leafs a module
-//! contributes via augments *into other modules* are seen during those other
-//! modules' walks, not this one. [`WalkOptions::follow_deviations`] and
-//! [`WalkOptions::deep_typedef_chains`] are accepted and stored but reserved for
-//! that later work.
+//! [`walk`](SchemaWalker::walk) visits the module's own tree
+//! ([`walk_own_tree`](SchemaWalker::walk_own_tree)) and then the augments the
+//! module applies into other modules
+//! ([`walk_own_augments`](SchemaWalker::walk_own_augments)), so a backend
+//! finalising per-module output sees *all* of a module's typed leafs — including
+//! those it contributes under other modules' trees — during that module's walk.
+//!
+//! [`WalkOptions::follow_deviations`] and [`WalkOptions::deep_typedef_chains`]
+//! are accepted and stored but reserved for future work (step 4 / open
+//! questions).
+//!
+//! Like the rest of the resolution machinery, the walker is **opt-in**: it is
+//! constructed by a backend from what `Plugin::emit_module` already has, and
+//! nothing in the compile path uses it.
 //!
 //! Like the rest of the resolution machinery, the walker is **opt-in**: it is
 //! constructed by a backend from what `Plugin::emit_module` already has, and
 //! nothing in the compile path uses it.
 
-use crate::compiler::{CompiledModule, ExpansionCtx, ModuleRegistry, SchemaNode, SchemaNodeKind};
-use crate::cursor::{Cursor, QName};
+use crate::compiler::{
+    AugmentEntry, CompiledModule, ExpansionCtx, ModuleRegistry, PathStep, SchemaNode,
+    SchemaNodeKind, SchemaPath,
+};
+use crate::cursor::{Axis, Cursor, QName};
 use crate::types_registry::{BuiltInType, ConstraintKind, TypeRegistry, TypeResolutionObserver};
 
 /// Tuning knobs for [`SchemaWalker`]. [`WalkOptions::default`] is the
@@ -113,24 +125,125 @@ impl<'a> SchemaWalker<'a> {
         self.options
     }
 
-    /// Walk the module's schema tree, firing observer events in encounter order.
-    /// The observer is borrowed for the duration of the walk and may carry
-    /// arbitrary backend state.
+    /// Walk the module's schema tree *and* the augments it applies into other
+    /// modules, firing observer events in encounter order: own-tree first, then
+    /// own-augments (§11). The observer is borrowed for the duration of the walk
+    /// and may carry arbitrary backend state.
     pub fn walk<O: TypeResolutionObserver>(&self, observer: &mut O) {
         self.walk_with_visitor(observer, |_| {});
     }
 
-    /// Walk while exposing the cursor at every visit. The `visit` closure is
-    /// called *before* type resolution at each node; type resolution still fires
-    /// through `observer`.
+    /// Like [`walk`](Self::walk) but exposes the cursor at every visit. The
+    /// `visit` closure is called *before* type resolution at each node; type
+    /// resolution still fires through `observer`.
     pub fn walk_with_visitor<O, V>(&self, observer: &mut O, mut visit: V)
+    where
+        O: TypeResolutionObserver,
+        V: FnMut(&Cursor<'_>),
+    {
+        self.walk_own_tree_inner(observer, &mut visit);
+        self.walk_own_augments_inner(observer, &mut visit);
+    }
+
+    /// Walk only the module's *own* schema tree (its `children(ctx)`), not the
+    /// augments it applies into other modules.
+    pub fn walk_own_tree<O: TypeResolutionObserver>(&self, observer: &mut O) {
+        self.walk_own_tree_inner(observer, &mut |_| {});
+    }
+
+    /// For every augment this module applies into *another* module's tree, walk
+    /// the augment's contributed children — positioned in the host tree so
+    /// leafref paths resolve correctly and host-applied annotations are surfaced
+    /// — firing observer events as if the children were part of this module.
+    ///
+    /// A backend finalising per-module output must run this during the
+    /// augmenting module's walk, because those typed leafs structurally live
+    /// under another module's tree but belong to this module (§11).
+    pub fn walk_own_augments<O: TypeResolutionObserver>(&self, observer: &mut O) {
+        self.walk_own_augments_inner(observer, &mut |_| {});
+    }
+
+    fn walk_own_tree_inner<O, V>(&self, observer: &mut O, visit: &mut V)
     where
         O: TypeResolutionObserver,
         V: FnMut(&Cursor<'_>),
     {
         let root = Cursor::root_of(self.module, self.ctx);
         for child in self.module.children(self.ctx) {
-            self.visit_node(&child, &root, observer, &mut visit);
+            self.visit_node(&child, &root, observer, visit);
+        }
+    }
+
+    fn walk_own_augments_inner<O, V>(&self, observer: &mut O, visit: &mut V)
+    where
+        O: TypeResolutionObserver,
+        V: FnMut(&Cursor<'_>),
+    {
+        for aug in &self.module.augments {
+            if !self.augment_is_enabled(aug) {
+                continue;
+            }
+            let Some(target_cursor) = self.cursor_for_augment_target(&aug.target_path) else {
+                continue;
+            };
+            // For each node this augment contributes (declaration order), visit
+            // the matching child in the *host's* compiled tree at the target —
+            // not the raw `aug.nodes` — so extensions the host's compile applied
+            // at the splice point (e.g. annotation-injected ones) are surfaced
+            // (§11 host-tree-iteration rule). Matching by name (rather than
+            // visiting every same-module child) keeps two augments into the same
+            // target from double-counting each other's nodes.
+            let host_children = target_cursor.child_nodes();
+            for body_node in &aug.nodes {
+                if let Some(child) = host_children.iter().find(|c| {
+                    c.name == body_node.name && c.module_name == self.module.key.name
+                }) {
+                    self.visit_node(child, &target_cursor, observer, visit);
+                }
+            }
+        }
+    }
+
+    /// True if every `if-feature` on the augment is enabled (an augment whose
+    /// guard fails contributes no nodes and therefore fires no events).
+    fn augment_is_enabled(&self, aug: &AugmentEntry) -> bool {
+        aug.if_features
+            .iter()
+            .all(|f| self.ctx.eval_if_feature(f, &self.module.key.name))
+    }
+
+    /// Position a cursor at an augment's target node in the host module. Returns
+    /// `None` if the host module or target node cannot be reached (best-effort;
+    /// the walk skips such augments rather than failing).
+    fn cursor_for_augment_target(&self, target_path: &SchemaPath) -> Option<Cursor<'a>> {
+        let first = target_path.first()?;
+        let host = self.step_module(first);
+        let mut cur = Cursor::root_of(self.module, self.ctx).reroot(&host)?;
+        let axes: Vec<Axis> = target_path
+            .iter()
+            .map(|step| {
+                Axis::Child(QName {
+                    module: Some(self.step_module(step)),
+                    name: step.name.clone(),
+                })
+            })
+            .collect();
+        cur.follow_path(&axes).ok()?;
+        Some(cur)
+    }
+
+    /// Resolve a target-path step's prefix to a module name, in the context of
+    /// this (augmenting) module's imports. Unprefixed / own-prefix → this module.
+    fn step_module(&self, step: &PathStep) -> String {
+        match &step.prefix {
+            None => self.module.key.name.clone(),
+            Some(p) if *p == self.module.prefix => self.module.key.name.clone(),
+            Some(p) => self
+                .module
+                .prefix_map
+                .get(p)
+                .cloned()
+                .unwrap_or_else(|| self.module.key.name.clone()),
         }
     }
 

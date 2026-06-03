@@ -410,15 +410,14 @@ For a maintainer picking up step 4:
 |---|---|---|
 | 1 | `core::walker` skeleton | **Done** (`ea920e4`) |
 | 2 | Wire observer firing at resolution sites | **Done** (`ea920e4`) |
-| 3 | `walk_own_augments` (own-augment traversal) | **Pending** — see §11 |
+| 3 | `walk_own_augments` (own-augment traversal) | **Done** |
 | 4 | `ref-data`-gated parity tests | **Pending** — see §9 |
 | 5 | `on_constraint_source` for `when`/`must` | **Done** (`53062f7`) |
 | 6 | `on_extension_attached` for foreign-module extensions | **Done** (`813bd2f`) |
 
-Steps 3 and 4 remain; they are independent, and either order is fine.
-Step 3 (own-augment traversal) is the higher-leverage of the two per
-the §14 probe; step 4 (parity tests) is insurance against future
-regressions.
+Only step 4 (the `ref-data`-gated reference-parity tests) remains; it is
+insurance against future regressions and needs checked-in reference
+outputs.
 
 ### Original step descriptions
 
@@ -447,6 +446,16 @@ separately and does not touch upstream further.
 ---
 
 ## 11. Step 3 detail — what augment splicing must actually do
+
+**Status: implemented.** `SchemaWalker::walk` now runs `walk_own_tree`
+followed by `walk_own_augments`; both are also public for fine-grained
+use. `walk_own_augments` positions a cursor at each augment target in the
+host (via `Cursor::reroot` + `follow_path`) and, for each node the
+augment contributes, visits the matching *host-side* child (read through
+the new `Cursor::child_nodes`) so host-applied annotations are surfaced
+(the option-1 / cursor-based-descent approach below). `if-feature`-disabled
+augments fire no events. The six tests below are in
+`core/src/walker/tests.rs`. The original spec is preserved for rationale.
 
 With steps 1–2 in place, the walker visits `module.children(ctx)`. By
 construction those children include subtrees that *other* modules
@@ -630,7 +639,7 @@ copied verbatim into the source nodes during compile.
 
 It is **not** correct for `on_extension_attached` events when the
 host module's compile pipeline applies `apply_annotations`. Path-
-based annotations (`tailf:annotate "/host:x/host:y/aug:z"`) are
+based annotations (`acme:annotate "/host:x/host:y/aug:z"`) are
 merged into the **host's compiled SchemaNode tree** at the splice
 point, not back into `aug.nodes`. Walking `aug.nodes` therefore
 misses those foreign extensions even though, logically, they
@@ -687,8 +696,8 @@ walker. Pick (1) unless a second use case appears.
 6. `own_augments_surface_host_applied_annotations` — module M
    augments host H at `/H:root` with leaf `M:x`. After M is
    compiled, simulate H applying `apply_annotations` injecting a
-   foreign extension `tailf:callpoint` onto `H:root/M:x`. Walking
-   M must fire `on_extension_attached("tailf-common", _, _)` for
+   foreign extension `acme:callpoint` onto `H:root/M:x`. Walking
+   M must fire `on_extension_attached("acme-ext", _, _)` for
    `M:x` exactly once. This pins the cursor-based-descent
    semantics described above and prevents accidental regression
    to `aug.nodes`-only iteration.
@@ -873,8 +882,8 @@ alone cannot see leafs `M` contributes to other modules' trees.
 
 After step 6 (`on_extension_attached`) landed, a re-run of the same
 verification shows the foreign-extension event is now firing — 144
-modules' `walker_seq` includes `tailf-common` from
-`tailf:callpoint`/`tailf:hidden`/etc instances. But the post-step-6
+modules' `walker_seq` includes the shared annotation-extension module
+from `acme:callpoint`/`acme:hidden`/etc instances. But the post-step-6
 counts are:
 
 | Outcome | Pre step 6 | Post step 6 |
@@ -885,9 +894,9 @@ counts are:
 | Both | 6 | 5 |
 
 The drop in set-matches and rise in extra-only is **expected**: step 6
-now reports many `tailf-common`-class events the reference compiler
-already filters out (most modules import `tailf-common`, so the
-backend's import-filter pass drops it). Steps 1/2/5/6 are correct;
+now reports many shared-annotation-module events the reference compiler
+already filters out (most modules import that shared extension module, so
+the backend's import-filter pass drops it). Steps 1/2/5/6 are correct;
 the *content* is now strictly richer, and the residual difference
 between walker output and the reference is explainable by the
 backend-side filter alone (or, for the 19 miss-only, by step 3 not
@@ -895,17 +904,16 @@ yet being implemented).
 
 **Persistent miss-only after step 6**: spot-checked against the
 `*-ann` targets, the remaining miss-only is dominated by the
-augment-into-host pattern. For example, `Cisco-IOS-XE-aaa-ann`
-declares `tailf:annotate "/ios:native/ios:radius/ios-aaa:server/ios-aaa:key"`.
-The leaf `key` was contributed to `native`'s tree by `aaa`'s own
-augment-out; its `module_name` is `Cisco-IOS-XE-aaa`. When `native`
+augment-into-host pattern. For example, an annotation module `A-ann`
+declares `acme:annotate "/host:root/host:a/A:server/A:key"`.
+The leaf `key` was contributed to the host's tree by `A`'s own
+augment-out; its `module_name` is `A`. When the host
 is compiled, `apply_annotations` decorates the host-tree node at
-`key` with `tailf:callpoint`. When the walker walks
-`Cisco-IOS-XE-aaa` from its root, `aaa`'s `module.children(ctx)`
-does NOT include `key` (it lives under `native`'s root, not aaa's).
-Probe result: `walker_seq=[]` for `aaa`. Reference compiler's
-`ns_to_prefix_maps` for aaa: `["Cisco-IOS-XE-aaa-ann",
-"Cisco-IOS-XE-aaa"]`.
+`key` with `acme:callpoint`. When the walker walks
+`A` from its root, `A`'s `module.children(ctx)`
+does NOT include `key` (it lives under the host's root, not A's).
+Probe result: `walker_seq=[]` for `A`. Reference compiler's
+`ns_to_prefix_maps` for A: `["A-ann", "A"]`.
 
 This empirically confirms what §11 documents: step 3
 (`walk_own_augments`) is the required unblocker, and the
@@ -917,7 +925,8 @@ cursor-into-host-tree semantics that surfaces these annotations.
 1. **Step 5 first** (`on_constraint_source`) — DONE in `53062f7`.
 2. **Step 6 second** (`on_extension_attached`) — DONE in `813bd2f`.
    Confirmed via probe: 144 modules now report foreign-extension
-   events from `tailf-common` etc. that were previously invisible.
+   events from the shared annotation-extension module that were
+   previously invisible.
 3. **Step 3 third** (`walk_own_augments`) — pending. Empirically
    the unblocker for the residual 19 miss-only cases (dominated by
    `*-ann` annotations against augment-grafted host nodes) and 5
@@ -1071,8 +1080,8 @@ Probe sweep on 2026-06-03 with step 6 implemented:
   whose annotations target paths landing on the annotation source
   module itself, not on host-tree augment splice points).
 * Set-match: 281 → 175 (drop expected — step 6 now reports many
-  `tailf-common` foreign-extension events the backend's import
-  filter would suppress).
+  shared-annotation-module foreign-extension events the backend's
+  import filter would suppress).
 * Extra-only: 151 → 262 (rise expected — same reason).
 * Both: 6 → 5.
 

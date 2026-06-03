@@ -11,7 +11,21 @@ use crate::compiler::{compile_module, ModuleRegistry, Typedef};
 use crate::devindex::DeviationIndex;
 use crate::parser::parse_yang;
 use crate::compiler::ExtensionInstance;
+use crate::plugin::OverlayExtension;
 use crate::types_registry::{ConstraintKind, TypeResolutionObserver};
+
+/// Walk with a name-recording visitor; returns the names of all visited nodes
+/// in encounter order (own-tree then own-augments).
+fn visited_names(walker: &SchemaWalker<'_>) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut obs = EventRecorder::default();
+    walker.walk_with_visitor(&mut obs, |c| {
+        if let Some(n) = c.current() {
+            names.push(n.name.clone());
+        }
+    });
+    names
+}
 
 fn registry_from(sources: &[(&str, &str)]) -> ModuleRegistry {
     let mut reg = ModuleRegistry::new();
@@ -572,5 +586,294 @@ module m {
             "ext:cc:callpoint".to_string(),
             "leafref:dd:target".to_string(),
         ]
+    );
+}
+
+// ── Step 3: walk_own_augments (§11) ──────────────────────────────────────────
+
+#[test]
+fn own_augments_fire_in_declaration_order() {
+    // M contributes two augments into host H (both into /h:root). Walking M
+    // visits both augmented leaves, in source-declaration order.
+    let reg = registry_from(&[
+        (
+            "h",
+            r#"
+module h { namespace "urn:h"; prefix h; container root { } }
+"#,
+        ),
+        (
+            "m",
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  import h { prefix h; }
+  augment "/h:root" { leaf a { type string; } }
+  augment "/h:root" { leaf b { type string; } }
+}
+"#,
+        ),
+    ]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+    assert_eq!(visited_names(&walker), vec!["a", "b"]);
+}
+
+#[test]
+fn own_augments_skipped_if_feature_disabled() {
+    // M's augment is guarded by `if-feature myfeat`. With a strict feature set
+    // that does not enable myfeat, the augment contributes no events.
+    let reg = registry_from(&[
+        (
+            "h",
+            r#"
+module h { namespace "urn:h"; prefix h; container root { } }
+"#,
+        ),
+        (
+            "m",
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  import h { prefix h; }
+  feature myfeat;
+  augment "/h:root" {
+    if-feature myfeat;
+    leaf a { type string; }
+  }
+}
+"#,
+        ),
+    ]);
+    // Strict whitelist: m is "listed" (one enabled feature) but myfeat is not,
+    // so myfeat evaluates disabled.
+    let mut feats = HashSet::new();
+    feats.insert(("m".to_string(), "other".to_string()));
+    let cx = ExpansionCtx::new(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+    assert!(visited_names(&walker).is_empty(), "disabled augment fires nothing");
+}
+
+#[test]
+fn own_augments_position_cursor_at_target() {
+    // A leafref in the augment body resolving via `..` must find a sibling in the
+    // HOST tree (the cursor is positioned at the augment target in the host).
+    let reg = registry_from(&[
+        (
+            "h",
+            r#"
+module h {
+  namespace "urn:h";
+  prefix h;
+  container root { leaf hostleaf { type string; } }
+}
+"#,
+        ),
+        (
+            "m",
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  import h { prefix h; }
+  augment "/h:root" {
+    leaf ref { type leafref { path "../h:hostleaf"; } }
+  }
+}
+"#,
+        ),
+    ]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+
+    let mut obs = EventRecorder::default();
+    walker.walk(&mut obs);
+    // `../hostleaf` resolves to the host's own leaf.
+    assert_eq!(obs.events, vec!["leafref:h:hostleaf".to_string()]);
+}
+
+#[test]
+fn cross_module_augment_chain_per_module_attribution() {
+    // A augments B, B augments C. Each module's walk fires only its own tree
+    // plus its own augments — never another module's augment.
+    let reg = registry_from(&[
+        (
+            "c",
+            r#"
+module c { namespace "urn:c"; prefix c; container root { } }
+"#,
+        ),
+        (
+            "b",
+            r#"
+module b {
+  namespace "urn:b";
+  prefix b;
+  import c { prefix c; }
+  container broot { }
+  augment "/c:root" { leaf bx { type string; } }
+}
+"#,
+        ),
+        (
+            "a",
+            r#"
+module a {
+  namespace "urn:a";
+  prefix a;
+  import b { prefix b; }
+  augment "/b:broot" { leaf ax { type string; } }
+}
+"#,
+        ),
+    ]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let types = TypeRegistry::new(&reg);
+
+    let a = reg.resolve_import("a", None).unwrap();
+    let b = reg.resolve_import("b", None).unwrap();
+    let c = reg.resolve_import("c", None).unwrap();
+
+    assert_eq!(visited_names(&SchemaWalker::new(&a, &reg, &types, &cx)), vec!["ax"]);
+    assert_eq!(
+        visited_names(&SchemaWalker::new(&b, &reg, &types, &cx)),
+        vec!["broot", "bx"]
+    );
+    assert_eq!(visited_names(&SchemaWalker::new(&c, &reg, &types, &cx)), vec!["root"]);
+}
+
+#[test]
+fn walk_calls_own_tree_then_own_augments() {
+    // walk() event sequence == walk_own_tree() events ++ walk_own_augments() events.
+    let reg = registry_from(&[
+        (
+            "h",
+            r#"
+module h { namespace "urn:h"; prefix h; container root { } }
+"#,
+        ),
+        (
+            "m",
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  import h { prefix h; }
+  typedef t1 { type string; }
+  typedef t2 { type string; }
+  leaf own { type t1; }
+  augment "/h:root" { leaf aug { type t2; } }
+}
+"#,
+        ),
+    ]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+
+    let mut all = EventRecorder::default();
+    walker.walk(&mut all);
+    let mut tree = EventRecorder::default();
+    walker.walk_own_tree(&mut tree);
+    let mut augs = EventRecorder::default();
+    walker.walk_own_augments(&mut augs);
+
+    assert_eq!(tree.events, vec!["typedef:m:t1".to_string()]);
+    assert_eq!(augs.events, vec!["typedef:m:t2".to_string()]);
+    let mut combined = tree.events.clone();
+    combined.extend(augs.events.clone());
+    assert_eq!(all.events, combined);
+}
+
+#[test]
+fn own_augments_surface_host_applied_annotations() {
+    // M augments host H at /h:root with leaf x. An annotation module injects a
+    // foreign extension (xann:callpoint) onto /h:root/m:x. Walking M must fire
+    // on_extension_attached for that foreign extension on x — proving the walk
+    // surfaces extensions reached through the augment splice point.
+    let parse = |src: &str| {
+        let (stmts, errs) = parse_yang(src, Arc::from("t.yang"));
+        assert!(errs.is_empty(), "parse errors: {errs:?}");
+        let stmt = stmts.into_iter().next().unwrap();
+        let name = stmt.arg.clone().unwrap();
+        (ModuleKey::latest(&name), stmt)
+    };
+
+    let h_src = r#"
+module h { namespace "urn:h"; prefix h; container root { } }
+"#;
+    let m_src = r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  import h { prefix h; }
+  augment "/h:root" { leaf x { type string; } }
+}
+"#;
+    // Annotation module: uses the overlay extension `xann:annotate` whose body
+    // carries the extension to inject onto the target node.
+    let ann_src = r#"
+module annmod {
+  namespace "urn:annmod";
+  prefix am;
+  import h { prefix h; }
+  import m { prefix m; }
+  import xann { prefix xann; }
+  xann:annotate "/h:root/m:x" {
+    xann:callpoint "cp";
+  }
+}
+"#;
+
+    let (h_key, h_stmt) = parse(h_src);
+    let (m_key, m_stmt) = parse(m_src);
+    let (ann_key, ann_stmt) = parse(ann_src);
+
+    // Build an annotation index that recognises `xann:annotate` as an overlay.
+    static OVERLAY: &[OverlayExtension] = &[OverlayExtension {
+        module: "xann",
+        name: "annotate",
+        source_plugin: "test",
+    }];
+    let ann_index = AnnotationIndex::build(&[(ann_key, ann_stmt)], OVERLAY);
+
+    let mut reg = ModuleRegistry::new();
+    for (key, stmt) in [(h_key, h_stmt), (m_key, m_stmt)] {
+        let compiled = compile_module(
+            &key,
+            stmt,
+            &reg,
+            &DeviationIndex::default(),
+            &ann_index,
+            &AstAnnotationIndex::default(),
+        );
+        reg.insert(Arc::new(compiled));
+    }
+
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+
+    let mut obs = EventRecorder::default();
+    walker.walk(&mut obs);
+    assert_eq!(
+        obs.events,
+        vec!["ext:xann:callpoint".to_string()],
+        "annotation-injected foreign extension on the augmented node is surfaced"
     );
 }
