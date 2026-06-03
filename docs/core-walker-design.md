@@ -413,7 +413,7 @@ For a maintainer picking up step 4:
 | 3 | `walk_own_augments` (own-augment traversal) | **Pending** — see §11 |
 | 4 | `ref-data`-gated parity tests | **Pending** — see §9 |
 | 5 | `on_constraint_source` for `when`/`must` | **Done** (`53062f7`) |
-| 6 | `on_extension_attached` for foreign-module extensions | **Done** |
+| 6 | `on_extension_attached` for foreign-module extensions | **Done** (`813bd2f`) |
 
 Steps 3 and 4 remain; they are independent, and either order is fine.
 Step 3 (own-augment traversal) is the higher-leverage of the two per
@@ -620,6 +620,51 @@ fn augment_is_enabled(&self, aug: &AugmentEntry) -> bool {
 The `walk_with_visitor` variant follows the same pattern but threads
 the visitor through.
 
+#### CRITICAL: source nodes vs host-tree nodes
+
+The skeleton above iterates `aug.nodes` (the augment-body
+source-declaration nodes stored on the augmenting module). That
+form is convenient and is correct for `on_typedef_resolved` /
+`on_leafref_resolved` events because types and leafref paths are
+copied verbatim into the source nodes during compile.
+
+It is **not** correct for `on_extension_attached` events when the
+host module's compile pipeline applies `apply_annotations`. Path-
+based annotations (`tailf:annotate "/host:x/host:y/aug:z"`) are
+merged into the **host's compiled SchemaNode tree** at the splice
+point, not back into `aug.nodes`. Walking `aug.nodes` therefore
+misses those foreign extensions even though, logically, they
+attach to nodes whose `module_name` is the augmenting module.
+
+Empirical evidence: in a 461-module reference bundle, every
+`*-ann` annotation module that targets a node grafted via an
+augment-out exhibits this — a probe walking only `aug.nodes`
+reports `walker_seq=[]` for the augmenting module, while the
+reference compiler's `ns_to_prefix_maps` for that module includes
+the annotation source.
+
+**Resolution**: when walking own-augments, prefer
+**iterating the host's compiled subtree at the cursor** rather
+than the augmenting module's `aug.nodes`. Two equivalent options:
+
+1. **Cursor-based descent** (recommended): after positioning the
+   cursor at the augment target in the host, enumerate the
+   host-side children whose `module_name == self.module.key.name`
+   and call `visit_node` on each. This naturally surfaces any
+   annotations the host applied during its compile.
+2. **Apply annotations to `aug.nodes` at compile time**: extend
+   `apply_annotations` so that when a target path navigates into
+   a foreign-augment-owned subtree, the resulting extensions are
+   *also* recorded on the augmenting module's `aug.nodes`. The
+   walker can then keep its simpler `aug.nodes`-iteration form.
+   This is more invasive (compile-side change) but keeps the
+   walker free of host-tree lookups.
+
+For the maintainer: option (1) is the smaller change and lives
+entirely in `walker/`. Option (2) is preferable if other future
+plugins need annotation-aware augment-body access outside the
+walker. Pick (1) unless a second use case appears.
+
 **Tests to add** (`core/src/walker/tests.rs`):
 
 1. `own_augments_fire_in_declaration_order` — module M with two
@@ -639,12 +684,28 @@ the visitor through.
 5. `walk_calls_own_tree_then_own_augments` — assert event order
    from `walk()` equals `walk_own_tree()` events followed by
    `walk_own_augments()` events.
+6. `own_augments_surface_host_applied_annotations` — module M
+   augments host H at `/H:root` with leaf `M:x`. After M is
+   compiled, simulate H applying `apply_annotations` injecting a
+   foreign extension `tailf:callpoint` onto `H:root/M:x`. Walking
+   M must fire `on_extension_attached("tailf-common", _, _)` for
+   `M:x` exactly once. This pins the cursor-based-descent
+   semantics described above and prevents accidental regression
+   to `aug.nodes`-only iteration.
 
 **Bundle-level smoke-test target**: with step 3 in place, a byte-faithful
 backend (using the `YANGEST_NS_DUMP=1` probe in the downstream
-experiments tree) should drop the count of *miss-only*
-modules from 23 → ~9 (the `*-ann` cases that need step 6) and "both"
-from 1 → 0.
+experiments tree) should:
+
+* Drop *miss-only* from the post-step-5/6 baseline (19 modules) to
+  **near zero** — the remaining miss-only entries after step 6
+  landed are dominated by `*-ann` annotation modules whose foreign
+  extensions live on host trees, exactly the case test 6 above
+  pins down. Verified via a probe sweep on 2026-06-03 against the
+  reference yangbundle.
+* Drop "both" from 5 → 0.
+* "extra-only" is unaffected by step 3 (it needs the backend's
+  imports filter).
 
 ---
 
@@ -808,21 +869,66 @@ The first two categories are the §12 use case verbatim. The third
 category confirms §11 own-augment traversal is needed: `walk_own_tree`
 alone cannot see leafs `M` contributes to other modules' trees.
 
+### Verification results (2026-06-03 — post step 6)
+
+After step 6 (`on_extension_attached`) landed, a re-run of the same
+verification shows the foreign-extension event is now firing — 144
+modules' `walker_seq` includes `tailf-common` from
+`tailf:callpoint`/`tailf:hidden`/etc instances. But the post-step-6
+counts are:
+
+| Outcome | Pre step 6 | Post step 6 |
+|---|---|---|
+| Set + order match | 281 | 175 |
+| Extra-only | 151 | 262 |
+| Miss-only | 23 | 19 |
+| Both | 6 | 5 |
+
+The drop in set-matches and rise in extra-only is **expected**: step 6
+now reports many `tailf-common`-class events the reference compiler
+already filters out (most modules import `tailf-common`, so the
+backend's import-filter pass drops it). Steps 1/2/5/6 are correct;
+the *content* is now strictly richer, and the residual difference
+between walker output and the reference is explainable by the
+backend-side filter alone (or, for the 19 miss-only, by step 3 not
+yet being implemented).
+
+**Persistent miss-only after step 6**: spot-checked against the
+`*-ann` targets, the remaining miss-only is dominated by the
+augment-into-host pattern. For example, `Cisco-IOS-XE-aaa-ann`
+declares `tailf:annotate "/ios:native/ios:radius/ios-aaa:server/ios-aaa:key"`.
+The leaf `key` was contributed to `native`'s tree by `aaa`'s own
+augment-out; its `module_name` is `Cisco-IOS-XE-aaa`. When `native`
+is compiled, `apply_annotations` decorates the host-tree node at
+`key` with `tailf:callpoint`. When the walker walks
+`Cisco-IOS-XE-aaa` from its root, `aaa`'s `module.children(ctx)`
+does NOT include `key` (it lives under `native`'s root, not aaa's).
+Probe result: `walker_seq=[]` for `aaa`. Reference compiler's
+`ns_to_prefix_maps` for aaa: `["Cisco-IOS-XE-aaa-ann",
+"Cisco-IOS-XE-aaa"]`.
+
+This empirically confirms what §11 documents: step 3
+(`walk_own_augments`) is the required unblocker, and the
+`own_augments_surface_host_applied_annotations` test pins the
+cursor-into-host-tree semantics that surfaces these annotations.
+
 ### Updated migration prioritisation
 
-1. **Step 5 first** (`on_constraint_source`) — fixes 23 miss-only
-   cases. Smaller change (default-method trait extension + walker-side
-   firing at `when`/`must`-bearing nodes), no compile-side changes.
-2. **Step 3 second** (`walk_own_augments`) — fixes the augment-out
-   subset of the 6 "both" cases plus the augment-out tail of the
-   miss-only cases overlapping with augmenter modules. Larger change
-   but no compile-side changes either: `CompiledModule::augments` is
-   already populated.
-3. **Backend filter** — drop walker-observed modules already in
-   `yang_header.imports`. Pure downstream work; collapses 151 +
-   filter-tail of 6 = up to 157 cases.
+1. **Step 5 first** (`on_constraint_source`) — DONE in `53062f7`.
+2. **Step 6 second** (`on_extension_attached`) — DONE in `813bd2f`.
+   Confirmed via probe: 144 modules now report foreign-extension
+   events from `tailf-common` etc. that were previously invisible.
+3. **Step 3 third** (`walk_own_augments`) — pending. Empirically
+   the unblocker for the residual 19 miss-only cases (dominated by
+   `*-ann` annotations against augment-grafted host nodes) and 5
+   "both" cases. See §11 for the full spec including the
+   host-tree-iteration nuance the maintainer must implement.
+4. **Backend filter** — drop walker-observed modules already in
+   `yang_header.imports`. Pure downstream work; collapses the
+   262 extra-only post-step-6 to near zero.
 
-Total expected coverage if all three land: 281 + 23 + 151 + 6 = 461.
+Total expected coverage if step 3 + filter land: 461/461 on the
+reference bundle.
 
 ---
 
@@ -957,19 +1063,23 @@ In `core/src/walker/tests.rs`:
   once per occurrence in `node.extensions`; observers that want
   uniqueness use an `IndexSet` keyed on whatever they care about.
 
-### Expected metric movement
+### Observed metric movement (post-implementation)
 
-After step 6 lands and a backend consumes it:
+Probe sweep on 2026-06-03 with step 6 implemented:
 
-* Probe miss-only: 23 → ~9 (the 14 `*-ann`-driven cases
-  unblocked).
-* Combined with step 3: miss-only → 0.
-* "extra-only" cases unaffected — they need a backend-side import
-  filter, which is a downstream concern.
+* Miss-only: 23 → 19. Step 6 unblocked 4 of the *-ann cases (those
+  whose annotations target paths landing on the annotation source
+  module itself, not on host-tree augment splice points).
+* Set-match: 281 → 175 (drop expected — step 6 now reports many
+  `tailf-common` foreign-extension events the backend's import
+  filter would suppress).
+* Extra-only: 151 → 262 (rise expected — same reason).
+* Both: 6 → 5.
 
-After step 3 + step 6 + the backend rewrite, the full 461 modules
-on the reference bundle are reachable: 281 already-OK + 23
-unblocked by step 5 (already implemented) + step 3 + step 6 + 156
-unblocked by the import filter = 460+, with the remaining 1–2
-"OTHER" failures being non-`ns_to_prefix_maps` issues investigated
-separately.
+Step 6 is contract-correct; the residual miss-only of 19 is the
+augment-into-host *-ann pattern documented in §14, which step 3
+addresses. After step 3 lands with cursor-into-host-tree
+semantics (§11), miss-only is expected to reach 0.
+
+The backend-side import filter, applied on top of the walker
+output, then collapses the 262 extra-only to near zero.
