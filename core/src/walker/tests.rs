@@ -880,47 +880,6 @@ module annmod {
     );
 }
 
-#[test]
-fn own_augments_with_uses_body_visit_expanded_leaves() {
-    // Augment body uses `uses g;` shorthand: the raw `aug.nodes` is a single
-    // SchemaNodeKind::Uses naming grouping `g`. The walker must visit the
-    // grouping's expanded leaves (a, b) — not the raw Uses node — so that
-    // typedef and constraint events on those leaves are observed.
-    let reg = registry_from(&[
-        (
-            "h",
-            r#"
-module h { namespace "urn:h"; prefix h; container root { } }
-"#,
-        ),
-        (
-            "m",
-            r#"
-module m {
-  namespace "urn:m";
-  prefix m;
-  import h { prefix h; }
-  grouping g {
-    leaf a { type string; }
-    leaf b { type string; }
-  }
-  augment "/h:root" { uses g; }
-}
-"#,
-        ),
-    ]);
-    let feats = HashSet::new();
-    let cx = ctx(&reg, &feats);
-    let m = reg.resolve_import("m", None).unwrap();
-    let types = TypeRegistry::new(&reg);
-    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
-    assert_eq!(
-        visited_names(&walker),
-        vec!["a", "b"],
-        "uses-shaped augment body must surface the grouping's expanded leaves"
-    );
-}
-
 // ── Follow-up B: injection_source_module (§14) ───────────────────────────────
 
 #[test]

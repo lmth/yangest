@@ -410,14 +410,17 @@ For a maintainer picking up step 4:
 |---|---|---|
 | 1 | `core::walker` skeleton | **Done** (`ea920e4`) |
 | 2 | Wire observer firing at resolution sites | **Done** (`ea920e4`) |
-| 3 | `walk_own_augments` (own-augment traversal) | **Done** (`d3a5cf5`); Uses-body follow-up **Done** (`84da49f`); annotation source-module attribution **Done** (`ExtensionInstance::injection_source_module`) |
+| 3 | `walk_own_augments` (own-augment traversal) | **Done** (`d3a5cf5`); Uses-body follow-up **Reverted** (the obvious approach in `84da49f` regressed runtime — see §11); annotation source-module attribution **Done** (`ExtensionInstance::injection_source_module`) |
 | 4 | `ref-data`-gated parity tests | **Pending** — see §9 |
 | 5 | `on_constraint_source` for `when`/`must` | **Done** (`53062f7`) |
 | 6 | `on_extension_attached` for foreign-module extensions | **Done** (`813bd2f`) |
 
-Only step 4 (the `ref-data`-gated reference-parity tests) remains; it is
-insurance against future regressions and needs checked-in reference
-outputs.
+Only step 4 (the `ref-data`-gated reference-parity tests) and the
+§11 Uses-body follow-up remain. Step 4 is insurance against future
+regressions and needs checked-in reference outputs; the Uses-body
+follow-up is documented in §11 with three candidate paths
+forward — the natural approach was tried in `84da49f` and reverted
+because of catastrophic runtime regression.
 
 ### Original step descriptions
 
@@ -583,50 +586,78 @@ panics on schema gaps.
 `visit_node` with `data_cursor` positioned at the enclosing data
 node, not the case.
 
-**Recursive bodies / `uses grouping;`**: ✅ *Resolved* in the
-follow-up to step 3 (`Cursor::augment_children` and
-`SchemaWalker::walk_own_augments_inner` now both call
-`compile::expand_children` on the augment body). Background and
-the design tradeoff are kept here for the record.
-
-An augment body of the form `augment X { uses g; }` stores
-`aug.nodes` as a single `SchemaNode` of `kind::Uses` whose `name`
-is `"__uses__"`, **not** the grouping's expanded leaves. Two
-pitfalls follow:
+**Recursive bodies / `uses grouping;`**: ⚠️ *Open follow-up; the
+obvious fix is unsafe at scale.* An augment body of the form
+`augment X { uses g; }` stores `aug.nodes` as a single
+`SchemaNode` of `kind::Uses` whose `name` is `"__uses__"`, **not**
+the grouping's expanded leaves. Two pitfalls follow:
 
 * **`body_node.children(ctx)` returns nothing** when called directly
   on the Uses node. Uses are expanded by their *parent's*
   `expand_children` call, not by descending into the Uses itself.
-* **Host-tree `child_nodes()` did not show expanded leaves either**
-  for foreign-augment contributions: pre-fix
-  `Cursor::augment_children` extended with `aug.nodes.iter().cloned()` —
-  i.e. the raw Uses node — so cursoring at the augment target saw
+* **Host-tree `child_nodes()` does not show expanded leaves either**
+  for foreign-augment contributions: `Cursor::augment_children`
+  currently extends with `aug.nodes.iter().cloned()` — i.e. the raw
+  Uses node — so cursoring at the augment target sees
   `Uses{name:"__uses__"}` on the cursor's child list.
 
 The simple "match `aug.nodes[i].name` against `host_children` by
-name" loop therefore visited *zero* nodes for any Uses-shaped
+name" loop therefore visits *zero* nodes for any Uses-shaped
 augment body — empirically the dominant pattern in real-world
-yangbundles, where almost every augment body uses the grouping idiom.
+yangbundles, where almost every augment body uses the grouping
+idiom.
 
-**Resolution adopted**: option 2 of the three originally
-considered.
+**Resolution attempted (commit `84da49f`, reverted in
+`<this commit>`):** the natural fix — make
+`Cursor::augment_children` and the walker's body iteration call
+`compile::expand_children` on `aug.nodes` — is *correct* on a
+small fixture but **scales catastrophically on heavy bundles**.
+The probe `walker.walk` per module climbs from a few minutes to
+runaway memory growth (>7 GB and still rising at termination) on
+the ios-xe yangbundle (~461 modules, deep augment-target paths).
+Two amplification factors compound:
 
-1. *(rejected)* Walker uses `compile::expand_children` only on the
-   walker side — leaves the cursor inconsistent for other
-   consumers.
-2. *(adopted)* `Cursor::augment_children` calls
-   `compile::expand_children` on each contributing augment's body
-   so the cursor's child list is consistent regardless of body
-   shape. The walker also expands `aug.nodes` before its
-   name-match loop (so its own iteration enumerates the same
-   expanded leaves the cursor exposes). Localised to two helpers;
-   `cursor::find_child` automatically benefits.
-3. *(rejected)* Compile pre-expands augment bodies into
-   `aug.nodes`. Most invasive; would also require care to keep
-   the Uses node's overlay (refines, local augments, when,
-   if-feature) intact at re-expansion time.
+1. **`augment_children` is invoked on every cursor descent**
+   (`Cursor::current_children` is on the path of `find_child`,
+   `child_nodes`, and augment-target navigation). The walker
+   descends a lot.
+2. **`expand_children_inner` clones every node** of an
+   `expand_uses_lazy`-cached body into the returned `Vec`. The
+   grouping cache short-circuits `expand_uses_lazy` itself, but
+   the per-call `Vec::clone` is O(grouping_size) in deep
+   `SchemaNode` clones (each carries `pmap`, `extensions`,
+   `Vec<WhenExpr>`, etc.). With many matching Uses-shaped
+   augments per descent, allocator pressure dominates.
 
-Test pinning the contract: `walker::tests::own_augments_with_uses_body_visit_expanded_leaves`.
+A targeted "fast-path-clone unless aug.nodes contains a Uses"
+optimisation was tried but did not help materially.
+
+**Status: open follow-up; three candidate paths, ranked by
+perceived robustness:**
+
+1. **Cache expanded augment bodies once per
+   `(AugmentEntry, ExpansionCtx)`** via a new per-`ExpansionCtx`
+   cache keyed on `*const AugmentEntry` (or interior-mutable
+   storage on `CompiledModule`). `Cursor::augment_children` then
+   `Arc::clone`s the cached `Vec` instead of re-walking it.
+   Per-call cost in `current_children` becomes O(N) in result
+   size, not O(N × matches × per-call expansion).
+2. **Compile pre-expands augment bodies** so `aug.nodes` always
+   stores post-grouping leaves. One-time cost at compile. Care
+   needed to keep refines / local augments / when / if-feature
+   intact at re-expansion.
+3. **Keep the cursor raw, push synthetic frames in the walker**
+   for visited body leaves — bypass `find_child` entirely for
+   the per-augment-body iteration.
+
+Path (1) is the most defensive; (3) is closest in spirit to the
+host-tree-iteration rule the upstream tests pin. Both need fresh
+ios-xe bench numbers before declaring done.
+
+The §14 verification table (post step 3) still applies: even
+without the Uses-body fix, step 3 unblocks two cases. The dominant
+17 Uses-body misses are blocked on this follow-up; do not assume
+they are easy.
 
 **Cross-module augment chains**: when module A augments into B, and B
 augments into C, A's walk visits A's augment into B *only*. B's augment
@@ -985,7 +1016,9 @@ categories). The remaining 17 miss-only follow two patterns:
    host-children loop visits zero nodes per augment (Uses node's
    name is the grouping name, no host-side counterpart by that
    name). See §11 "Recursive bodies / `uses grouping;`" for the
-   three follow-up options. *(Resolved in `84da49f`.)*
+   three candidate paths forward. *(Attempted in `84da49f` and
+   reverted because of catastrophic runtime regression on heavy
+   bundles; remains an open follow-up.)*
 2. **Annotation source-module attribution**: even when step 3
    reaches the host-tree node carrying a foreign extension, the
    walker fires `on_extension_attached(ext.module, …)` where
@@ -1012,7 +1045,8 @@ categories). The remaining 17 miss-only follow two patterns:
    filter too. An observer can now recover the annotation source from
    a finalised `SchemaNode`.
 
-Both follow-ups are now implemented; see the §10 status table.
+Annotation source-module attribution is implemented (see §10
+status table); the Uses-body fix remains an open follow-up.
 
 ### Updated migration prioritisation
 
@@ -1022,11 +1056,13 @@ Both follow-ups are now implemented; see the §10 status table.
    events from the shared annotation-extension module that were
    previously invisible.
 3. **Step 3 third** (`walk_own_augments`) — DONE in `d3a5cf5`,
-   plus follow-up (a) **DONE** (`84da49f`: Uses-body expansion in
-   `Cursor::augment_children` + walker name-match) and follow-up
-   (b) **DONE** (`ExtensionInstance::injection_source_module` so
+   plus follow-up (b) **DONE**
+   (`ExtensionInstance::injection_source_module` so
    `on_extension_attached` reports the annotation-source module,
-   not the extension-definition module).
+   not the extension-definition module). Follow-up (a) — Uses-body
+   expansion — was attempted in `84da49f` and reverted because of
+   catastrophic runtime regression on heavy bundles; **open** with
+   three candidate paths in §11.
 4. **Backend filter** — drop walker-observed modules already in
    `yang_header.imports`. Pure downstream work; collapses the
    ~264 extra-only to near zero.

@@ -47,8 +47,8 @@
 //! nothing in the compile path uses it.
 
 use crate::compiler::{
-    expand_children, AugmentEntry, CompiledModule, ExpansionCtx, ModuleRegistry, NodeOverlayMap,
-    PathStep, SchemaNode, SchemaNodeKind, SchemaPath,
+    AugmentEntry, CompiledModule, ExpansionCtx, ModuleRegistry, PathStep, SchemaNode,
+    SchemaNodeKind, SchemaPath,
 };
 use crate::cursor::{Axis, Cursor, QName};
 use crate::types_registry::{BuiltInType, ConstraintKind, TypeRegistry, TypeResolutionObserver};
@@ -190,26 +190,15 @@ impl<'a> SchemaWalker<'a> {
             // visiting every same-module child) keeps two augments into the same
             // target from double-counting each other's nodes.
             //
-            // Expand `aug.nodes` first so that augment bodies expressed as
-            // `uses g;` (whose raw `aug.nodes` is a single Uses node named
-            // `__uses__`) iterate the grouping's expanded leaves rather than
-            // the bare Uses (§11 recursive-bodies rule).
+            // NOTE: when an augment body is `uses g;` (so `aug.nodes` is a
+            // single `Uses` node named `__uses__`), this name-match loop
+            // visits zero nodes — the §11 follow-up. The natural fix (expand
+            // both `aug.nodes` and `host_children` via `expand_children`)
+            // was attempted in `84da49f` and reverted in `<this commit>`
+            // because of catastrophic per-descent allocation costs on heavy
+            // bundles; see §11 for the three candidate paths forward.
             let host_children = target_cursor.child_nodes();
-            let empty_overlay = NodeOverlayMap::new();
-            let body_overlay = if self.module.overlay.is_empty() {
-                &empty_overlay
-            } else {
-                &self.module.overlay
-            };
-            let body_nodes = expand_children(
-                &aug.nodes,
-                &self.module.prefix,
-                &self.module.key.name,
-                body_overlay,
-                &[],
-                self.ctx,
-            );
-            for body_node in &body_nodes {
+            for body_node in &aug.nodes {
                 if let Some(child) = host_children.iter().find(|c| {
                     c.name == body_node.name && c.module_name == self.module.key.name
                 }) {
