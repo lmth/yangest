@@ -1048,6 +1048,63 @@ categories). The remaining 17 miss-only follow two patterns:
 Annotation source-module attribution is implemented (see §10
 status table); the Uses-body fix remains an open follow-up.
 
+#### Empirical effectiveness of follow-up (b) — open question
+
+After `57cdaa4` (Gap 2 fix) landed, the bundle-scale probe was
+re-run on 461 modules. The three new walker tests pass, but the
+expected unblocking of `*-ann` modules in real-world output is
+not yet seen:
+
+| Module | walker_seq (post-revert, post-Gap-2) | reference |
+|---|---|---|
+| `Cisco-IOS-XE-aaa` | `["tailf-common"]` | `["Cisco-IOS-XE-aaa-ann", "Cisco-IOS-XE-aaa"]` |
+| `Cisco-IOS-XE-acl` | `[]` | `["Cisco-IOS-XE-acl-ann", "Cisco-IOS-XE-acl"]` |
+| `Cisco-IOS-XE-atm` | `[]` | `["Cisco-IOS-XE-atm-ann", ..., "Cisco-IOS-XE-atm"]` |
+| `Cisco-IOS-XE-pppoe` | `[]` | `["Cisco-IOS-XE-pppoe-ann", "Cisco-IOS-XE-pppoe"]` |
+
+Of the 6 "both" cases (mismatched set + order), 4/6 have
+`extra=['tailf-common']` paired with `missing=['<X>-ann']`. That
+indicates the walker fires `on_extension_attached` for tailf
+annotations but with `source = 'tailf-common'` — i.e.
+`source_for_ns()` returns `ext.module` because
+`injection_source_module` is `None` at those instances.
+
+The annotation-target topology of these modules is the likely
+explanation. Example: `Cisco-IOS-XE-acl-ann.yang` annotates paths
+like `/ios:native/ios:mac/ios-acl:access-list` — i.e. nodes that
+`Cisco-IOS-XE-acl` augments INTO `Cisco-IOS-XE-native`'s tree.
+The annotations are therefore applied to nodes contributed via
+acl's *cross-module augment*. Two hypotheses for why
+`injection_source_module` is `None` at those sites:
+
+1. **Compile ordering**: `apply_annotation_to_node` (compile.rs
+   ~3519) sets `injection_source_module` correctly when called,
+   but it isn't called for the augment-spliced child contributed
+   by acl into native (the splice point may not run the
+   apply-annotations pass that resolves
+   `tailf:annotate "/ios:native/ios:mac/ios-acl:access-list"`).
+2. **AST-overlay path returns None**:
+   `ast_ann_index.module_key_for_file(sub.pos.orig_file())`
+   doesn't recognise `Cisco-IOS-XE-acl-ann.yang` as an
+   annotation-source file in this code path, falling back to
+   `ext.module = "tailf-common"`.
+
+A focused investigation by the maintainer is needed; the
+plumbing on the walker side is correct (`source_for_ns()` is
+called), so the gap is in **populating
+`injection_source_module`** for the augment-spliced extension
+sites, not in surfacing it.
+
+Suggested investigation steps:
+* Add a temporary `eprintln!` in `apply_annotation_to_node` and
+  the AST-overlay path to confirm whether they run for one of the
+  affected modules (e.g. `Cisco-IOS-XE-aaa-ann` injecting into
+  `aaa`'s augment children).
+* Cross-check whether `tailf:annotate "/p1:x/p2:y/.../p1:z"`
+  paths are resolved against the compiled-with-augments host
+  tree (so the spliced acl child is visible) or the bare native
+  declaration.
+
 ### Updated migration prioritisation
 
 1. **Step 5 first** (`on_constraint_source`) — DONE in `53062f7`.
