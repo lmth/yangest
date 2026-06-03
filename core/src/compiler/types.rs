@@ -290,6 +290,26 @@ impl SchemaNode {
             .iter()
             .find(|e| e.module == module && e.name == name)
     }
+
+    /// All `must` expressions on this node, in declaration order. Returns an
+    /// empty slice for kinds that cannot carry `must` (e.g. `Choice`, `Case`,
+    /// `Action`, `Uses`).
+    pub fn musts(&self) -> &[MustExpr] {
+        match &self.kind {
+            SchemaNodeKind::Container { musts, .. }
+            | SchemaNodeKind::Leaf { musts, .. }
+            | SchemaNodeKind::LeafList { musts, .. }
+            | SchemaNodeKind::List { musts, .. }
+            | SchemaNodeKind::Rpc { musts, .. }
+            | SchemaNodeKind::Notification { musts, .. }
+            | SchemaNodeKind::AnyXml { musts, .. }
+            | SchemaNodeKind::AnyData { musts, .. } => musts,
+            SchemaNodeKind::Choice { .. }
+            | SchemaNodeKind::Case { .. }
+            | SchemaNodeKind::Action { .. }
+            | SchemaNodeKind::Uses { .. } => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

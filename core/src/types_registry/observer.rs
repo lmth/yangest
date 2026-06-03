@@ -30,6 +30,17 @@
 
 use crate::compiler::{SchemaNode, Typedef};
 
+/// Kind of constraint expression — used by
+/// [`TypeResolutionObserver::on_constraint_source`] to disambiguate `when`
+/// from `must` events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstraintKind {
+    /// A `when` expression.
+    When,
+    /// A `must` expression.
+    Must,
+}
+
 /// Receives type-resolution events in encounter order.
 pub trait TypeResolutionObserver {
     /// Fired when a typedef reference is resolved. `source_module` is the module
@@ -39,6 +50,25 @@ pub trait TypeResolutionObserver {
     /// Fired when a leafref's target node is resolved. `source_module` is the
     /// module in whose context the leafref was resolved.
     fn on_leafref_resolved(&mut self, _source_module: &str, _target: &SchemaNode) {}
+
+    /// Fired by the walker for each `when` / `must` constraint visited at a
+    /// node, with the *source module* of that constraint expression — i.e. the
+    /// module whose YANG source the constraint was written in. This is the
+    /// node's own module for original constraints, the deviation module for
+    /// constraints injected by deviations, and the annotation module for
+    /// constraints injected by annotations.
+    ///
+    /// The default implementation is a no-op so existing observers remain
+    /// behavioural-compatible. Backends that need to register namespaces of
+    /// constraint-contributing modules (e.g. an `ns_to_prefix_maps` builder
+    /// for an FXS-style backend) implement this method.
+    fn on_constraint_source(
+        &mut self,
+        _source_module: &str,
+        _kind: ConstraintKind,
+        _node: &SchemaNode,
+    ) {
+    }
 }
 
 /// An observer that records nothing. Used by the non-observer resolution paths;

@@ -10,7 +10,7 @@ use crate::ast::ModuleKey;
 use crate::compiler::{compile_module, ModuleRegistry, Typedef};
 use crate::devindex::DeviationIndex;
 use crate::parser::parse_yang;
-use crate::types_registry::TypeResolutionObserver;
+use crate::types_registry::{ConstraintKind, TypeResolutionObserver};
 
 fn registry_from(sources: &[(&str, &str)]) -> ModuleRegistry {
     let mut reg = ModuleRegistry::new();
@@ -49,6 +49,18 @@ impl TypeResolutionObserver for EventRecorder {
         // Match the design's consumer pattern (§8): the namespace that matters is
         // the *target* node's module, read from the target itself.
         self.events.push(format!("leafref:{}:{}", target.module_name, target.name));
+    }
+    fn on_constraint_source(
+        &mut self,
+        source_module: &str,
+        kind: ConstraintKind,
+        node: &SchemaNode,
+    ) {
+        let k = match kind {
+            ConstraintKind::When => "when",
+            ConstraintKind::Must => "must",
+        };
+        self.events.push(format!("{k}:{source_module}:{}", node.name));
     }
 }
 
@@ -240,4 +252,112 @@ module m {
     assert!(walker.options().follow_deviations);
     assert_eq!(walker.module().key.name, "m");
     assert_eq!(walker.registry().modules.len(), 1);
+}
+
+#[test]
+fn fires_constraint_source_for_when_and_must_in_declaration_order() {
+    // A leaf with a `when` (original) and a container with a `must` (original):
+    // both should fire on_constraint_source with the node's own module as the
+    // source. `when` fires before `must` at the same node (for nodes that
+    // carry both the spec is when-then-must — covered by a separate test).
+    let reg = registry_from(&[(
+        "m",
+        r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  container c {
+    must "true()";
+    leaf l {
+      when "true()";
+      type string;
+    }
+  }
+}
+"#,
+    )]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+
+    let mut obs = EventRecorder::default();
+    walker.walk(&mut obs);
+
+    // Expected: visit container c → must fires; visit leaf l → when fires;
+    // type resolution fires nothing for plain `string`.
+    assert_eq!(
+        obs.events,
+        vec!["must:m:c", "when:m:l"],
+        "constraint events should fire in walk encounter order"
+    );
+}
+
+#[test]
+fn fires_when_then_must_at_same_node() {
+    // A node that carries BOTH when and must: the walker fires when first,
+    // then must, both with the node's own module.
+    let reg = registry_from(&[(
+        "m",
+        r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  leaf l {
+    when "true()";
+    must "true()";
+    type string;
+  }
+}
+"#,
+    )]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+
+    let mut obs = EventRecorder::default();
+    walker.walk(&mut obs);
+
+    assert_eq!(obs.events, vec!["when:m:l", "must:m:l"]);
+}
+
+#[test]
+fn default_observer_method_means_no_constraint_events() {
+    // An observer that does NOT override on_constraint_source must not see
+    // any constraint events, only typedef/leafref events. Confirms the
+    // backward-compat default-method extension property documented in §12.
+    struct OnlyTypeObserver(Vec<String>);
+    impl TypeResolutionObserver for OnlyTypeObserver {
+        fn on_typedef_resolved(&mut self, src: &str, td: &Typedef) {
+            self.0.push(format!("typedef:{src}:{}", td.name));
+        }
+        // on_leafref_resolved + on_constraint_source: defaults (no-op)
+    }
+
+    let reg = registry_from(&[(
+        "m",
+        r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  leaf l {
+    when "true()";
+    must "true()";
+    type string;
+  }
+}
+"#,
+    )]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+
+    let mut obs = OnlyTypeObserver(Vec::new());
+    walker.walk(&mut obs);
+    assert!(obs.0.is_empty(), "no events for plain string + default observer methods");
 }

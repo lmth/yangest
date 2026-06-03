@@ -38,7 +38,7 @@
 
 use crate::compiler::{CompiledModule, ExpansionCtx, ModuleRegistry, SchemaNode, SchemaNodeKind};
 use crate::cursor::{Cursor, QName};
-use crate::types_registry::{BuiltInType, TypeRegistry, TypeResolutionObserver};
+use crate::types_registry::{BuiltInType, ConstraintKind, TypeRegistry, TypeResolutionObserver};
 
 /// Tuning knobs for [`SchemaWalker`]. [`WalkOptions::default`] is the
 /// reference-compiler-faithful configuration; backends customise only when they
@@ -164,10 +164,29 @@ impl<'a> SchemaWalker<'a> {
         };
 
         visit(&node_cursor);
+        self.fire_constraint_sources(node, observer);
         self.resolve_node_type(node, &node_cursor, observer);
 
         for child in node.children(self.ctx) {
             self.visit_node(&child, &node_cursor, observer, visit);
+        }
+    }
+
+    /// Fire `on_constraint_source` for each `when` and `must` on `node`, in
+    /// `when`-then-`must` declaration order. Source modules are read from the
+    /// expressions themselves: original constraints carry the node's own
+    /// module; deviation- or annotation-injected constraints carry the
+    /// injecting module's name.
+    fn fire_constraint_sources<O: TypeResolutionObserver>(
+        &self,
+        node: &SchemaNode,
+        observer: &mut O,
+    ) {
+        for w in &node.when {
+            observer.on_constraint_source(&w.source_module, ConstraintKind::When, node);
+        }
+        for m in node.musts() {
+            observer.on_constraint_source(&m.source_module, ConstraintKind::Must, node);
         }
     }
 

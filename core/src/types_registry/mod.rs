@@ -30,7 +30,7 @@ use crate::compiler::{ModuleRegistry, Typedef};
 pub mod leafref;
 mod observer;
 
-pub use observer::{NoopObserver, TypeResolutionObserver};
+pub use observer::{ConstraintKind, NoopObserver, TypeResolutionObserver};
 
 // ── Built-in types (RFC 7950 §9) ─────────────────────────────────────────────
 
