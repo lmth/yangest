@@ -192,6 +192,25 @@ pub struct ExtensionInstance {
     /// Source position of the extension statement (used for ordering, e.g.
     /// extension entries may need to be sorted by source position).
     pub pos: Pos,
+    /// When this instance was *injected* onto a node by an annotation module
+    /// (rather than written in the node's own source), the name of that
+    /// annotation module. `None` for extensions written directly in the source.
+    ///
+    /// This distinguishes the extension's *definition* module ([`module`](Self::module),
+    /// e.g. the module declaring `callpoint`) from the *injection source* module
+    /// (the `*-ann` overlay that attached it). Backends that build a
+    /// namespace-encounter map need the latter; see
+    /// [`source_for_ns`](Self::source_for_ns).
+    pub injection_source_module: Option<String>,
+}
+
+impl ExtensionInstance {
+    /// The module to attribute this extension to for namespace/encounter-order
+    /// purposes: the injection-source module if it was annotation-injected,
+    /// otherwise its definition module.
+    pub fn source_for_ns(&self) -> &str {
+        self.injection_source_module.as_deref().unwrap_or(&self.module)
+    }
 }
 
 pub struct SchemaNode {

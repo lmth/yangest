@@ -410,7 +410,7 @@ For a maintainer picking up step 4:
 |---|---|---|
 | 1 | `core::walker` skeleton | **Done** (`ea920e4`) |
 | 2 | Wire observer firing at resolution sites | **Done** (`ea920e4`) |
-| 3 | `walk_own_augments` (own-augment traversal) | **Done** (`d3a5cf5`); Uses-body follow-up **Done**; remaining follow-up: annotation source-module attribution — see §14 |
+| 3 | `walk_own_augments` (own-augment traversal) | **Done** (`d3a5cf5`); Uses-body follow-up **Done** (`84da49f`); annotation source-module attribution **Done** (`ExtensionInstance::injection_source_module`) |
 | 4 | `ref-data`-gated parity tests | **Pending** — see §9 |
 | 5 | `on_constraint_source` for `when`/`must` | **Done** (`53062f7`) |
 | 6 | `on_extension_attached` for foreign-module extensions | **Done** (`813bd2f`) |
@@ -606,9 +606,7 @@ pitfalls follow:
 The simple "match `aug.nodes[i].name` against `host_children` by
 name" loop therefore visited *zero* nodes for any Uses-shaped
 augment body — empirically the dominant pattern in real-world
-yangbundles (e.g. `Cisco-IOS-XE-acl`, `Cisco-IOS-XE-pppoe`,
-several openconfig modules), where almost every augment body uses
-the grouping idiom.
+yangbundles, where almost every augment body uses the grouping idiom.
 
 **Resolution adopted**: option 2 of the three originally
 considered.
@@ -979,46 +977,42 @@ Two miss-only cases were unblocked (a few flipped between
 categories). The remaining 17 miss-only follow two patterns:
 
 1. **Uses-shaped augment bodies** are *not* visited. Spot-check on
-   `Cisco-IOS-XE-acl`: walker_seq=`[]` despite acl having six
-   augments into `/ios:native/...`. acl-ann annotates leaves
-   under those splice points. Each acl augment's body is `uses
-   <grouping-name>;` rather than direct leaf statements, so the
+   a representative device module: walker_seq=`[]` despite it having
+   several augments into a host module. Its annotation module
+   annotates leaves under those splice points. Each augment's body is
+   `uses <grouping-name>;` rather than direct leaf statements, so the
    step-3 implementation's `aug.nodes`-name-match-against-
    host-children loop visits zero nodes per augment (Uses node's
    name is the grouping name, no host-side counterpart by that
    name). See §11 "Recursive bodies / `uses grouping;`" for the
-   three follow-up options.
+   three follow-up options. *(Resolved in `84da49f`.)*
 2. **Annotation source-module attribution**: even when step 3
    reaches the host-tree node carrying a foreign extension, the
    walker fires `on_extension_attached(ext.module, …)` where
    `ext.module` is the **definition** module of the extension
-   (`tailf-common` for `tailf:callpoint`), not the **annotation
-   source module** that injected it (e.g. `Cisco-IOS-XE-aaa-ann`).
+   (the shared annotation-extension module), not the **annotation
+   source module** that injected it (e.g. an `A-ann` overlay).
    The reference compiler's `ns_to_prefix_maps` records the
    latter.
 
-   Probe confirms: post-step-3 `walker_seq` for
-   `Cisco-IOS-XE-aaa` is `["tailf-common"]` (was `[]`); the
-   reference is `["Cisco-IOS-XE-aaa-ann", "Cisco-IOS-XE-aaa"]`.
-   Step 3's host-tree iteration is working — but the source-
-   module reported is wrong for annotation-injected extensions.
+   Probe confirms: post-step-3 `walker_seq` for a device module
+   `A` is `["<shared-ext-module>"]` (was `[]`); the reference is
+   `["A-ann", "A"]`. Step 3's host-tree iteration is working — but
+   the source-module reported is wrong for annotation-injected
+   extensions.
 
-   **Resolution path**: `ExtensionInstance` needs a separate
-   `injection_source_module: Option<String>` field populated
-   during `apply_annotations` from `ann.from_module.name`
-   (path-based) and from `ast_ann_index.module_key_for_file(
-   ext.pos.orig_file())` (AST-based). The walker prefers the
-   `injection_source_module` over `ext.module` when firing
-   `on_extension_attached`. Without that, there is no way for an
-   observer to recover the annotation source from a finalised
-   `SchemaNode`.
+   **Resolution path** *(implemented)*: `ExtensionInstance` carries
+   a separate `injection_source_module: Option<String>` field,
+   populated during `apply_annotations` from `ann.from_module.name`
+   (path-based) and at extension-collection time from
+   `ast_ann_index.module_key_for_file(ext.pos.orig_file())`
+   (AST-based). The walker reports `ExtensionInstance::source_for_ns`
+   (which prefers `injection_source_module` over `ext.module`) when
+   firing `on_extension_attached`, and uses it for the foreign-source
+   filter too. An observer can now recover the annotation source from
+   a finalised `SchemaNode`.
 
-Together these two follow-ups are roughly the size of step 3
-itself; suggested next-step ordering: §11 follow-up (2)
-(`Cursor::augment_children` returns expanded children) first
-because it is local to one helper and unblocks the dominant
-Uses-body pattern; the source-module attribution fix can land as
-a separate compile-side change afterwards.
+Both follow-ups are now implemented; see the §10 status table.
 
 ### Updated migration prioritisation
 
@@ -1028,12 +1022,11 @@ a separate compile-side change afterwards.
    events from the shared annotation-extension module that were
    previously invisible.
 3. **Step 3 third** (`walk_own_augments`) — DONE in `d3a5cf5`,
-   plus follow-up (a) **DONE** (Uses-body expansion in
-   `Cursor::augment_children` + walker name-match). Remaining
-   follow-up: (b) `ExtensionInstance::injection_source_module`
-   so `on_extension_attached` reports the annotation-source
-   module, not the extension-definition module. See post-step-3
-   verification sub-section above.
+   plus follow-up (a) **DONE** (`84da49f`: Uses-body expansion in
+   `Cursor::augment_children` + walker name-match) and follow-up
+   (b) **DONE** (`ExtensionInstance::injection_source_module` so
+   `on_extension_attached` reports the annotation-source module,
+   not the extension-definition module).
 4. **Backend filter** — drop walker-observed modules already in
    `yang_header.imports`. Pure downstream work; collapses the
    ~264 extra-only to near zero.
@@ -1115,8 +1108,11 @@ loop and before `resolve_node_type`:
 
 ```rust
 for ext in &node.extensions {
-    if ext.module != node.module_name {
-        observer.on_extension_attached(&ext.module, ext, node);
+    // `source_for_ns()` is the injection-source module if the extension was
+    // annotation-injected, else its defining module (follow-up B).
+    let source = ext.source_for_ns();
+    if source != node.module_name {
+        observer.on_extension_attached(source, ext, node);
     }
 }
 ```

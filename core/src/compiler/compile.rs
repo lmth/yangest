@@ -308,6 +308,7 @@ pub fn compile_module(
         &registry.grammar,
         &key.name,
         &mut module_errors,
+        ast_ann_index,
     );
 
     let mut compiled = CompiledModule {
@@ -1022,6 +1023,7 @@ fn compile_schema_node(
         registry.flags.ignore_unknown_features,
         &registry.flags.meta_extensions,
         &registry.flags,
+        ast_ann_index,
     );
 
     let kind = match builtin_keyword(stmt)? {
@@ -1356,9 +1358,10 @@ fn compile_node_common(
     ignore_unknown: bool,
     meta_extensions: &[(String, String)],
     flags: &CompilationFlags,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> NodeCommon {
     let extensions =
-        collect_extension_instances(stmt, own_prefix, prefix_map, grammar, module_errors);
+        collect_extension_instances(stmt, own_prefix, prefix_map, grammar, module_errors, ast_ann_index);
     NodeCommon {
         name: required_stmt_name(stmt, module_errors).unwrap_or_default(),
         pos: stmt.pos.clone(),
@@ -1469,6 +1472,7 @@ fn collect_extension_instances(
     prefix_map: &PrefixMap,
     grammar: &GrammarRegistry,
     module_errors: &mut Vec<YError>,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> Vec<ExtensionInstance> {
     let mut result = Vec::new();
 
@@ -1498,12 +1502,22 @@ fn collect_extension_instances(
             validate_extension_instance(sub, rule, own_prefix, &module, prefix_map, module_errors);
         }
 
+        // If this extension statement was injected by an AST-level annotation
+        // (`annotate-module`/`annotate-statement`), its source file maps to the
+        // annotation module; record that as the injection source so a backend can
+        // attribute the namespace to the annotating module, not the extension's
+        // defining module. Normal source extensions map to no annotation file.
+        let injection_source_module = ast_ann_index
+            .module_key_for_file(sub.pos.orig_file())
+            .map(|k| k.name.clone());
+
         result.push(ExtensionInstance {
             module,
             name,
             arg: sub.arg.clone(),
             substmts: sub.substmts.clone(),
             pos: sub.pos.clone(),
+            injection_source_module,
         });
     }
 
@@ -1661,6 +1675,7 @@ fn collect_module_extensions(
     grammar: &GrammarRegistry,
     own_module_name: &str,
     module_errors: &mut Vec<YError>,
+    ast_ann_index: &AstAnnotationIndex,
 ) -> Vec<ExtensionInstance> {
     let mut result = Vec::new();
 
@@ -1685,12 +1700,22 @@ fn collect_module_extensions(
             validate_extension_instance(sub, rule, own_prefix, &module, prefix_map, module_errors);
         }
 
+        // If this extension statement was injected by an AST-level annotation
+        // (`annotate-module`/`annotate-statement`), its source file maps to the
+        // annotation module; record that as the injection source so a backend can
+        // attribute the namespace to the annotating module, not the extension's
+        // defining module. Normal source extensions map to no annotation file.
+        let injection_source_module = ast_ann_index
+            .module_key_for_file(sub.pos.orig_file())
+            .map(|k| k.name.clone());
+
         result.push(ExtensionInstance {
             module,
             name,
             arg: sub.arg.clone(),
             substmts: sub.substmts.clone(),
             pos: sub.pos.clone(),
+            injection_source_module,
         });
     }
 
@@ -2711,7 +2736,11 @@ fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> 
 
     // Inject annotation extension instances and apply when/must from annotations.
     for ann in &overlay.annotations {
-        node.extensions.extend(ann.instances.iter().cloned());
+        node.extensions.extend(ann.instances.iter().map(|inst| {
+            let mut inst = inst.clone();
+            inst.injection_source_module = Some(ann.source_module.clone());
+            inst
+        }));
         let source = ann.source_module.as_str();
         let source_rev = ann.source_revision.clone();
         for when in &ann.when_stmts {
@@ -3488,7 +3517,11 @@ fn apply_annotations(
 
 /// Apply annotation (extensions, whens, musts) to a resolved target node.
 fn apply_annotation_to_node(node: &mut SchemaNode, ann: &PendingAnnotation) {
-    node.extensions.extend(ann.instances.iter().cloned());
+    node.extensions.extend(ann.instances.iter().map(|inst| {
+        let mut inst = inst.clone();
+        inst.injection_source_module = Some(ann.from_module.name.clone());
+        inst
+    }));
     let source = ann.from_module.name.as_str();
     let source_rev = ann.from_module.revision.clone();
     for when in &ann.when_stmts {
@@ -3795,6 +3828,7 @@ fn apply_node_mutation(
                             arg: stmt.arg.clone(),
                             substmts: stmt.substmts.clone(),
                             pos: stmt.pos.clone(),
+                            injection_source_module: None,
                         };
                         match mode {
                             MutationMode::Delete => {

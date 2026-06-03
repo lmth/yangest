@@ -45,10 +45,6 @@
 //! Like the rest of the resolution machinery, the walker is **opt-in**: it is
 //! constructed by a backend from what `Plugin::emit_module` already has, and
 //! nothing in the compile path uses it.
-//!
-//! Like the rest of the resolution machinery, the walker is **opt-in**: it is
-//! constructed by a backend from what `Plugin::emit_module` already has, and
-//! nothing in the compile path uses it.
 
 use crate::compiler::{
     expand_children, AugmentEntry, CompiledModule, ExpansionCtx, ModuleRegistry, NodeOverlayMap,
@@ -338,8 +334,12 @@ impl<'a> SchemaWalker<'a> {
         observer: &mut O,
     ) {
         for ext in &node.extensions {
-            if ext.module != node.module_name {
-                observer.on_extension_attached(&ext.module, ext, node);
+            // Attribute the extension to its *injection-source* module when it was
+            // annotation-injected (so a backend records the `*-ann` overlay, not
+            // the extension's defining module); otherwise to its defining module.
+            let source = ext.source_for_ns();
+            if source != node.module_name {
+                observer.on_extension_attached(source, ext, node);
             }
         }
     }

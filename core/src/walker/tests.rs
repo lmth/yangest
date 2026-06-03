@@ -871,9 +871,11 @@ module annmod {
 
     let mut obs = EventRecorder::default();
     walker.walk(&mut obs);
+    // The event reports the *injection-source* module (the annotation module
+    // `annmod`), not the extension's defining module (`xann`) — follow-up B.
     assert_eq!(
         obs.events,
-        vec!["ext:xann:callpoint".to_string()],
+        vec!["ext:annmod:callpoint".to_string()],
         "annotation-injected foreign extension on the augmented node is surfaced"
     );
 }
@@ -917,4 +919,88 @@ module m {
         vec!["a", "b"],
         "uses-shaped augment body must surface the grouping's expanded leaves"
     );
+}
+
+// ── Follow-up B: injection_source_module (§14) ───────────────────────────────
+
+#[test]
+fn source_for_ns_prefers_injection_source() {
+    use crate::ast::Pos;
+    let pos = Pos::FilePos { file: Arc::from("t"), line: 1 };
+    let direct = ExtensionInstance {
+        module: "defmod".into(),
+        name: "callpoint".into(),
+        arg: None,
+        substmts: vec![],
+        pos: pos.clone(),
+        injection_source_module: None,
+    };
+    assert_eq!(direct.source_for_ns(), "defmod");
+
+    let injected = ExtensionInstance {
+        module: "defmod".into(),
+        name: "callpoint".into(),
+        arg: None,
+        substmts: vec![],
+        pos,
+        injection_source_module: Some("ann-mod".into()),
+    };
+    assert_eq!(injected.source_for_ns(), "ann-mod");
+}
+
+#[test]
+fn path_annotation_reports_injection_source_module() {
+    // An annotation module injects a foreign extension onto a plain (non-augmented)
+    // node. on_extension_attached must report the annotation module, not the
+    // extension's defining module.
+    let parse = |src: &str| {
+        let (stmts, errs) = parse_yang(src, Arc::from("t.yang"));
+        assert!(errs.is_empty(), "parse errors: {errs:?}");
+        let stmt = stmts.into_iter().next().unwrap();
+        let name = stmt.arg.clone().unwrap();
+        (ModuleKey::latest(&name), stmt)
+    };
+
+    let m_src = r#"
+module m { namespace "urn:m"; prefix m; leaf x { type string; } }
+"#;
+    let ann_src = r#"
+module annmod {
+  namespace "urn:annmod";
+  prefix am;
+  import m { prefix m; }
+  import xann { prefix xann; }
+  xann:annotate "/m:x" { xann:callpoint "cp"; }
+}
+"#;
+    let (m_key, m_stmt) = parse(m_src);
+    let (ann_key, ann_stmt) = parse(ann_src);
+
+    static OVERLAY: &[OverlayExtension] = &[OverlayExtension {
+        module: "xann",
+        name: "annotate",
+        source_plugin: "test",
+    }];
+    let ann_index = AnnotationIndex::build(&[(ann_key, ann_stmt)], OVERLAY);
+
+    let mut reg = ModuleRegistry::new();
+    let compiled = compile_module(
+        &m_key,
+        m_stmt,
+        &reg,
+        &DeviationIndex::default(),
+        &ann_index,
+        &AstAnnotationIndex::default(),
+    );
+    reg.insert(Arc::new(compiled));
+
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+
+    let mut obs = EventRecorder::default();
+    walker.walk(&mut obs);
+    assert_eq!(obs.events, vec!["ext:annmod:callpoint".to_string()]);
 }

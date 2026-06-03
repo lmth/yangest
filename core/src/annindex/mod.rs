@@ -288,6 +288,7 @@ fn resolve_ext_instances(
                 arg: sub.arg.clone(),
                 substmts: sub.substmts.clone(),
                 pos: sub.pos.clone(),
+                injection_source_module: None,
             })
         })
         .collect()
@@ -331,6 +332,7 @@ fn resolve_ext_instances_excluding_overlays(
                 arg: sub.arg.clone(),
                 substmts: sub.substmts.clone(),
                 pos: sub.pos.clone(),
+                injection_source_module: None,
             })
         })
         .collect()
