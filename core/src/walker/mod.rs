@@ -197,8 +197,14 @@ impl<'a> SchemaWalker<'a> {
             // was attempted in `84da49f` and reverted in `<this commit>`
             // because of catastrophic per-descent allocation costs on heavy
             // bundles; see §11 for the three candidate paths forward.
+            // Contributed names come from the *expanded* augment body (a `uses g;`
+            // body stores a single `Uses` node), served from the cached expansion
+            // the cursor also uses.
+            let body = self
+                .ctx
+                .expand_augment_body(aug, &self.module.prefix, &self.module.key.name);
             let host_children = target_cursor.child_nodes();
-            for body_node in &aug.nodes {
+            for body_node in body.iter() {
                 if let Some(child) = host_children.iter().find(|c| {
                     c.name == body_node.name && c.module_name == self.module.key.name
                 }) {

@@ -26,6 +26,7 @@
 //! `SchemaNode::children`, and is never used by the compile path or by the tree
 //! plugin — so non-consumers pay nothing.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::compiler::{CompiledModule, ExpansionCtx, PathStep, SchemaNode, SchemaNodeKind};
@@ -107,13 +108,34 @@ pub struct Cursor<'a> {
     /// Depth (stack length) below which `..` is refused. Set by
     /// [`set_xpath_root`](Self::set_xpath_root); 0 by default.
     pinned_root: usize,
+    /// Memoized logical children of the *current* position. Computing them
+    /// (expanding `uses`, applying overlays, splicing augments, flattening
+    /// `choice`/`case`) deep-clones the node's subtree, and a caller that
+    /// enumerates a node's children calls `find_child` once *per child* — all at
+    /// the same position. Caching the result here collapses that O(children)
+    /// re-computation to one expansion per position. Always reset to `None` when
+    /// the position changes; see [`invalidate`](Self::invalidate).
+    children_cache: RefCell<Option<Arc<Vec<SchemaNode>>>>,
 }
 
 impl<'a> Cursor<'a> {
     /// Create a cursor positioned at the root of `module`.
     pub fn root_of(module: &'a CompiledModule, ctx: &'a ExpansionCtx<'a>) -> Self {
         let root = Arc::new(flatten_transparent(module.children(ctx), ctx));
-        Cursor { module, ctx, root, stack: Vec::new(), pinned_root: 0 }
+        Cursor {
+            module,
+            ctx,
+            root,
+            stack: Vec::new(),
+            pinned_root: 0,
+            children_cache: RefCell::new(None),
+        }
+    }
+
+    /// Drop the memoized children of the current position. Call after any change
+    /// to `stack` (the current node changed, so its cached children are stale).
+    fn invalidate(&mut self) {
+        *self.children_cache.borrow_mut() = None;
     }
 
     /// The module this cursor navigates.
@@ -182,18 +204,24 @@ impl<'a> Cursor<'a> {
     /// spliced in by external augments targeting the current node (the data tree
     /// is the union of every module's contributions).
     fn current_children(&self) -> Arc<Vec<SchemaNode>> {
-        match self.stack.last() {
-            None => Arc::clone(&self.root),
-            Some(f) => {
-                let node = &f.siblings[f.index];
-                let mut kids = flatten_transparent(node.children(self.ctx), self.ctx);
-                let augmented = self.augment_children();
-                if !augmented.is_empty() {
-                    kids.extend(flatten_transparent(augmented, self.ctx));
-                }
-                Arc::new(kids)
-            }
+        // Root children are already an Arc — share directly, never cache.
+        let Some(f) = self.stack.last() else {
+            return Arc::clone(&self.root);
+        };
+        // Memoized: the same position's children are requested once per child
+        // lookup during a children-enumeration burst.
+        if let Some(cached) = self.children_cache.borrow().as_ref() {
+            return Arc::clone(cached);
         }
+        let node = &f.siblings[f.index];
+        let mut kids = flatten_transparent(node.children(self.ctx), self.ctx);
+        let augmented = self.augment_children();
+        if !augmented.is_empty() {
+            kids.extend(flatten_transparent(augmented, self.ctx));
+        }
+        let arc = Arc::new(kids);
+        *self.children_cache.borrow_mut() = Some(Arc::clone(&arc));
+        arc
     }
 
     /// The module-qualified absolute path of the current node, as
@@ -225,15 +253,16 @@ impl<'a> Cursor<'a> {
         for module in self.ctx.registry.modules.values() {
             for aug in &module.augments {
                 if augment_target_matches(module, &aug.target_path, &abs) {
-                    // NOTE: `aug.nodes` may be a single `SchemaNodeKind::Uses`
-                    // node (when the augment body is `uses g;`); see
-                    // core-walker-design.md §11. Expanding it here is the
-                    // natural fix but scales catastrophically on heavy
-                    // bundles (the obvious approach was tried in `84da49f`
-                    // and reverted in `<this commit>`); the recommended
-                    // approach now is to cache expanded augment bodies in
-                    // `ExpansionCtx` rather than re-expanding per descent.
-                    out.extend(aug.nodes.iter().cloned());
+                    // `aug.nodes` may be a single `SchemaNodeKind::Uses` node (when
+                    // the augment body is `uses g;`); expand it so the cursor sees
+                    // the grouping's leaves (core-walker-design.md §11). The
+                    // expansion is cached per augment, and `current_children`
+                    // memoizes this whole list per position, so the per-descent
+                    // re-expansion that regressed in `84da49f` is avoided.
+                    let expanded =
+                        self.ctx
+                            .expand_augment_body(aug, &module.prefix, &module.key.name);
+                    out.extend(expanded.iter().cloned());
                 }
             }
         }
@@ -247,6 +276,7 @@ impl<'a> Cursor<'a> {
         let index = match_index(&siblings, qname)?;
         let mut next = self.clone();
         next.stack.push(Frame { siblings, index });
+        next.invalidate(); // `next` is at a child position; the cloned cache is the parent's.
         Some(next)
     }
 
@@ -256,6 +286,7 @@ impl<'a> Cursor<'a> {
         let index = match_index(&siblings, qname)
             .ok_or_else(|| CursorError::NoSuchChild(qname.name.clone()))?;
         self.stack.push(Frame { siblings, index });
+        self.invalidate();
         Ok(())
     }
 
@@ -265,6 +296,7 @@ impl<'a> Cursor<'a> {
             return Err(CursorError::AtRoot);
         }
         self.stack.pop();
+        self.invalidate();
         Ok(())
     }
 
@@ -290,6 +322,7 @@ impl<'a> Cursor<'a> {
     pub fn reset_to_root(&mut self) {
         self.stack.clear();
         self.pinned_root = 0;
+        self.invalidate();
     }
 
     /// Pin the current depth as the root for relative resolution: subsequent
@@ -302,6 +335,7 @@ impl<'a> Cursor<'a> {
     /// Return to the pinned xpath root (see [`set_xpath_root`](Self::set_xpath_root)).
     pub fn reset_to_xpath_root(&mut self) {
         self.stack.truncate(self.pinned_root);
+        self.invalidate();
     }
 
     /// Convert into a floating cursor seeded with this single position.
