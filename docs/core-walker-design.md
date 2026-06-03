@@ -410,7 +410,7 @@ For a maintainer picking up step 4:
 |---|---|---|
 | 1 | `core::walker` skeleton | **Done** (`ea920e4`) |
 | 2 | Wire observer firing at resolution sites | **Done** (`ea920e4`) |
-| 3 | `walk_own_augments` (own-augment traversal) | **Done** |
+| 3 | `walk_own_augments` (own-augment traversal) | **Done** (`d3a5cf5`); two follow-ups: Uses-expansion + annotation source-module attribution — see §14 |
 | 4 | `ref-data`-gated parity tests | **Pending** — see §9 |
 | 5 | `on_constraint_source` for `when`/`must` | **Done** (`53062f7`) |
 | 6 | `on_extension_attached` for foreign-module extensions | **Done** (`813bd2f`) |
@@ -583,9 +583,47 @@ panics on schema gaps.
 `visit_node` with `data_cursor` positioned at the enclosing data
 node, not the case.
 
-**Recursive bodies**: if an augment body contains `Uses` nodes, they
-expand transparently via `node.children(ctx)` exactly like in
-own-tree walking; no special handling needed.
+**Recursive bodies / `uses grouping;`**: ⚠️ *Subtle*. An augment body
+of the form `augment X { uses g; }` stores `aug.nodes` as a single
+`SchemaNode` of `kind::Uses` whose `name` is the grouping name (e.g.
+`"g"`), **not** the grouping's expanded leaves. Two pitfalls follow:
+
+* **`body_node.children(ctx)` returns nothing** when called directly
+  on the Uses node. Uses are expanded by their *parent's*
+  `expand_children` call, not by descending into the Uses itself.
+* **Host-tree `child_nodes()` does not show expanded leaves either**
+  for foreign-augment contributions: `Cursor::augment_children`
+  currently extends with `aug.nodes.iter().cloned()` — i.e. the raw
+  Uses node — so cursoring at the augment target sees `Uses{name:"g"}`
+  on the cursor's child list.
+
+The simple "match `aug.nodes[i].name` against `host_children` by
+name" loop therefore visits *zero* nodes for any Uses-shaped
+augment body — empirically the dominant pattern in real-world
+yangbundles (e.g. `Cisco-IOS-XE-acl`, `Cisco-IOS-XE-pppoe`,
+several openconfig modules), where almost every augment body uses
+the grouping idiom.
+
+**Required step-3 follow-up** (one of these):
+
+1. **Walker uses `compile::expand_children` on `aug.nodes`** to get
+   the effective contributed `Vec<SchemaNode>` for matching. Then
+   look each one up in `host_children` by name. Cleanest from the
+   walker's perspective; couples the walker to a compile-internal
+   API.
+2. **`Cursor::augment_children` returns expanded children** rather
+   than raw `aug.nodes`. The cursor's child list becomes consistent
+   regardless of augment body shape, and the simple name-match loop
+   in the walker just works. May affect other cursor consumers; vet
+   `cursor::find_child` callers.
+3. **Compile pre-expands augment bodies** so `aug.nodes` always
+   stores the post-grouping leaves. Most invasive but yields the
+   simplest walker; matches what backends naively expect from
+   `CompiledModule::augments`.
+
+Recommend (2) — it localises the change to one helper, repairs
+every consumer that uses the cursor, and the walker keeps its
+current shape.
 
 **Cross-module augment chains**: when module A augments into B, and B
 augments into C, A's walk visits A's augment into B *only*. B's augment
@@ -920,6 +958,63 @@ This empirically confirms what §11 documents: step 3
 `own_augments_surface_host_applied_annotations` test pins the
 cursor-into-host-tree semantics that surfaces these annotations.
 
+### Verification results (2026-06-03 — post step 3)
+
+Step 3 (`walk_own_augments`) landed in `d3a5cf5`. Re-running the
+probe shows only modest movement:
+
+| Outcome | Pre step 3 | Post step 3 |
+|---|---|---|
+| Set + order match | 175 | 174 |
+| Extra-only | 262 | 264 |
+| Miss-only | 19 | 17 |
+| Both | 5 | 6 |
+
+Two miss-only cases were unblocked (a few flipped between
+categories). The remaining 17 miss-only follow two patterns:
+
+1. **Uses-shaped augment bodies** are *not* visited. Spot-check on
+   `Cisco-IOS-XE-acl`: walker_seq=`[]` despite acl having six
+   augments into `/ios:native/...`. acl-ann annotates leaves
+   under those splice points. Each acl augment's body is `uses
+   <grouping-name>;` rather than direct leaf statements, so the
+   step-3 implementation's `aug.nodes`-name-match-against-
+   host-children loop visits zero nodes per augment (Uses node's
+   name is the grouping name, no host-side counterpart by that
+   name). See §11 "Recursive bodies / `uses grouping;`" for the
+   three follow-up options.
+2. **Annotation source-module attribution**: even when step 3
+   reaches the host-tree node carrying a foreign extension, the
+   walker fires `on_extension_attached(ext.module, …)` where
+   `ext.module` is the **definition** module of the extension
+   (`tailf-common` for `tailf:callpoint`), not the **annotation
+   source module** that injected it (e.g. `Cisco-IOS-XE-aaa-ann`).
+   The reference compiler's `ns_to_prefix_maps` records the
+   latter.
+
+   Probe confirms: post-step-3 `walker_seq` for
+   `Cisco-IOS-XE-aaa` is `["tailf-common"]` (was `[]`); the
+   reference is `["Cisco-IOS-XE-aaa-ann", "Cisco-IOS-XE-aaa"]`.
+   Step 3's host-tree iteration is working — but the source-
+   module reported is wrong for annotation-injected extensions.
+
+   **Resolution path**: `ExtensionInstance` needs a separate
+   `injection_source_module: Option<String>` field populated
+   during `apply_annotations` from `ann.from_module.name`
+   (path-based) and from `ast_ann_index.module_key_for_file(
+   ext.pos.orig_file())` (AST-based). The walker prefers the
+   `injection_source_module` over `ext.module` when firing
+   `on_extension_attached`. Without that, there is no way for an
+   observer to recover the annotation source from a finalised
+   `SchemaNode`.
+
+Together these two follow-ups are roughly the size of step 3
+itself; suggested next-step ordering: §11 follow-up (2)
+(`Cursor::augment_children` returns expanded children) first
+because it is local to one helper and unblocks the dominant
+Uses-body pattern; the source-module attribution fix can land as
+a separate compile-side change afterwards.
+
 ### Updated migration prioritisation
 
 1. **Step 5 first** (`on_constraint_source`) — DONE in `53062f7`.
@@ -927,17 +1022,19 @@ cursor-into-host-tree semantics that surfaces these annotations.
    Confirmed via probe: 144 modules now report foreign-extension
    events from the shared annotation-extension module that were
    previously invisible.
-3. **Step 3 third** (`walk_own_augments`) — pending. Empirically
-   the unblocker for the residual 19 miss-only cases (dominated by
-   `*-ann` annotations against augment-grafted host nodes) and 5
-   "both" cases. See §11 for the full spec including the
-   host-tree-iteration nuance the maintainer must implement.
+3. **Step 3 third** (`walk_own_augments`) — DONE in `d3a5cf5`,
+   but two follow-ups required to be effective on real bundles:
+   (a) the §11 "Recursive bodies / `uses grouping;`" Uses-
+   expansion fix; (b) `ExtensionInstance::injection_source_module`
+   so `on_extension_attached` reports the annotation-source
+   module, not the extension-definition module. See post-step-3
+   verification sub-section above.
 4. **Backend filter** — drop walker-observed modules already in
    `yang_header.imports`. Pure downstream work; collapses the
-   262 extra-only post-step-6 to near zero.
+   ~264 extra-only to near zero.
 
-Total expected coverage if step 3 + filter land: 461/461 on the
-reference bundle.
+Total expected coverage if step 3 follow-ups + filter land: 461/461
+on the reference bundle.
 
 ---
 
