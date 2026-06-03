@@ -25,10 +25,15 @@
 //! ## Scope
 //!
 //! This implements the design doc's migration steps 1–2 (skeleton + observer
-//! firing). Cross-module **augment splicing and deviation inlining** at the
-//! walk level (step 3) depend on indexset-based augment splicing in `compile`
-//! and are not yet performed here: the walk currently visits each module's own
-//! `children(ctx)`. [`WalkOptions::follow_deviations`] and
+//! firing), step 5 (`on_constraint_source` for `when`/`must`), and step 6
+//! (`on_extension_attached` for foreign-module extensions). At each node the
+//! walker fires, in order: constraint-source events, foreign-extension events,
+//! then type-resolution events; then it descends.
+//!
+//! Cross-module **own-augment traversal** (step 3) is not yet performed: the
+//! walk currently visits each module's own `children(ctx)`, so leafs a module
+//! contributes via augments *into other modules* are seen during those other
+//! modules' walks, not this one. [`WalkOptions::follow_deviations`] and
 //! [`WalkOptions::deep_typedef_chains`] are accepted and stored but reserved for
 //! that later work.
 //!
@@ -165,6 +170,7 @@ impl<'a> SchemaWalker<'a> {
 
         visit(&node_cursor);
         self.fire_constraint_sources(node, observer);
+        self.fire_extension_attached(node, observer);
         self.resolve_node_type(node, &node_cursor, observer);
 
         for child in node.children(self.ctx) {
@@ -187,6 +193,22 @@ impl<'a> SchemaWalker<'a> {
         }
         for m in node.musts() {
             observer.on_constraint_source(&m.source_module, ConstraintKind::Must, node);
+        }
+    }
+
+    /// Fire `on_extension_attached` for each *foreign-module* extension instance
+    /// on `node`, in `node.extensions` declaration order. Same-module extensions
+    /// are filtered out (a backend that needs them reads `node.extensions`
+    /// directly). Fires after constraint-source events and before type resolution.
+    fn fire_extension_attached<O: TypeResolutionObserver>(
+        &self,
+        node: &SchemaNode,
+        observer: &mut O,
+    ) {
+        for ext in &node.extensions {
+            if ext.module != node.module_name {
+                observer.on_extension_attached(&ext.module, ext, node);
+            }
         }
     }
 

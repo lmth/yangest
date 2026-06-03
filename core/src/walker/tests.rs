@@ -10,6 +10,7 @@ use crate::ast::ModuleKey;
 use crate::compiler::{compile_module, ModuleRegistry, Typedef};
 use crate::devindex::DeviationIndex;
 use crate::parser::parse_yang;
+use crate::compiler::ExtensionInstance;
 use crate::types_registry::{ConstraintKind, TypeResolutionObserver};
 
 fn registry_from(sources: &[(&str, &str)]) -> ModuleRegistry {
@@ -61,6 +62,14 @@ impl TypeResolutionObserver for EventRecorder {
             ConstraintKind::Must => "must",
         };
         self.events.push(format!("{k}:{source_module}:{}", node.name));
+    }
+    fn on_extension_attached(
+        &mut self,
+        source_module: &str,
+        ext: &ExtensionInstance,
+        _node: &SchemaNode,
+    ) {
+        self.events.push(format!("ext:{source_module}:{}", ext.name));
     }
 }
 
@@ -360,4 +369,208 @@ module m {
     let mut obs = OnlyTypeObserver(Vec::new());
     walker.walk(&mut obs);
     assert!(obs.0.is_empty(), "no events for plain string + default observer methods");
+}
+
+// ── Step 6: on_extension_attached (§15) ──────────────────────────────────────
+
+#[test]
+fn fires_on_extension_attached_for_foreign_module_only() {
+    // Leaf `x` carries an own-module extension (`m:hint`) and a foreign-module
+    // extension (`b:callpoint`). Only the foreign one fires.
+    let reg = registry_from(&[
+        (
+            "b",
+            r#"
+module b {
+  namespace "urn:b";
+  prefix b;
+  extension callpoint { argument n; }
+}
+"#,
+        ),
+        (
+            "m",
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  import b { prefix b; }
+  extension hint { argument n; }
+  leaf x { type string; m:hint "h"; b:callpoint "cp"; }
+}
+"#,
+        ),
+    ]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+
+    let mut obs = EventRecorder::default();
+    walker.walk(&mut obs);
+    assert_eq!(obs.events, vec!["ext:b:callpoint".to_string()]);
+}
+
+#[test]
+fn fires_extensions_in_declaration_order_no_dedup() {
+    // Three foreign extensions in order p1:e1, p2:e2, p1:e3 — emitted in exactly
+    // that order, with no per-source dedup at the walker layer.
+    let reg = registry_from(&[
+        (
+            "p1",
+            r#"
+module p1 {
+  namespace "urn:p1";
+  prefix p1;
+  extension e1 { argument n; }
+  extension e3 { argument n; }
+}
+"#,
+        ),
+        (
+            "p2",
+            r#"
+module p2 {
+  namespace "urn:p2";
+  prefix p2;
+  extension e2 { argument n; }
+}
+"#,
+        ),
+        (
+            "m",
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  import p1 { prefix p1; }
+  import p2 { prefix p2; }
+  leaf x { type string; p1:e1 "1"; p2:e2 "2"; p1:e3 "3"; }
+}
+"#,
+        ),
+    ]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+
+    let mut obs = EventRecorder::default();
+    walker.walk(&mut obs);
+    assert_eq!(
+        obs.events,
+        vec![
+            "ext:p1:e1".to_string(),
+            "ext:p2:e2".to_string(),
+            "ext:p1:e3".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn default_observer_method_means_no_extension_events() {
+    // An observer that does not override on_extension_attached sees nothing from
+    // it (default no-op), even when foreign extensions are present.
+    struct OnlyTypeObserver(Vec<String>);
+    impl TypeResolutionObserver for OnlyTypeObserver {
+        fn on_typedef_resolved(&mut self, src: &str, td: &Typedef) {
+            self.0.push(format!("typedef:{src}:{}", td.name));
+        }
+        // on_extension_attached: default (no-op)
+    }
+    let reg = registry_from(&[
+        (
+            "b",
+            r#"
+module b {
+  namespace "urn:b";
+  prefix b;
+  extension callpoint { argument n; }
+}
+"#,
+        ),
+        (
+            "m",
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  import b { prefix b; }
+  leaf x { type string; b:callpoint "cp"; }
+}
+"#,
+        ),
+    ]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+
+    let mut obs = OnlyTypeObserver(Vec::new());
+    walker.walk(&mut obs);
+    assert!(obs.0.is_empty(), "default on_extension_attached records nothing");
+}
+
+#[test]
+fn fires_constraint_then_extension_then_resolution() {
+    // A leaf with a `when` (own module), a foreign extension (cc:callpoint), and
+    // a leafref into module dd. The events at the node must be ordered:
+    // constraint-source, then extension, then leafref resolution.
+    let reg = registry_from(&[
+        (
+            "cc",
+            r#"
+module cc {
+  namespace "urn:cc";
+  prefix cc;
+  extension callpoint { argument n; }
+}
+"#,
+        ),
+        (
+            "dd",
+            r#"
+module dd {
+  namespace "urn:dd";
+  prefix dd;
+  leaf target { type string; }
+}
+"#,
+        ),
+        (
+            "m",
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  import cc { prefix cc; }
+  import dd { prefix dd; }
+  leaf x {
+    type leafref { path "/dd:target"; }
+    when "true()";
+    cc:callpoint "cp";
+  }
+}
+"#,
+        ),
+    ]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let types = TypeRegistry::new(&reg);
+    let walker = SchemaWalker::new(&m, &reg, &types, &cx);
+
+    let mut obs = EventRecorder::default();
+    walker.walk(&mut obs);
+    assert_eq!(
+        obs.events,
+        vec![
+            "when:m:x".to_string(),
+            "ext:cc:callpoint".to_string(),
+            "leafref:dd:target".to_string(),
+        ]
+    );
 }

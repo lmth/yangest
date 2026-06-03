@@ -28,7 +28,7 @@
 //!   outer reference reports. Drive resolution in the order you need the
 //!   namespaces registered.
 
-use crate::compiler::{SchemaNode, Typedef};
+use crate::compiler::{ExtensionInstance, SchemaNode, Typedef};
 
 /// Kind of constraint expression — used by
 /// [`TypeResolutionObserver::on_constraint_source`] to disambiguate `when`
@@ -61,11 +61,31 @@ pub trait TypeResolutionObserver {
     /// The default implementation is a no-op so existing observers remain
     /// behavioural-compatible. Backends that need to register namespaces of
     /// constraint-contributing modules (e.g. an `ns_to_prefix_maps` builder
-    /// for an FXS-style backend) implement this method.
+    /// for a byte-faithful backend) implement this method.
     fn on_constraint_source(
         &mut self,
         _source_module: &str,
         _kind: ConstraintKind,
+        _node: &SchemaNode,
+    ) {
+    }
+
+    /// Fired by the walker once per *foreign-module* extension instance attached
+    /// to a visited node, in declaration order within `node.extensions`. Fired
+    /// *after* [`on_constraint_source`](Self::on_constraint_source) events at the
+    /// same node and *before* type resolution and child descent.
+    ///
+    /// `source_module` is `ext.module` — the module that declared the extension
+    /// instance. By contract this only fires when `ext.module != node.module_name`,
+    /// so observers do not need to filter same-module extensions; a backend that
+    /// also needs same-module extensions should read `node.extensions` directly.
+    ///
+    /// The default implementation is a no-op so existing observers remain
+    /// behavioural-compatible.
+    fn on_extension_attached(
+        &mut self,
+        _source_module: &str,
+        _ext: &ExtensionInstance,
         _node: &SchemaNode,
     ) {
     }

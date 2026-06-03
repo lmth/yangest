@@ -413,12 +413,12 @@ For a maintainer picking up step 4:
 | 3 | `walk_own_augments` (own-augment traversal) | **Pending** — see §11 |
 | 4 | `ref-data`-gated parity tests | **Pending** — see §9 |
 | 5 | `on_constraint_source` for `when`/`must` | **Done** (`53062f7`) |
-| 6 | `on_extension_attached` for foreign-module extensions | **Pending** — see §15 |
+| 6 | `on_extension_attached` for foreign-module extensions | **Done** |
 
-Steps 3, 4, 6 are independent; any order is fine. Empirical
-evidence from a downstream walker probe (§14) gives priority to
-step 3 (~14 modules) and step 6 (~14 modules), with step 4 third
-(insurance against future regressions).
+Steps 3 and 4 remain; they are independent, and either order is fine.
+Step 3 (own-augment traversal) is the higher-leverage of the two per
+the §14 probe; step 4 (parity tests) is insurance against future
+regressions.
 
 ### Original step descriptions
 
@@ -481,7 +481,7 @@ impl<'a> SchemaWalker<'a> {
 ```
 
 Splitting the methods is mandatory, not cosmetic: a backend that is
-already finalising per-module output (the fxs case) must complete
+already finalising per-module output must complete
 **all** observer events for module *M* before the next module is
 walked, which means own-augment events have to fire during *M*'s walk
 even though structurally they live under another module's tree.
@@ -578,10 +578,9 @@ node, not the case.
 expand transparently via `node.children(ctx)` exactly like in
 own-tree walking; no special handling needed.
 
-**Cross-module augment chains**: when otv augments into ethernet,
-and ethernet augments into interfaces, the otv walk visits otv's
-augment into ethernet *only*. ethernet's augment into interfaces is
-ethernet's responsibility, fired during ethernet's own walk. This
+**Cross-module augment chains**: when module A augments into B, and B
+augments into C, A's walk visits A's augment into B *only*. B's augment
+into C is B's responsibility, fired during B's own walk. This
 matches the reference compiler's per-module compilation model.
 
 **Suggested implementation skeleton**:
@@ -641,10 +640,10 @@ the visitor through.
    from `walk()` equals `walk_own_tree()` events followed by
    `walk_own_augments()` events.
 
-**Bundle-level smoke-test target**: with step 3 in place, the fxs
-backend (using the `YANGEST_FXS_NS_DUMP=1` probe in the downstream
-yangest-experiments tree) should drop the count of *miss-only*
-modules from 23 → ~9 (the *-ann cases that need step 6) and "both"
+**Bundle-level smoke-test target**: with step 3 in place, a byte-faithful
+backend (using the `YANGEST_NS_DUMP=1` probe in the downstream
+experiments tree) should drop the count of *miss-only*
+modules from 23 → ~9 (the `*-ann` cases that need step 6) and "both"
 from 1 → 0.
 
 ---
@@ -672,7 +671,7 @@ alone cannot reproduce the reference set. The missing signal is the
 source module of `when`/`must` constraints contributed by deviations
 and annotations applied to nodes during compilation.
 
-Concretely, for `Cisco-IOS-XE-native` the reference includes a
+Concretely, for one large device module the reference includes a
 deviation that adds a `when` whose source module is the deviation
 module itself — the reference compiler counts this in the namespace
 map even though the deviation contributes no typed leaf of its own.
@@ -706,7 +705,7 @@ kind)` pair encountered at a node, *before* descending into the node's
 children. Backends that do not care provide the default no-op and pay
 nothing.
 
-This event is exactly what the fxs plugin's existing
+This event is exactly what a byte-faithful backend's existing
 `AppliedDeviations`/`AppliedAnnotations` pdata reads today — but now
 tied to encounter order, which is the missing dimension.
 
@@ -730,7 +729,7 @@ Step 5 is independent of step 3 and can land before or after it.
   only if a second backend asks. **Status: unchanged.**
 * Whether `walk_with_visitor`'s `V: FnMut` should also be able to
   *prune* a subtree (`enum Action { Recurse, Skip }`). The first
-  consumer (fxs ns-map building) does not need pruning; the `tree`
+  consumer (ns-map building) does not need pruning; the `tree`
   plugin would. Add when a second consumer appears.
   **Status: still deferred; no urgency.**
 * Augment-source-module exposure via `on_node_enter`. **Resolved**
@@ -755,7 +754,7 @@ Before step 3 lands, the following can be verified with the current
 walker:
 
 1. **Side-by-side observer dump** — wire a recording observer into
-   the downstream fxs plugin (behind an env flag, not committed),
+   the downstream backend (behind an env flag, not committed),
    run it on a sample of modules with `ns_to_prefix_maps` currently
    matching the reference, and confirm the recorded
    `(source_module, kind)` event sequence is consistent with the
@@ -778,7 +777,7 @@ upstream changes.
 ### Verification results (2026-06-03)
 
 The verification described in §14 has been carried out: a recording
-observer was wired into the fxs backend behind an env flag and run
+observer was wired into the downstream backend behind an env flag and run
 against the full 461-module reference yangbundle. Results
 (de-duplicated source-module set, own module excluded, comparing
 walker output to the reference `ns_to_prefix_maps`):
@@ -799,16 +798,11 @@ the event stream, not corrections to existing event order.
 
 The miss-only cases break down into:
 
-* `*-ann` modules (annotations contributing `when`/`must`): aaa-ann,
-  acl-ann, dhcp-ann, ethernet-ann, native-ann, pnp-ann, pppoe-ann,
-  spanning-tree-ann, atm-ann, voice-ann, openconfig-network-instance-l3,
-  …
-* `*-deviation`, `*-obsolete` overlays: cts-routing-deviation,
-  eigrp-obsolete, ospf-obsolete, …
-* Augment-out source modules (e.g. `Cisco-IOS-XE-native` is missing
-  hsrp / interfaces / ip / ipv6 / line / location / logging /
-  transport — all modules `native` augments INTO, contributing typed
-  leafs at those modules' splice points).
+* Annotation (`*-ann`) modules contributing `when`/`must` constraints.
+* `*-deviation` / `*-obsolete` overlay modules.
+* Augment-out source modules (e.g. a device's root module is missing the
+  several host modules it augments INTO — all contributing typed leafs at
+  those modules' splice points).
 
 The first two categories are the §12 use case verbatim. The third
 category confirms §11 own-augment traversal is needed: `walk_own_tree`
@@ -834,16 +828,24 @@ Total expected coverage if all three land: 281 + 23 + 151 + 6 = 461.
 
 ## 15. Step 6 — `on_extension_attached` event
 
+**Status: implemented.** `TypeResolutionObserver::on_extension_attached`
+is upstream; the walker fires it in `visit_node` after the
+`on_constraint_source` loop and before type resolution, once per
+foreign-module extension instance (`ext.module != node.module_name`) in
+`node.extensions` declaration order. The four tests from the *Tests*
+subsection below are in `core/src/walker/tests.rs`. The original
+specification is preserved below for design rationale.
+
 ### Why this step is needed
 
 The walker probe (§14) classified 23 modules as miss-only after
 step 5 landed. Inspection showed two distinct causes:
 
-1. The augment-out tail (modules like `Cisco-IOS-XE-native` whose
-   typed leafs live under hosts the walker never sees from
-   `native`'s root). Step 3 (§11) addresses this.
+1. The augment-out tail (a device's root module whose typed leafs live
+   under hosts the walker never sees from that root). Step 3 (§11)
+   addresses this.
 2. Annotation modules (`*-ann`) that attach **extension instances**
-   such as `tailf:callpoint`, `tailf:hidden`, `tailf:dependency`,
+   such as `acme:callpoint`, `acme:hidden`, `acme:dependency`,
    etc. to nodes in a target module. These are NOT `when`/`must`
    constraints — they're orthogonal extension attachments. They
    are observable at `SchemaNode::extensions` after the annotation
@@ -852,11 +854,9 @@ step 5 landed. Inspection showed two distinct causes:
    to a visited node.
 
 Empirically, 14 of the 23 miss-only cases on the reference bundle
-are exclusively in this second category (acl-ann, aaa-ann,
-dhcp-ann, ethernet-ann, native-ann, pnp-ann, pppoe-ann,
-spanning-tree-ann, atm-ann, voice-ann, …). Without step 6 a
-backend cannot reach byte-faithful output for any module that
-imports an annotation overlay.
+are exclusively in this second category (various `*-ann` annotation
+modules). Without step 6 a backend cannot reach byte-faithful output
+for any module that imports an annotation overlay.
 
 ### Trait surface (proposed)
 
@@ -939,7 +939,7 @@ In `core/src/walker/tests.rs`:
    it sees zero `on_extension_attached` calls (verified via a
    recording observer that logs every method call).
 4. `fires_after_constraint_before_resolution` — leaf with a `when`
-   from foreign module `B` AND a `tailf:callpoint` from foreign
+   from foreign module `B` AND an `acme:callpoint` from foreign
    module `C` AND a leafref to foreign module `D`. Recording
    observer: assert event order is `on_constraint_source(B,
    When, _)`, `on_extension_attached(C, _, _)`,
