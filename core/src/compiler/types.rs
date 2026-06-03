@@ -53,6 +53,16 @@ pub struct CompilationFlags {
     /// before the first instance of any of these extensions in the YANG source.
     /// Format: `[(module_name, extension_name), ...]`.
     pub meta_extensions: Vec<(String, String)>,
+    /// Extension that declares an explicit dependency path inside a `must` or
+    /// `when` statement. When set, the argument of each occurrence is collected
+    /// into [`MustExpr::explicit_deps`] / [`WhenExpr::explicit_deps`].
+    /// Format: `(module_name, extension_name)`.
+    pub dependency_extension: Option<(String, String)>,
+    /// Extension that suppresses XPath-derived auto-dependency analysis inside
+    /// a `must` or `when` statement. When present on the statement, sets
+    /// [`MustExpr::override_auto_deps`] / [`WhenExpr::override_auto_deps`] to
+    /// `true`. Format: `(module_name, extension_name)`.
+    pub override_auto_deps_extension: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,11 +146,12 @@ pub struct MustExpr {
     /// Revision of the source module. `None` for must statements in the target module itself.
     /// Set when the must was injected by an annotation module.
     pub source_revision: Option<String>,
-    /// Explicit dependency paths from extension sub-statements (e.g. a "dependency"
-    /// extension that lists additional paths the must expression depends on).
+    /// Explicit dependency paths from sub-statements of the configured
+    /// dependency extension (see [`CompilationFlags::dependency_extension`]).
     pub explicit_deps: Vec<String>,
-    /// True when an "override-auto-dependencies" extension is present: use only
-    /// explicit deps, skip XPath-derived auto-dependency analysis.
+    /// True when the configured override-auto-dependencies extension is
+    /// present (see [`CompilationFlags::override_auto_deps_extension`]):
+    /// consumers should use only `explicit_deps` and skip XPath dep analysis.
     pub override_auto_deps: bool,
 }
 
@@ -157,6 +168,13 @@ pub struct WhenExpr {
     /// (non-local origin). When true, `F_WHEN_CTX_NODE_UP` must be set in the FXS
     /// when tuple, and deps need a parent step prepended.
     pub non_local: bool,
+    /// Explicit dependency paths from sub-statements of the configured
+    /// dependency extension (see [`CompilationFlags::dependency_extension`]).
+    pub explicit_deps: Vec<String>,
+    /// True when the configured override-auto-dependencies extension is
+    /// present (see [`CompilationFlags::override_auto_deps_extension`]):
+    /// consumers should use only `explicit_deps` and skip XPath dep analysis.
+    pub override_auto_deps: bool,
 }
 
 /// An extension statement applied to a schema node or module during compilation.

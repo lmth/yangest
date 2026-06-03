@@ -669,7 +669,7 @@ fn collect_augments(
         augments.push(AugmentEntry {
             target_path,
             nodes,
-            when: collect_when_exprs(augment, own_prefix, prefix_map, key.name.as_str(), module_errors),
+            when: collect_when_exprs(augment, own_prefix, prefix_map, key.name.as_str(), module_errors, &registry.flags),
             if_features: collect_if_features(
                 augment,
                 own_prefix,
@@ -948,7 +948,7 @@ fn compile_uses_node(
         local_augments.push(LocalAugmentEntry {
             target_path: target_path.into_iter().map(|step| step.name).collect(),
             nodes,
-            when: collect_when_exprs(augment, own_prefix, prefix_map, key.name.as_str(), module_errors),
+            when: collect_when_exprs(augment, own_prefix, prefix_map, key.name.as_str(), module_errors, &registry.flags),
             if_features: collect_if_features(
                 augment,
                 own_prefix,
@@ -985,7 +985,7 @@ fn compile_uses_node(
                     .cloned()
                     .collect(),
                 local_augments,
-                when: collect_when_exprs(uses_stmt, own_prefix, prefix_map, key.name.as_str(), module_errors),
+                when: collect_when_exprs(uses_stmt, own_prefix, prefix_map, key.name.as_str(), module_errors, &registry.flags),
                 if_features: collect_if_features(
                     uses_stmt,
                     own_prefix,
@@ -1022,6 +1022,7 @@ fn compile_schema_node(
         module_errors,
         registry.flags.ignore_unknown_features,
         &registry.flags.meta_extensions,
+        &registry.flags,
     );
 
     let kind = match builtin_keyword(stmt)? {
@@ -1039,7 +1040,7 @@ fn compile_schema_node(
                 module_errors,
                 ast_ann_index,
             ),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index, &registry.flags),
         },
         BuiltInKeyword::Leaf => SchemaNodeKind::Leaf {
             type_stmt: compile_type_stmt(stmt, yang_version, own_prefix, prefix_map, module_errors),
@@ -1047,7 +1048,7 @@ fn compile_schema_node(
             default: opt_substmt_arg(stmt, BuiltInKeyword::Default),
             mandatory: opt_bool_substmt(stmt, BuiltInKeyword::Mandatory, module_errors)
                 .unwrap_or(false),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index, &registry.flags),
         },
         BuiltInKeyword::LeafList => SchemaNodeKind::LeafList {
             type_stmt: compile_type_stmt(stmt, yang_version, own_prefix, prefix_map, module_errors),
@@ -1060,7 +1061,7 @@ fn compile_schema_node(
                 .unwrap_or(0),
             max_elements: opt_max_elements(stmt, module_errors),
             ordered_by: opt_ordered_by(stmt, module_errors).unwrap_or(OrderedBy::System),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index, &registry.flags),
         },
         BuiltInKeyword::List => SchemaNodeKind::List {
             key: parse_key_stmt(stmt.get_substmt(BuiltInKeyword::Key)),
@@ -1084,7 +1085,7 @@ fn compile_schema_node(
                 .unwrap_or(0),
             max_elements: opt_max_elements(stmt, module_errors),
             ordered_by: opt_ordered_by(stmt, module_errors).unwrap_or(OrderedBy::System),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index, &registry.flags),
         },
         BuiltInKeyword::Choice => SchemaNodeKind::Choice {
             default: opt_substmt_arg(stmt, BuiltInKeyword::Default),
@@ -1142,7 +1143,7 @@ fn compile_schema_node(
                 module_errors,
                 ast_ann_index,
             ),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index, &registry.flags),
         },
         BuiltInKeyword::Action => SchemaNodeKind::Action {
             input: compile_io_block(
@@ -1183,17 +1184,17 @@ fn compile_schema_node(
                 module_errors,
                 ast_ann_index,
             ),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index, &registry.flags),
         },
         BuiltInKeyword::AnyXml => SchemaNodeKind::AnyXml {
             mandatory: opt_bool_substmt(stmt, BuiltInKeyword::Mandatory, module_errors)
                 .unwrap_or(false),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index, &registry.flags),
         },
         BuiltInKeyword::AnyData => SchemaNodeKind::AnyData {
             mandatory: opt_bool_substmt(stmt, BuiltInKeyword::Mandatory, module_errors)
                 .unwrap_or(false),
-            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index),
+            musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index, &registry.flags),
         },
         _ => return None,
     };
@@ -1355,6 +1356,7 @@ fn compile_node_common(
     module_errors: &mut Vec<YError>,
     ignore_unknown: bool,
     meta_extensions: &[(String, String)],
+    flags: &CompilationFlags,
 ) -> NodeCommon {
     let extensions =
         collect_extension_instances(stmt, own_prefix, prefix_map, grammar, module_errors);
@@ -1363,7 +1365,7 @@ fn compile_node_common(
         pos: stmt.pos.clone(),
         status: parse_status(stmt, module_errors),
         config: opt_bool_substmt(stmt, BuiltInKeyword::Config, module_errors),
-        when: collect_when_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors),
+        when: collect_when_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, flags),
         if_features: collect_if_features(
             stmt,
             own_prefix,
@@ -1957,9 +1959,10 @@ fn collect_when_exprs(
     prefix_map: &PrefixMap,
     source_module_name: &str,
     module_errors: &mut Vec<YError>,
+    flags: &CompilationFlags,
 ) -> Vec<WhenExpr> {
     stmt.get_substmts(BuiltInKeyword::When)
-        .map(|when| compile_when_expr(when, own_prefix, prefix_map, source_module_name, module_errors))
+        .map(|when| compile_when_expr(when, own_prefix, prefix_map, source_module_name, module_errors, flags))
         .collect()
 }
 
@@ -1969,9 +1972,12 @@ fn compile_when_expr(
     prefix_map: &PrefixMap,
     source_module_name: &str,
     module_errors: &mut Vec<YError>,
+    flags: &CompilationFlags,
 ) -> WhenExpr {
     let xpath = stmt.arg.clone().unwrap_or_default();
     validate_xpath(&xpath, own_prefix, prefix_map, &stmt.pos, module_errors);
+    let (explicit_deps, override_auto_deps) =
+        collect_explicit_deps(&stmt.substmts, own_prefix, source_module_name, prefix_map, flags);
     WhenExpr {
         xpath,
         description: opt_substmt_arg(stmt, BuiltInKeyword::Description),
@@ -1979,6 +1985,8 @@ fn compile_when_expr(
         source_module: source_module_name.to_string(),
         source_revision: None,
         non_local: false,
+        explicit_deps,
+        override_auto_deps,
     }
 }
 
@@ -1989,9 +1997,10 @@ fn collect_must_exprs(
     source_module_name: &str,
     module_errors: &mut Vec<YError>,
     ast_ann_index: &AstAnnotationIndex,
+    flags: &CompilationFlags,
 ) -> Vec<MustExpr> {
     stmt.get_substmts(BuiltInKeyword::Must)
-        .map(|must| compile_must_expr(must, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index))
+        .map(|must| compile_must_expr(must, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index, flags))
         .collect()
 }
 
@@ -2002,6 +2011,7 @@ fn compile_must_expr(
     source_module_name: &str,
     module_errors: &mut Vec<YError>,
     ast_ann_index: &AstAnnotationIndex,
+    flags: &CompilationFlags,
 ) -> MustExpr {
     let xpath = stmt.arg.clone().unwrap_or_default();
     validate_xpath(&xpath, own_prefix, prefix_map, &stmt.pos, module_errors);
@@ -2013,24 +2023,8 @@ fn compile_must_expr(
             Some(ann_key) => (ann_key.name.clone(), ann_key.revision.clone()),
             None => (source_module_name.to_string(), None),
         };
-    // Collect explicit `tailf:dependency` sub-statements. These provide explicit dependency
-    // paths that are merged with the XPath-derived deps (or replace them when
-    // `tailf:override-auto-dependencies` is also present).
-    let explicit_deps: Vec<String> = stmt
-        .substmts
-        .iter()
-        .filter(|sub| {
-            resolve_kw(&sub.keyword, own_prefix, source_module_name, prefix_map)
-                .map(|(_, name)| name == "dependency")
-                .unwrap_or(false)
-        })
-        .filter_map(|sub| sub.arg.clone())
-        .collect();
-    let override_auto_deps = stmt.substmts.iter().any(|sub| {
-        resolve_kw(&sub.keyword, own_prefix, source_module_name, prefix_map)
-            .map(|(_, name)| name == "override-auto-dependencies")
-            .unwrap_or(false)
-    });
+    let (explicit_deps, override_auto_deps) =
+        collect_explicit_deps(&stmt.substmts, own_prefix, source_module_name, prefix_map, flags);
     MustExpr {
         xpath,
         error_message: opt_substmt_arg(stmt, BuiltInKeyword::ErrorMessage),
@@ -2041,6 +2035,45 @@ fn compile_must_expr(
         explicit_deps,
         override_auto_deps,
     }
+}
+
+/// Resolve the configured `dependency` and `override-auto-dependencies`
+/// extensions (if any) inside a `must` or `when` statement's sub-statements,
+/// using the lookup keys configured in [`CompilationFlags`].
+///
+/// Returns `(explicit_deps, override_auto_deps)`. When the corresponding
+/// extension is unset in `flags`, the result is empty / `false` (the default —
+/// no built-in name strings are matched).
+fn collect_explicit_deps(
+    substmts: &[Stmt],
+    own_prefix: &str,
+    source_module_name: &str,
+    prefix_map: &PrefixMap,
+    flags: &CompilationFlags,
+) -> (Vec<String>, bool) {
+    let explicit_deps: Vec<String> = if let Some((mod_name, ext_name)) = flags.dependency_extension.as_ref() {
+        substmts
+            .iter()
+            .filter(|sub| {
+                resolve_kw(&sub.keyword, own_prefix, source_module_name, prefix_map)
+                    .map(|(m, n)| m == mod_name.as_str() && n == ext_name.as_str())
+                    .unwrap_or(false)
+            })
+            .filter_map(|sub| sub.arg.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let override_auto_deps = if let Some((mod_name, ext_name)) = flags.override_auto_deps_extension.as_ref() {
+        substmts.iter().any(|sub| {
+            resolve_kw(&sub.keyword, own_prefix, source_module_name, prefix_map)
+                .map(|(m, n)| m == mod_name.as_str() && n == ext_name.as_str())
+                .unwrap_or(false)
+        })
+    } else {
+        false
+    };
+    (explicit_deps, override_auto_deps)
 }
 
 fn validate_xpath(
@@ -3789,6 +3822,11 @@ fn mutate_when_exprs(list: &mut Vec<WhenExpr>, stmt: &Stmt, mode: MutationMode, 
         source_module: source_module_name.to_string(),
         source_revision,
         non_local: false,
+        // Mirrors `mutate_must_exprs`: explicit-dependency sub-statements from
+        // annotation-injected whens are not resolved in the mutate path
+        // (no own_prefix/prefix_map context). Leave empty.
+        explicit_deps: vec![],
+        override_auto_deps: false,
     };
     match mode {
         MutationMode::Add => list.push(entry),
@@ -5065,6 +5103,8 @@ module bad-use {
             source_module: String::new(),
             source_revision: None,
             non_local: false,
+            explicit_deps: vec![],
+            override_auto_deps: false,
         });
 
         sort_augments_by_source(&mut augments);
