@@ -718,8 +718,8 @@ fn inline_augment_into(
             SchemaNodeKind::Container { children: c, .. }
             | SchemaNodeKind::List { children: c, .. }
             | SchemaNodeKind::Case { children: c }
-            | SchemaNodeKind::Notification { children: c, .. } => c.extend(nodes),
-            SchemaNodeKind::Choice { cases, .. } => cases.extend(nodes),
+            | SchemaNodeKind::Notification { children: c, .. } => Arc::make_mut(c).extend(nodes),
+            SchemaNodeKind::Choice { cases, .. } => Arc::make_mut(cases).extend(nodes),
             _ => {}
         }
     }
@@ -953,7 +953,7 @@ fn compile_schema_node(
     let kind = match builtin_keyword(stmt)? {
         BuiltInKeyword::Container => SchemaNodeKind::Container {
             presence: opt_substmt_arg(stmt, BuiltInKeyword::Presence),
-            children: compile_schema_children(
+            children: Arc::new(compile_schema_children(
                 &stmt.substmts,
                 key,
                 source_module_name,
@@ -964,7 +964,7 @@ fn compile_schema_node(
                 local_groupings,
                 module_errors,
                 ast_ann_index,
-            ),
+            )),
             musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index, &registry.flags),
         },
         BuiltInKeyword::Leaf => SchemaNodeKind::Leaf {
@@ -994,7 +994,7 @@ fn compile_schema_node(
                 .get_substmts(BuiltInKeyword::Unique)
                 .filter_map(|unique| unique.arg.clone())
                 .collect(),
-            children: compile_schema_children(
+            children: Arc::new(compile_schema_children(
                 &stmt.substmts,
                 key,
                 source_module_name,
@@ -1005,7 +1005,7 @@ fn compile_schema_node(
                 local_groupings,
                 module_errors,
                 ast_ann_index,
-            ),
+            )),
             min_elements: opt_u64_substmt(stmt, BuiltInKeyword::MinElements, module_errors)
                 .unwrap_or(0),
             max_elements: opt_max_elements(stmt, module_errors),
@@ -1030,7 +1030,7 @@ fn compile_schema_node(
             ),
         },
         BuiltInKeyword::Case => SchemaNodeKind::Case {
-            children: compile_schema_children(
+            children: Arc::new(compile_schema_children(
                 &stmt.substmts,
                 key,
                 source_module_name,
@@ -1041,7 +1041,7 @@ fn compile_schema_node(
                 local_groupings,
                 module_errors,
                 ast_ann_index,
-            ),
+            )),
         },
         BuiltInKeyword::Rpc => SchemaNodeKind::Rpc {
             input: compile_io_block(
@@ -1097,7 +1097,7 @@ fn compile_schema_node(
             ),
         },
         BuiltInKeyword::Notification => SchemaNodeKind::Notification {
-            children: compile_schema_children(
+            children: Arc::new(compile_schema_children(
                 &stmt.substmts,
                 key,
                 source_module_name,
@@ -1108,7 +1108,7 @@ fn compile_schema_node(
                 local_groupings,
                 module_errors,
                 ast_ann_index,
-            ),
+            )),
             musts: collect_must_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, ast_ann_index, &registry.flags),
         },
         BuiltInKeyword::AnyXml => SchemaNodeKind::AnyXml {
@@ -1153,7 +1153,7 @@ fn compile_choice_cases(
     local_groupings: &IndexMap<String, Grouping>,
     module_errors: &mut Vec<YError>,
     ast_ann_index: &AstAnnotationIndex,
-) -> Vec<SchemaNode> {
+) -> Arc<Vec<SchemaNode>> {
     let mut cases = Vec::new();
 
     for sub in &stmt.substmts {
@@ -1226,7 +1226,7 @@ fn compile_choice_cases(
                     description: None,
                     reference: None,
                     extensions: Vec::new(),
-                    kind: SchemaNodeKind::Case { children },
+                    kind: SchemaNodeKind::Case { children: Arc::new(children) },
                     pmap: HashMap::new(),
                 });
             }
@@ -1234,7 +1234,7 @@ fn compile_choice_cases(
         }
     }
 
-    cases
+    Arc::new(cases)
 }
 
 fn compile_io_block(
@@ -1248,9 +1248,9 @@ fn compile_io_block(
     local_groupings: &IndexMap<String, Grouping>,
     module_errors: &mut Vec<YError>,
     ast_ann_index: &AstAnnotationIndex,
-) -> Vec<SchemaNode> {
+) -> Arc<Vec<SchemaNode>> {
     stmt.map(|io| {
-        compile_schema_children(
+        Arc::new(compile_schema_children(
             &io.substmts,
             key,
             source_module_name,
@@ -1261,7 +1261,7 @@ fn compile_io_block(
             local_groupings,
             module_errors,
             ast_ann_index,
-        )
+        ))
     })
     .unwrap_or_default()
 }
@@ -2624,15 +2624,15 @@ fn propagate_scope_groupings(
             | SchemaNodeKind::List { children, .. }
             | SchemaNodeKind::Case { children }
             | SchemaNodeKind::Notification { children, .. } => {
-                propagate_scope_groupings(children, scope);
+                propagate_scope_groupings(Arc::make_mut(children).as_mut_slice(), scope);
             }
             SchemaNodeKind::Choice { cases, .. } => {
-                propagate_scope_groupings(cases, scope);
+                propagate_scope_groupings(Arc::make_mut(cases).as_mut_slice(), scope);
             }
             SchemaNodeKind::Rpc { input, output, .. }
             | SchemaNodeKind::Action { input, output } => {
-                propagate_scope_groupings(input, scope);
-                propagate_scope_groupings(output, scope);
+                propagate_scope_groupings(Arc::make_mut(input).as_mut_slice(), scope);
+                propagate_scope_groupings(Arc::make_mut(output).as_mut_slice(), scope);
             }
             _ => {}
         }
@@ -2674,23 +2674,35 @@ fn fully_expand_nodes(
                     | SchemaNodeKind::List { children, .. }
                     | SchemaNodeKind::Case { children }
                     | SchemaNodeKind::Notification { children, .. } => {
-                        *children = fully_expand_nodes(
+                        *children = Arc::new(fully_expand_nodes(
                             children,
                             &node.module_prefix,
                             &node.module_name,
                             ctx,
-                        );
+                        ));
                     }
                     SchemaNodeKind::Choice { cases, .. } => {
-                        *cases =
-                            fully_expand_nodes(cases, &node.module_prefix, &node.module_name, ctx);
+                        *cases = Arc::new(fully_expand_nodes(
+                            cases,
+                            &node.module_prefix,
+                            &node.module_name,
+                            ctx,
+                        ));
                     }
                     SchemaNodeKind::Rpc { input, output, .. }
                     | SchemaNodeKind::Action { input, output } => {
-                        *input =
-                            fully_expand_nodes(input, &node.module_prefix, &node.module_name, ctx);
-                        *output =
-                            fully_expand_nodes(output, &node.module_prefix, &node.module_name, ctx);
+                        *input = Arc::new(fully_expand_nodes(
+                            input,
+                            &node.module_prefix,
+                            &node.module_name,
+                            ctx,
+                        ));
+                        *output = Arc::new(fully_expand_nodes(
+                            output,
+                            &node.module_prefix,
+                            &node.module_name,
+                            ctx,
+                        ));
                     }
                     SchemaNodeKind::Leaf { .. }
                     | SchemaNodeKind::LeafList { .. }
@@ -2911,10 +2923,11 @@ fn inline_local_augment_into(
             SchemaNodeKind::Container { children: c, .. }
             | SchemaNodeKind::List { children: c, .. }
             | SchemaNodeKind::Case { children: c }
-            | SchemaNodeKind::Notification { children: c, .. } => c.extend(nodes),
+            | SchemaNodeKind::Notification { children: c, .. } => Arc::make_mut(c).extend(nodes),
             SchemaNodeKind::Choice { cases, .. } => {
                 // RFC 7950 §7.9.2: non-case nodes in a choice are implicitly wrapped
                 // in a case with the same name as the node. Apply wrapping here.
+                let cases = Arc::make_mut(cases);
                 for node in nodes {
                     match &node.kind {
                         SchemaNodeKind::Case { .. } => cases.push(node),
@@ -2937,7 +2950,7 @@ fn inline_local_augment_into(
                                 description: None,
                                 reference: None,
                                 extensions: Vec::new(),
-                                kind: SchemaNodeKind::Case { children: vec![node] },
+                                kind: SchemaNodeKind::Case { children: Arc::new(vec![node]) },
                                 pmap: HashMap::new(),
                             };
                             cases.push(implicit_case);
@@ -2961,17 +2974,17 @@ fn fix_module_prefix(node: &mut SchemaNode, module_name: &str, new_prefix: &str)
         | SchemaNodeKind::List { children, .. }
         | SchemaNodeKind::Notification { children, .. }
         | SchemaNodeKind::Case { children } => {
-            for child in children {
+            for child in Arc::make_mut(children) {
                 fix_module_prefix(child, module_name, new_prefix);
             }
         }
         SchemaNodeKind::Choice { cases, .. } => {
-            for case in cases {
+            for case in Arc::make_mut(cases) {
                 fix_module_prefix(case, module_name, new_prefix);
             }
         }
         SchemaNodeKind::Rpc { input, output, .. } | SchemaNodeKind::Action { input, output } => {
-            for child in input.iter_mut().chain(output.iter_mut()) {
+            for child in Arc::make_mut(input).iter_mut().chain(Arc::make_mut(output).iter_mut()) {
                 fix_module_prefix(child, module_name, new_prefix);
             }
         }
@@ -3138,20 +3151,20 @@ fn propagate_uses_constraints(
         | SchemaNodeKind::List { children, .. }
         | SchemaNodeKind::Case { children }
         | SchemaNodeKind::Notification { children, .. } => {
-            for child in children {
+            for child in Arc::make_mut(children) {
                 propagate_uses_constraints(child, &[], inherited_if_features);
             }
         }
         SchemaNodeKind::Choice { cases, .. } => {
-            for case in cases {
+            for case in Arc::make_mut(cases) {
                 propagate_uses_constraints(case, &[], inherited_if_features);
             }
         }
         SchemaNodeKind::Rpc { input, output, .. } | SchemaNodeKind::Action { input, output } => {
-            for child in input {
+            for child in Arc::make_mut(input) {
                 propagate_uses_constraints(child, &[], inherited_if_features);
             }
-            for child in output {
+            for child in Arc::make_mut(output) {
                 propagate_uses_constraints(child, &[], inherited_if_features);
             }
         }
@@ -3174,20 +3187,20 @@ fn apply_augment_status(node: &mut SchemaNode, aug_status: Status) {
         | SchemaNodeKind::List { children, .. }
         | SchemaNodeKind::Case { children }
         | SchemaNodeKind::Notification { children, .. } => {
-            for child in children {
+            for child in Arc::make_mut(children) {
                 apply_augment_status(child, aug_status);
             }
         }
         SchemaNodeKind::Choice { cases, .. } => {
-            for case in cases {
+            for case in Arc::make_mut(cases) {
                 apply_augment_status(case, aug_status);
             }
         }
         SchemaNodeKind::Rpc { input, output, .. } | SchemaNodeKind::Action { input, output } => {
-            for child in input {
+            for child in Arc::make_mut(input) {
                 apply_augment_status(child, aug_status);
             }
-            for child in output {
+            for child in Arc::make_mut(output) {
                 apply_augment_status(child, aug_status);
             }
         }
@@ -3773,20 +3786,20 @@ fn find_node_mut_in_node<'a>(
         SchemaNodeKind::Container { children, .. }
         | SchemaNodeKind::List { children, .. }
         | SchemaNodeKind::Case { children }
-        | SchemaNodeKind::Notification { children, .. } => find_node_mut(children, path),
-        SchemaNodeKind::Choice { cases, .. } => find_node_mut(cases, path),
+        | SchemaNodeKind::Notification { children, .. } => find_node_mut(Arc::make_mut(children), path),
+        SchemaNodeKind::Choice { cases, .. } => find_node_mut(Arc::make_mut(cases), path),
         SchemaNodeKind::Rpc { input, output, .. } | SchemaNodeKind::Action { input, output } => {
             if head.name == "input" {
                 if tail.is_empty() {
                     None
                 } else {
-                    find_node_mut(input, tail)
+                    find_node_mut(Arc::make_mut(input), tail)
                 }
             } else if head.name == "output" {
                 if tail.is_empty() {
                     None
                 } else {
-                    find_node_mut(output, tail)
+                    find_node_mut(Arc::make_mut(output), tail)
                 }
             } else {
                 None
@@ -3818,19 +3831,19 @@ fn remove_node_at_path(nodes: &mut Vec<SchemaNode>, path: &[PathStep]) -> bool {
             SchemaNodeKind::Container { children, .. }
             | SchemaNodeKind::List { children, .. }
             | SchemaNodeKind::Case { children }
-            | SchemaNodeKind::Notification { children, .. } => remove_node_at_path(children, tail),
-            SchemaNodeKind::Choice { cases, .. } => remove_node_at_path(cases, tail),
+            | SchemaNodeKind::Notification { children, .. } => remove_node_at_path(Arc::make_mut(children), tail),
+            SchemaNodeKind::Choice { cases, .. } => remove_node_at_path(Arc::make_mut(cases), tail),
             SchemaNodeKind::Rpc { input, output, .. }
             | SchemaNodeKind::Action { input, output } => {
                 if tail[0].name == "input" {
                     if tail.len() > 1 {
-                        remove_node_at_path(input, &tail[1..])
+                        remove_node_at_path(Arc::make_mut(input), &tail[1..])
                     } else {
                         false
                     }
                 } else if tail[0].name == "output" {
                     if tail.len() > 1 {
-                        remove_node_at_path(output, &tail[1..])
+                        remove_node_at_path(Arc::make_mut(output), &tail[1..])
                     } else {
                         false
                     }

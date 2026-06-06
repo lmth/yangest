@@ -313,7 +313,7 @@ impl SchemaNode {
 pub enum SchemaNodeKind {
     Container {
         presence: Option<String>,
-        children: Vec<SchemaNode>,
+        children: Arc<Vec<SchemaNode>>,
         musts: Vec<MustExpr>,
     },
     Leaf {
@@ -335,7 +335,7 @@ pub enum SchemaNodeKind {
     List {
         key: Vec<String>,
         unique: Vec<String>,
-        children: Vec<SchemaNode>,
+        children: Arc<Vec<SchemaNode>>,
         min_elements: u64,
         max_elements: Option<u64>,
         ordered_by: OrderedBy,
@@ -344,22 +344,22 @@ pub enum SchemaNodeKind {
     Choice {
         default: Option<String>,
         mandatory: bool,
-        cases: Vec<SchemaNode>,
+        cases: Arc<Vec<SchemaNode>>,
     },
     Case {
-        children: Vec<SchemaNode>,
+        children: Arc<Vec<SchemaNode>>,
     },
     Rpc {
-        input: Vec<SchemaNode>,
-        output: Vec<SchemaNode>,
+        input: Arc<Vec<SchemaNode>>,
+        output: Arc<Vec<SchemaNode>>,
         musts: Vec<MustExpr>,
     },
     Action {
-        input: Vec<SchemaNode>,
-        output: Vec<SchemaNode>,
+        input: Arc<Vec<SchemaNode>>,
+        output: Arc<Vec<SchemaNode>>,
     },
     Notification {
-        children: Vec<SchemaNode>,
+        children: Arc<Vec<SchemaNode>>,
         musts: Vec<MustExpr>,
     },
     AnyXml {

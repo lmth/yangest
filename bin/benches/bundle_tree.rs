@@ -28,18 +28,19 @@
 //!                      with a shared expand cache (exactly as `main.rs`) and run
 //!                      the tree plugin's `emit_module` for every module.
 //!
-//! BASELINE — 2026-06-06, 20-core host, Cisco IOS-XE bundle (~1071 .yang):
-//!   compile_only : ~2.5 s
-//!   tree_emit    : ~7.8 s   (criterion, cold shared cache each iter, all modules)
-//!   peak alloc   : ~1.45 GiB (--features bench-alloc)
-//! Cross-check via the real binary (authoritative, parse+compile+emit+write):
-//!   validate-only (-e, no emit) : ~0.46 s / 0.74 GB   ← parse+compile is cheap
-//!   full tree build, j=20       : ~3.0 s  / 2.08 GB
-//!   emit scaling (full build)   : j1 4.65s · j2 3.35s · j4 3.04s · j8..j20 ~2.96s
-//! Emit dominates and PLATEAUS at ~j4 / ~2.5 effective cores: the shared
-//! `Arc<RwLock<HashMap>>` expand cache is a central serialization point. The
-//! Arc-shared-children change cuts per-clone cost/memory but NOT this lock — so
-//! the parallel-scaling fix is a sharded/concurrent cache, not Arc children.
+//! BASELINE — 2026-06-06, 20-core host, Cisco IOS-XE bundle (~1003–1071 .yang).
+//! Cross-check via the real binary (authoritative, parse+compile+emit+write),
+//! full tree build at j=20, showing the two landed optimizations stacking:
+//!   glibc malloc, Vec children      : 2.94 s / 2.09 GB   (original)
+//!   + mimalloc global allocator     : 1.34 s / 1.81 GB
+//!   + Arc-shared SchemaNode children: 0.67 s / 0.92 GB   ← current (4.4× / 2.3×)
+//! Why: callgrind showed ~50% of emit in libc malloc/free deep-cloning expanded
+//! SchemaNode subtrees. mimalloc cut allocator cost; Arc<Vec> children made
+//! SchemaNode::clone shallow (copy-on-write via Arc::make_mut), removing the
+//! churn at its source — halving both time and peak RSS.
+//! Residual: parallel scaling is ~1.6× (j1 1.06s → j20 0.67s) — load imbalance
+//! from one giant module (Cisco-IOS-XE-native = 58% of output), NOT lock/alloc
+//! contention. Only intra-module parallelism would lift that.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
