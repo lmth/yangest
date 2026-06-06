@@ -18,6 +18,7 @@ yangest-plugin-yin = { path = "../plugins/yin" }
 yangest-plugin-swagger = { path = "../plugins/swagger" }
 clap = { version = "4.6.1", features = ["derive"] }
 inventory = "0.3"
+mimalloc = "0.1"
 rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

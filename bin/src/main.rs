@@ -8,6 +8,13 @@ use std::sync::{Arc, RwLock};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use rayon::prelude::*;
 
+// Heavy-bundle builds are allocation-bound: tree emit spends ~50% of its time in
+// the system allocator deep-cloning expanded `SchemaNode` subtrees. mimalloc cuts
+// that ~2.2× on the Cisco IOS-XE bundle (2.94 s → 1.34 s wall, lower peak RSS) over
+// glibc malloc, with no code changes elsewhere. See docs / bundle_tree baseline.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use yangest_core::annindex::AnnotationIndex;
 use yangest_core::astannindex::AstAnnotationIndex;
 use yangest_core::ast::{self, ModuleKey};
