@@ -22,6 +22,67 @@ order-sensitive) backend.
 
 ---
 
+## STATUS (2026-06-06): retired from core's critical path — read this first
+
+The `SchemaWalker` and the encounter-order machinery described below are
+**frozen and quarantined as an experimental, downstream-plugin concern.** They
+are no longer extended, and byte-faithful emission is **not** a core goal. This
+section records why; the rest of the document is preserved as the design of a
+capability that may be revived *downstream*, but should not drive core decisions.
+
+**Why this was retired:**
+
+1. **The byte-identity requirement was validation-convenience, not a hard
+   constraint.** No external system checksums the reference compiler's exact
+   output bytes. Byte-diffing against the reference was simply the easiest way
+   the (external, downstream) byte-faithful plugin author gained confidence the
+   port was correct. **Normalized/semantic equivalence** — canonicalising the
+   semantically-unordered sets (notably `ns_to_prefix_maps`) before comparing —
+   satisfies that need without reproducing encounter order. That is now the
+   intended validation path.
+
+2. **The apparatus has zero in-tree consumers.** `SchemaWalker` /
+   `TypeResolutionObserver` are referenced only by the walker module itself, its
+   tests, and `bin/benches/walker_probe.rs`. The ordering-witness fields
+   (`status_before_ext_meta`, `units_before_status`, `uses_grouping_statuses`)
+   were written by the compiler but read by no emitter, and have been removed.
+   None of the in-tree plugins (tree / yang / yang-expanded / yin / depend /
+   swagger) use any of it.
+
+3. **Byte-identity is the load that made the lazy model expensive — the
+   §1↔§11 trade-off.** yangest's whole thesis is that a small per-module memory
+   footprint lets it hold many modules resident and compile the dependency DAG
+   in *parallel waves* (low memory ⟹ parallelism ⟹ speed). The lazy grouping
+   model (`uses` stored as a reference, refine/deviate/annotation applied as
+   overlays) is what keeps the footprint small. **Byte-identity (§1) requires a
+   whole-tree, encounter-order traversal of the expanded forest; on a lazily
+   expanded tree that means re-expanding via `SchemaNode::clone`, which is
+   O(subtree)** — so the walk deep-clones shared groupings per descent
+   (~440 s / 3.5 GB on a ~1071-module bundle; >10 GB and non-terminating once
+   `uses`-body augments are expanded, see §11). The encounter-order requirement
+   and the lazy model are in direct tension, and the walker is the seam where
+   they grind. Retiring the requirement dissolves the tension and restores the
+   memory/speed thesis. The reference compiler gets the order "for free" only
+   because it expands eagerly and collects data as a side effect of one in-order
+   build — a trade yangest deliberately does not make.
+
+**Framing correction (the order is deterministic, not OTP-random).** Earlier
+discussion described the reference order as "undefined but predictable for a
+given OTP/Erlang version," implying runtime hash randomness. The evidence says
+otherwise: the reference orders insertions **by source position** (see the
+`AugmentEntry` doc-comment in `core/src/compiler/types.rs`). The order is
+*deterministic but process-dependent* — the interleaving of visit pattern,
+augment splicing, and typedef-chain walking. The three failed derivation
+attempts (§1: alphabetical / reverse / DFS) failed because none of them sorted
+by the source `Pos` the data model already carries. So if a hard byte-identity
+need is ever revived **downstream**, prefer reconstructing the order by *sorting
+carried source positions* over reviving the expensive live walk — it preserves
+the fast lazy model. (Caveat: position-sort reconstructs node-visit order but
+may not capture intra-node type-resolution order, e.g. innermost-base-type-chain
+first; probe before betting on it.)
+
+---
+
 ## Table of Contents
 
 1. [Motivation](#1-motivation)
@@ -632,8 +693,16 @@ Two amplification factors compound:
 A targeted "fast-path-clone unless aug.nodes contains a Uses"
 optimisation was tried but did not help materially.
 
-**Status: open follow-up; three candidate paths, ranked by
-perceived robustness:**
+**Status (2026-06-06): RETIRED / won't-fix in core.** This follow-up only
+matters for byte-faithful encounter-order emission, which has been retired from
+core (see the STATUS banner at the top of this document). It is not pursued. The
+candidate paths below are preserved only for a possible *downstream* revival; do
+not invest core effort here. The diagnosis remains accurate and is the reason
+the requirement was dropped rather than chased: the real cost is the O(subtree)
+`SchemaNode::clone` in the cursor's per-descent `current_children`, which the
+byte-identity walk hits hardest.
+
+*(Historical) three candidate paths, ranked by perceived robustness:*
 
 1. **Cache expanded augment bodies once per
    `(AugmentEntry, ExpansionCtx)`** via a new per-`ExpansionCtx`

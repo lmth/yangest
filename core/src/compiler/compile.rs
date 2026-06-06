@@ -29,14 +29,6 @@ struct NodeCommon {
     description: Option<String>,
     reference: Option<String>,
     extensions: Vec<ExtensionInstance>,
-    /// True if the `status` statement appears in the substmts before the first
-    /// True if the `status` statement appears before certain vendor-specific meta
-    /// extensions in declaration order. Used by emit plugins for output ordering.
-    status_before_ext_meta: bool,
-    /// True if the `status` statement appears in the substmts before the `units`
-    /// statement. Emit plugins that reverse declaration order (last-declared
-    /// first) use this so that, when status precedes units, units ends up first.
-    units_before_status: bool,
 }
 
 struct IfFeatureParser<'a> {
@@ -830,70 +822,6 @@ fn compile_schema_children(
     nodes
 }
 
-/// Collect the statuses of groupings directly referenced by `uses` in a node's children:
-/// when a grouping itself contains `uses` stmts, recurse into those groupings and collect
-/// their statuses too (using the current module's local groupings for resolution).
-fn collect_uses_grouping_statuses(
-    kind: &SchemaNodeKind,
-    local_groupings: &IndexMap<String, Grouping>,
-) -> Vec<Status> {
-    let children = match kind {
-        SchemaNodeKind::Container { children, .. }
-        | SchemaNodeKind::List { children, .. }
-        | SchemaNodeKind::Case { children }
-        | SchemaNodeKind::Notification { children, .. } => children.as_slice(),
-        SchemaNodeKind::Choice { cases, .. } => cases.as_slice(),
-        SchemaNodeKind::Rpc { input, output, .. } | SchemaNodeKind::Action { input, output } => {
-            let mut statuses = Vec::new();
-            for child in input.iter().chain(output.iter()) {
-                if let SchemaNodeKind::Uses { grouping, was_unprefixed, .. } = &child.kind {
-                    if *was_unprefixed {
-                        collect_grouping_uses_statuses(grouping, local_groupings, &mut statuses);
-                    }
-                }
-            }
-            return statuses;
-        }
-        _ => return Vec::new(),
-    };
-    let mut statuses = Vec::new();
-    for child in children.iter() {
-        if let SchemaNodeKind::Uses { grouping, was_unprefixed, .. } = &child.kind {
-            if *was_unprefixed {
-                collect_grouping_uses_statuses(grouping, local_groupings, &mut statuses);
-            }
-        }
-    }
-    statuses
-}
-
-/// Recursively collect non-current statuses from a grouping and any `uses` it contains.
-/// Adds the grouping's own status (if non-current), then recurses into any prefix-less
-/// `uses` stmts within the grouping body.
-fn collect_grouping_uses_statuses(
-    grouping: &Grouping,
-    local_groupings: &IndexMap<String, Grouping>,
-    statuses: &mut Vec<Status>,
-) {
-    if grouping.status != Status::Current {
-        statuses.push(grouping.status);
-    }
-    // Recurse into the grouping's body: find nested uses stmts and collect their statuses.
-    for sub in &grouping.stmt.substmts {
-        if sub.keyword.is_builtin(BuiltInKeyword::Uses) {
-            let uses_arg = sub.arg.as_deref().unwrap_or("");
-            let (prefix, name) = split_prefixed_name(uses_arg);
-            // Only recurse into prefix-less uses (same-module groupings); skip
-            // cross-module groupings.
-            if prefix.is_none() {
-                if let Some(nested) = local_groupings.get(&name) {
-                    collect_grouping_uses_statuses(nested, local_groupings, statuses);
-                }
-            }
-        }
-    }
-}
-
 fn compile_uses_node(
     uses_stmt: &Stmt,
     key: &ModuleKey,
@@ -967,8 +895,6 @@ fn compile_uses_node(
         origin_module: key.name.clone(),
         pos: uses_stmt.pos.clone(),
         status: Status::Current,
-        status_before_ext_meta: false,
-        units_before_status: false,
         config: None,
         when: Vec::new(),
         if_features: Vec::new(),
@@ -996,7 +922,6 @@ fn compile_uses_node(
                 ),
             },
         },
-        uses_grouping_statuses: Vec::new(),
         pmap: HashMap::new(),
     })
 }
@@ -1021,7 +946,6 @@ fn compile_schema_node(
         &registry.grammar,
         module_errors,
         registry.flags.ignore_unknown_features,
-        &registry.flags.meta_extensions,
         &registry.flags,
         ast_ann_index,
     );
@@ -1207,15 +1131,12 @@ fn compile_schema_node(
         origin_module: source_module_name.to_string(),
         pos: common.pos,
         status: common.status,
-        status_before_ext_meta: common.status_before_ext_meta,
-        units_before_status: common.units_before_status,
         config: common.config,
         when: common.when,
         if_features: common.if_features,
         description: common.description,
         reference: common.reference,
         extensions: common.extensions,
-        uses_grouping_statuses: collect_uses_grouping_statuses(&kind, local_groupings),
         kind,
         pmap: HashMap::new(),
     })
@@ -1299,8 +1220,6 @@ fn compile_choice_cases(
                     origin_module: source_module_name.to_string(),
                     pos: sub.pos.clone(),
                     status: Status::Current,
-                    status_before_ext_meta: false,
-                    units_before_status: false,
                     config: None,
                     when: Vec::new(),
                     if_features: Vec::new(),
@@ -1308,7 +1227,6 @@ fn compile_choice_cases(
                     reference: None,
                     extensions: Vec::new(),
                     kind: SchemaNodeKind::Case { children },
-                    uses_grouping_statuses: Vec::new(),
                     pmap: HashMap::new(),
                 });
             }
@@ -1356,7 +1274,6 @@ fn compile_node_common(
     grammar: &GrammarRegistry,
     module_errors: &mut Vec<YError>,
     ignore_unknown: bool,
-    meta_extensions: &[(String, String)],
     flags: &CompilationFlags,
     ast_ann_index: &AstAnnotationIndex,
 ) -> NodeCommon {
@@ -1379,88 +1296,8 @@ fn compile_node_common(
         description: opt_substmt_arg(stmt, BuiltInKeyword::Description),
         reference: opt_substmt_arg(stmt, BuiltInKeyword::Reference),
         extensions,
-        status_before_ext_meta: compute_status_before_ext_meta(stmt, own_prefix, prefix_map, meta_extensions),
-        units_before_status: compute_units_before_status(stmt),
     }
 }
-
-/// Return `true` if the `status` statement appears in `stmt`'s substmts before the first
-/// occurrence of any extension listed in `meta_extensions`. Emit plugins use this to
-/// determine output ordering when a prepend-based strategy is employed.
-fn compute_status_before_ext_meta(
-    stmt: &Stmt,
-    own_prefix: &str,
-    prefix_map: &PrefixMap,
-    meta_extensions: &[(String, String)],
-) -> bool {
-    if meta_extensions.is_empty() {
-        return false;
-    }
-    let mut status_idx: Option<usize> = None;
-    let mut first_meta_idx: Option<usize> = None;
-    for (i, sub) in stmt.substmts.iter().enumerate() {
-        match &sub.keyword {
-            Keyword::BuiltIn(BuiltInKeyword::Status) => {
-                if status_idx.is_none() {
-                    status_idx = Some(i);
-                }
-            }
-            Keyword::ExtensionPrefixed { prefix, name } => {
-                let mod_name = if prefix == own_prefix {
-                    prefix.as_str()
-                } else {
-                    prefix_map.get(prefix.as_str()).map(|s| s.as_str()).unwrap_or(prefix.as_str())
-                };
-                if meta_extensions.iter().any(|(m, n)| m == mod_name && n == name)
-                    && first_meta_idx.is_none()
-                {
-                    first_meta_idx = Some(i);
-                }
-            }
-            Keyword::Extension { module, name } => {
-                if meta_extensions.iter().any(|(m, n)| m == module && n == name)
-                    && first_meta_idx.is_none()
-                {
-                    first_meta_idx = Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    match (status_idx, first_meta_idx) {
-        (Some(s), Some(m)) => s < m,
-        _ => false,
-    }
-}
-
-/// Returns true if the `status` statement is declared before the `units` statement
-/// in `stmt`'s substmts.  Emit plugins that reverse declaration order (last-declared
-/// items first) use this: when status is declared before units, units ends up first
-/// in the output.
-fn compute_units_before_status(stmt: &Stmt) -> bool {
-    let mut status_idx: Option<usize> = None;
-    let mut units_idx: Option<usize> = None;
-    for (i, sub) in stmt.substmts.iter().enumerate() {
-        match &sub.keyword {
-            Keyword::BuiltIn(BuiltInKeyword::Status) => {
-                if status_idx.is_none() {
-                    status_idx = Some(i);
-                }
-            }
-            Keyword::BuiltIn(BuiltInKeyword::Units) => {
-                if units_idx.is_none() {
-                    units_idx = Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    match (status_idx, units_idx) {
-        (Some(s), Some(u)) => s < u, // status declared first → units first in reversed output
-        _ => false, // no status or no units → ordering doesn't matter
-    }
-}
-
 
 ///
 /// Each sub-statement whose keyword is an extension (prefixed or resolved) is resolved to its
@@ -3094,8 +2931,6 @@ fn inline_local_augment_into(
                                 origin_module: case_origin,
                                 pos: case_pos,
                                 status: Status::Current,
-                                status_before_ext_meta: false,
-                                units_before_status: false,
                                 config: None,
                                 when: Vec::new(),
                                 if_features: Vec::new(),
@@ -3103,7 +2938,6 @@ fn inline_local_augment_into(
                                 reference: None,
                                 extensions: Vec::new(),
                                 kind: SchemaNodeKind::Case { children: vec![node] },
-                                uses_grouping_statuses: Vec::new(),
                                 pmap: HashMap::new(),
                             };
                             cases.push(implicit_case);

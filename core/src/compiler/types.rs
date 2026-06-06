@@ -48,11 +48,6 @@ pub struct CompilationFlags {
     /// Format: `(module_name, extension_name)`.
     /// When present, its argument is stored in [`Typedef::opaque_type_name`].
     pub opaque_type_extension: Option<(String, String)>,
-    /// Extensions that count as "metadata" for source-ordering computations.
-    /// [`SchemaNode::status_before_ext_meta`] is `true` when `status` appears
-    /// before the first instance of any of these extensions in the YANG source.
-    /// Format: `[(module_name, extension_name), ...]`.
-    pub meta_extensions: Vec<(String, String)>,
     /// Extension that declares an explicit dependency path inside a `must` or
     /// `when` statement. When set, the argument of each occurrence is collected
     /// into [`MustExpr::explicit_deps`] / [`WhenExpr::explicit_deps`].
@@ -226,14 +221,6 @@ pub struct SchemaNode {
     pub origin_module: String,
     pub pos: Pos,
     pub status: Status,
-    /// True if the `status` statement is declared before the first plugin-defined
-    /// metadata extension in the YANG source.  Used by emit plugins that need to
-    /// reproduce source-order-dependent output ordering.
-    /// See [`CompilationFlags::meta_extensions`] for the configured extension list.
-    pub status_before_ext_meta: bool,
-    /// True if the `status` statement is declared before `units` in the YANG source.
-    /// Emit plugins use this to reproduce source-order-dependent output ordering.
-    pub units_before_status: bool,
     pub config: Option<bool>,
     pub when: Vec<WhenExpr>,
     pub if_features: Vec<IfFeatureExpr>,
@@ -242,10 +229,6 @@ pub struct SchemaNode {
     /// Extension statements applied to this node, in declaration order.
     pub extensions: Vec<ExtensionInstance>,
     pub kind: SchemaNodeKind,
-    /// Statuses of groupings directly referenced by `uses` in this node's YANG substmts,
-    /// captured at compile time before expansion replaces children.
-    /// Used by emit plugins that need grouping-status information for output ordering.
-    pub uses_grouping_statuses: Vec<Status>,
     pub pmap: PMap,
 }
 
@@ -258,8 +241,6 @@ impl std::fmt::Debug for SchemaNode {
             .field("origin_module", &self.origin_module)
             .field("pos", &self.pos)
             .field("status", &self.status)
-            .field("status_before_ext_meta", &self.status_before_ext_meta)
-            .field("units_before_status", &self.units_before_status)
             .field("config", &self.config)
             .field("when", &self.when)
             .field("if_features", &self.if_features)
@@ -280,8 +261,6 @@ impl Clone for SchemaNode {
             origin_module: self.origin_module.clone(),
             pos: self.pos.clone(),
             status: self.status,
-            status_before_ext_meta: self.status_before_ext_meta,
-            units_before_status: self.units_before_status,
             config: self.config,
             when: self.when.clone(),
             if_features: self.if_features.clone(),
@@ -289,7 +268,6 @@ impl Clone for SchemaNode {
             reference: self.reference.clone(),
             extensions: self.extensions.clone(),
             kind: self.kind.clone(),
-            uses_grouping_statuses: self.uses_grouping_statuses.clone(),
             pmap: HashMap::new(), // pmap holds renderer-private data; not cloned
         }
     }
