@@ -307,18 +307,37 @@ and get the exact same compiled schema regardless of their working directory.
 ## 7. Writing bundle files
 
 Bundle files are plain text and can be written by hand. For projects that would
-rather start from an existing directory tree, a planned built-in
-`yangest generate-bundle <DIR>` command will walk the tree, classify each `.yang`
-file by inspecting its statements — primary module, deviation module (contains
-top-level `deviation` statements), or annotation module (contains a plugin-declared
-overlay extension) — and emit a starter `.yangbundle` for you to review and refine.
+rather start from an existing directory tree, the built-in `generate-bundle`
+subcommand scaffolds one for you:
+
+```
+yangest generate-bundle <DIR>... [-p <DEP_DIR>]... [-o project.yangbundle]
+```
+
+It walks the tree(s) recursively and classifies each `.yang` file by inspecting
+its statements:
+
+- a plain `module` → `modules` (a primary, emitted module);
+- a module with top-level `deviation` statements → `deviation_modules`;
+- a module using a plugin-declared overlay/annotation extension → `annotation_modules`;
+- a `submodule` → not listed; its directory is added to `search_paths` so
+  `include` resolves;
+- each `-p <DEP_DIR>` → carried over verbatim into `search_paths` as a
+  dependency-only path.
+
+Paths are written relative to the output file's directory (`-o`), or to the
+current directory when writing to stdout.
 
 Because some distinctions cannot be made from a file's contents alone — most
 notably *primary target* versus *dependency-only* module — the generated bundle is
-a **scaffold to edit**, not a final answer. Generation is a built-in command rather
-than an output plugin: it runs *before* compilation, on raw parsed files (which may
-not yet form a compilable set), whereas output plugins operate on the already
-`CompiledModule`-level schema. (A separate, simpler capability — serialising the
-*resolved* inputs of a successful compile back into a `.yangbundle` — could instead
-be offered as a normal post-compile facility, since by then classification is
-already known.)
+a **scaffold to edit**, not a final answer; everything in the scanned tree is
+treated as primary, and pure dependencies are expected to come from `-p`
+directories. Modules that carry *both* their own data and `deviation` statements
+are classified as deviation modules but flagged with a `# note:` comment for review.
+
+Generation is a built-in subcommand rather than an output plugin: it runs *before*
+compilation, on raw parsed files (which may not yet form a compilable set), whereas
+output plugins operate on the already `CompiledModule`-level schema. (A separate,
+simpler capability — serialising the *resolved* inputs of a successful compile back
+into a `.yangbundle` — could instead be offered as a normal post-compile facility,
+since by then classification is already known.)

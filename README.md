@@ -202,6 +202,35 @@ reference and a full walkthrough of the tree plugin.
 See [docs/bundle-file-format.md](docs/bundle-file-format.md) for the complete
 `.yangbundle` file format reference.
 
+Each path in a bundle (and the corresponding `-p` / `--deviation-module` /
+`--annotation-module` flags) may name a directory; yangest includes the `.yang`
+files directly inside it (one level, non-recursive). A file's *role* is set by
+which key/flag lists it, not by its contents, so keep primary, deviation, and
+annotation modules in separate directories.
+
+### Generating a bundle from a directory tree
+
+```
+yangest generate-bundle <DIR>... [-p <DEP_DIR>]... [-o project.yangbundle]
+```
+
+`generate-bundle` walks the given directory tree(s), classifies each `.yang` file
+by inspecting its statements, and writes a starter `.yangbundle` (to stdout, or to
+`-o FILE`):
+
+- every plain `module` becomes a **primary** (emitted) module;
+- a module with top-level `deviation` statements goes to `deviation_modules`;
+- a module using a plugin-declared annotation extension goes to `annotation_modules`;
+- `submodule` files are not listed; their directories are added to `search_paths`
+  so `include` resolves;
+- directories passed with `-p` are carried over verbatim into `search_paths` as
+  dependency-only paths.
+
+The one distinction that cannot be made from a file's contents — *primary target*
+vs. *dependency-only* — is resolved by convention: everything in the scanned tree
+is treated as primary, and pure dependencies belong in `-p` directories. The
+result is a scaffold to review and refine, not a final answer.
+
 ---
 
 ## Architecture

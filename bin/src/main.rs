@@ -24,6 +24,7 @@ use yangest_core::devindex::DeviationIndex;
 use yangest_core::plugin::{AstOverlayDescriptor, EmitState, OverlayExtension, Plugin, PluginRegistration};
 
 mod bundle;
+mod generate_bundle;
 
 include!(concat!(env!("OUT_DIR"), "/plugin_externs.rs"));
 
@@ -34,7 +35,8 @@ include!(concat!(env!("OUT_DIR"), "/plugin_externs.rs"));
 #[command(
     name = "yangest",
     version,
-    about = "Parallel YANG schema validator and converter"
+    about = "Parallel YANG schema validator and converter",
+    after_help = "Subcommands:\n  generate-bundle <DIR>...  Scaffold a .yangbundle from a directory tree\n                            (run `yangest generate-bundle --help` for options)"
 )]
 struct Cli {
     /// Output format (tree, depend, yang, yin, swagger)
@@ -108,6 +110,12 @@ struct Cli {
 }
 
 fn main() {
+    // Subcommand dispatch happens before the (dynamically built) compile CLI is
+    // parsed, so it does not interfere with positional FILE / plugin args.
+    if std::env::args().nth(1).as_deref() == Some("generate-bundle") {
+        generate_bundle::run();
+    }
+
     // Collect all plugins registered via inventory::submit! in plugin crates.
     // Sorted by name for consistent --help output and format lookup.
     let mut plugins: Vec<Box<dyn Plugin>> = inventory::iter::<PluginRegistration>
