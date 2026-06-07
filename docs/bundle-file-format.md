@@ -82,6 +82,18 @@ yangest --bundle project.yangbundle --errors-only
 
 Bundle files are valid TOML.  All keys are optional except `modules`.
 
+> **Files or directories.** Every entry in the four path-list keys — `modules`,
+> `search_paths`, `deviation_modules`, and `annotation_modules` — may name either
+> a single `.yang` file **or a directory**. A directory entry contributes every
+> `.yang` file located *directly inside* it; the scan is **not** recursive, so
+> nested subdirectories are not descended (list each subdirectory explicitly, or
+> the parent of a flat layout). The same applies to the equivalent command-line
+> arguments (positional `FILE`, `-p`, `--deviation-module`, `--annotation-module`).
+> Note that a directory only sets *where* files are found and *what role* they play
+> (by which key/flag lists it) — yangest does not infer a file's role from its
+> contents, so primary modules, deviation modules, and annotation modules must be
+> kept in separate directories (or listed separately) to be classified correctly.
+
 ### `modules` (required)
 
 ```toml
@@ -194,7 +206,10 @@ This makes bundles portable: the same bundle file works correctly regardless of
 where you invoke yangest from, as long as the YANG files are in the expected
 locations relative to the bundle itself.
 
-Absolute paths are used as-is.
+Absolute paths are used as-is.  Directory entries (see the note in
+[File format reference](#3-file-format-reference)) resolve the same way — a
+relative directory is taken relative to the bundle file's directory, then scanned
+for `.yang` files.
 
 ```toml
 # If the bundle is at /project/bundles/mydevice.yangbundle, these resolve to:
@@ -291,7 +306,19 @@ and get the exact same compiled schema regardless of their working directory.
 
 ## 7. Writing bundle files
 
-Bundle files are plain text and can be written by hand. For projects that need
-to generate or modify them programmatically, a future `bundle` output plugin will
-be able to read the current compilation inputs and write them back out as a
-`.yangbundle` file.
+Bundle files are plain text and can be written by hand. For projects that would
+rather start from an existing directory tree, a planned built-in
+`yangest generate-bundle <DIR>` command will walk the tree, classify each `.yang`
+file by inspecting its statements — primary module, deviation module (contains
+top-level `deviation` statements), or annotation module (contains a plugin-declared
+overlay extension) — and emit a starter `.yangbundle` for you to review and refine.
+
+Because some distinctions cannot be made from a file's contents alone — most
+notably *primary target* versus *dependency-only* module — the generated bundle is
+a **scaffold to edit**, not a final answer. Generation is a built-in command rather
+than an output plugin: it runs *before* compilation, on raw parsed files (which may
+not yet form a compilable set), whereas output plugins operate on the already
+`CompiledModule`-level schema. (A separate, simpler capability — serialising the
+*resolved* inputs of a successful compile back into a `.yangbundle` — could instead
+be offered as a normal post-compile facility, since by then classification is
+already known.)
