@@ -609,7 +609,21 @@ impl ModuleRegistry {
     }
 
     pub fn insert(&mut self, module: Arc<CompiledModule>) {
-        self.name_index.insert(module.key.name.clone(), Arc::clone(&module));
+        // The name-only index must point at the *latest* revision so that a
+        // revision-less `resolve_import` / `include` resolves to it (RFC 7950
+        // §5.1.1), regardless of compile/insert order.
+        let is_latest = match self.name_index.get(&module.key.name) {
+            Some(existing) => {
+                crate::ast::ModuleKey::revision_cmp(
+                    module.key.revision.as_deref(),
+                    existing.key.revision.as_deref(),
+                ) != std::cmp::Ordering::Less
+            }
+            None => true,
+        };
+        if is_latest {
+            self.name_index.insert(module.key.name.clone(), Arc::clone(&module));
+        }
         self.modules.insert(module.key.clone(), module);
     }
 

@@ -63,11 +63,14 @@ impl DepGraph {
     pub fn topo_sort(&self) -> Result<Vec<ModuleKey>, Vec<ModuleKey>> {
         let present: HashSet<&ModuleKey> = self.nodes.keys().collect();
 
-        // Name-only index: module name → best (highest revision) key present.
+        // Name-only index: module name → highest-revision key present, so a
+        // revision-less import/include resolves to the latest (RFC 7950 §5.1.1).
         let mut name_to_key: HashMap<&str, &ModuleKey> = HashMap::new();
         for key in present.iter() {
             let entry = name_to_key.entry(key.name.as_str()).or_insert(*key);
-            if entry.revision.is_none() && key.revision.is_some() {
+            if ModuleKey::revision_cmp(entry.revision.as_deref(), key.revision.as_deref())
+                == std::cmp::Ordering::Less
+            {
                 *entry = *key;
             }
         }
@@ -110,7 +113,9 @@ impl DepGraph {
         let mut name_to_key: HashMap<&str, &ModuleKey> = HashMap::new();
         for key in present.iter() {
             let entry = name_to_key.entry(key.name.as_str()).or_insert(*key);
-            if entry.revision.is_none() && key.revision.is_some() {
+            if ModuleKey::revision_cmp(entry.revision.as_deref(), key.revision.as_deref())
+                == std::cmp::Ordering::Less
+            {
                 *entry = *key;
             }
         }
@@ -255,6 +260,10 @@ mod tests {
     use std::sync::Arc;
 
     fn make_module(name: &str, imports: &[&str]) -> (ModuleKey, Stmt) {
+        make_module_rev(name, None, imports)
+    }
+
+    fn make_module_rev(name: &str, rev: Option<&str>, imports: &[&str]) -> (ModuleKey, Stmt) {
         let file = Arc::from("test.yang");
         let pos = crate::ast::Pos::new(Arc::clone(&file), 1);
         let subs: Vec<Stmt> = imports
@@ -281,7 +290,44 @@ mod tests {
             pos,
             subs,
         );
-        (ModuleKey::latest(name), stmt)
+        (ModuleKey::new(name, rev), stmt)
+    }
+
+    /// A revision-less `import` must resolve to the *latest* available revision
+    /// (RFC 7950 §5.1.1), not an arbitrary one. `foo@2026-06-07` depends on
+    /// `baz` while `foo@2024-01-01` does not, so an importer that resolves to the
+    /// latest lands a wave later than one that resolves to the old revision.
+    #[test]
+    fn revisionless_import_resolves_to_latest() {
+        let modules = vec![
+            make_module_rev("bar", None, &["foo"]),
+            make_module_rev("foo", Some("2024-01-01"), &[]),
+            make_module_rev("foo", Some("2026-06-07"), &["baz"]),
+            make_module_rev("baz", Some("2026-01-01"), &[]),
+        ];
+        let mut errors = vec![];
+        let graph = DepGraph::build(&modules, &mut errors);
+        let waves = graph.topo_sort_levels().expect("no cycle");
+        let wave_of = |name: &str| -> usize {
+            waves.iter().position(|w| w.iter().any(|k| k.name == name)).unwrap()
+        };
+        let foo_new = waves
+            .iter()
+            .position(|w| w.iter().any(|k| k.name == "foo" && k.revision.as_deref() == Some("2026-06-07")))
+            .unwrap();
+        // bar -> foo(latest=2026-06-07) -> baz, so bar is two waves after baz and
+        // strictly after the latest foo. If it had resolved to foo@2024-01-01
+        // (no deps), bar would sit in wave 1 instead.
+        assert!(wave_of("bar") > foo_new, "bar must follow the latest foo revision");
+        assert!(wave_of("bar") >= 2, "bar resolved to latest foo (which depends on baz)");
+    }
+
+    #[test]
+    fn revision_cmp_orders_none_oldest_then_chronological() {
+        use std::cmp::Ordering::{Greater, Less};
+        assert_eq!(ModuleKey::revision_cmp(None, Some("2020-01-01")), Less);
+        assert_eq!(ModuleKey::revision_cmp(Some("2026-06-07"), None), Greater);
+        assert_eq!(ModuleKey::revision_cmp(Some("2024-01-01"), Some("2026-06-07")), Less);
     }
 
     #[test]

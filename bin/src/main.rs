@@ -312,12 +312,36 @@ fn main() {
     }
     modules.retain(|(k, _)| reachable.contains(k.name.as_str()));
 
-    // Deduplicate modules by name.  A module can appear twice when it is
-    // listed as an explicit annotation/deviation file AND also found by the
-    // search-path directory scan.  Keep the first (higher-priority) entry.
+    // Deduplicate modules by exact (name, revision).  The same file can appear
+    // twice when it is listed explicitly AND also found by the search-path scan;
+    // keep the first (higher-priority) entry.  Distinct *revisions* of the same
+    // module are all kept, so a revision-dated import resolves to the exact one
+    // and a revision-less import/include resolves to the latest (RFC 7950 §5.1.1).
     {
-        let mut seen: HashSet<String> = HashSet::new();
-        modules.retain(|(k, _)| seen.insert(k.name.clone()));
+        let mut seen: HashSet<ModuleKey> = HashSet::new();
+        modules.retain(|(k, _)| seen.insert(k.clone()));
+    }
+
+    // Emit at most one revision per module name — the latest. A directory may
+    // hold several revisions of the same module; older ones still compile (so
+    // revision-dated imports resolve) but are not emitted as separate output.
+    {
+        let mut latest: HashMap<&str, &ModuleKey> = HashMap::new();
+        for k in &file_order {
+            latest
+                .entry(k.name.as_str())
+                .and_modify(|cur| {
+                    if ModuleKey::revision_cmp(cur.revision.as_deref(), k.revision.as_deref())
+                        == std::cmp::Ordering::Less
+                    {
+                        *cur = k;
+                    }
+                })
+                .or_insert(k);
+        }
+        let keep: HashSet<ModuleKey> = latest.values().map(|k| (*k).clone()).collect();
+        let mut emitted: HashSet<String> = HashSet::new();
+        file_order.retain(|k| keep.contains(k) && emitted.insert(k.name.clone()));
     }
 
     let dep_graph = DepGraph::build(&modules, &mut all_parse_errors);

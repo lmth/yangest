@@ -1,0 +1,7 @@
+submodule sub {
+  belongs-to parent { prefix p; }
+  revision 2026-06-07;
+  grouping g {
+    leaf new_leaf { type string; }
+  }
+}

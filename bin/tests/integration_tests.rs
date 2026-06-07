@@ -860,3 +860,48 @@ fn generate_bundle_classifies_by_role() {
         "deviation module must not be listed as primary\n{stdout}"
     );
 }
+
+// ── revision resolution (RFC 7950 §5.1.1) ────────────────────────────────────
+
+/// A revision-less `include` must resolve to the latest submodule revision. The
+/// `revisions/` fixture has `sub@2024-01-01` (grouping g → old_leaf) and
+/// `sub@2026-06-07` (grouping g → new_leaf); `parent` does `include sub; uses g;`.
+#[test]
+fn include_without_revision_uses_latest_submodule() {
+    let dir = yang_dir("revisions");
+    let out = Command::new(yangest_bin())
+        .arg("-f")
+        .arg("tree")
+        .arg("-p")
+        .arg(&dir)
+        .arg(dir.join("parent.yang"))
+        .output()
+        .expect("failed to run yangest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("new_leaf"), "expected the latest submodule revision\n{stdout}");
+    assert!(!stdout.contains("old_leaf"), "must not use the old submodule revision\n{stdout}");
+}
+
+/// `generate-bundle` lists only the latest revision of a module that appears in
+/// several revisions (`thing@2024-01-01` and `thing@2026-06-07`).
+#[test]
+fn generate_bundle_lists_latest_revision() {
+    let dir = yang_dir("revisions");
+    let out = Command::new(yangest_bin())
+        .arg("generate-bundle")
+        .arg(&dir)
+        .output()
+        .expect("failed to run yangest generate-bundle");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // Consider only listed entries, not `# note:` comments (which mention the
+    // superseded revision by name).
+    let listed = |needle: &str| {
+        stdout
+            .lines()
+            .any(|l| !l.trim_start().starts_with('#') && l.contains(needle))
+    };
+    assert!(listed("thing@2026-06-07.yang"), "latest revision should be listed\n{stdout}");
+    assert!(!listed("thing@2024-01-01.yang"), "older revision must not be listed\n{stdout}");
+}

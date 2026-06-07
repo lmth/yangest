@@ -17,13 +17,13 @@
 //! is therefore resolved by convention (tree = primary, `-p` = dependency). The
 //! result is a scaffold to review, not a final answer.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
-use yangest_core::ast::{self, BuiltInKeyword, Keyword};
+use yangest_core::ast::{self, BuiltInKeyword, Keyword, ModuleKey};
 use yangest_core::plugin::{Plugin, PluginRegistration};
 
 #[derive(Parser, Debug)]
@@ -137,6 +137,32 @@ fn has_data_nodes(header: &ast::Stmt) -> bool {
     })
 }
 
+/// Insert a `name -> (revision, path)` mapping, keeping the latest revision and
+/// recording a `# note:` for whichever revision is dropped (RFC 7950 §5.1.1).
+fn insert_latest(
+    map: &mut HashMap<String, (Option<String>, PathBuf)>,
+    name: String,
+    rev: Option<String>,
+    rel: PathBuf,
+    notes: &mut Vec<String>,
+) {
+    match map.get(&name) {
+        Some((cur_rev, cur_path)) => {
+            if ModuleKey::revision_cmp(cur_rev.as_deref(), rev.as_deref())
+                == std::cmp::Ordering::Less
+            {
+                notes.push(format!("'{name}': {} supersedes {}", rel.display(), cur_path.display()));
+                map.insert(name, (rev, rel));
+            } else {
+                notes.push(format!("'{name}': {} is an older revision, not listed", rel.display()));
+            }
+        }
+        None => {
+            map.insert(name, (rev, rel));
+        }
+    }
+}
+
 fn collect_yang_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -240,9 +266,11 @@ fn generate(args: &GenBundleArgs) -> Result<String, String> {
         return Err("no .yang files found under the given directory tree".into());
     }
 
-    let mut modules = BTreeSet::new();
-    let mut deviation_modules = BTreeSet::new();
-    let mut annotation_modules = BTreeSet::new();
+    // Each bucket keeps the latest revision per module name; a directory may
+    // hold several revisions of the same module (RFC 7950 §5.2 `name@date.yang`).
+    let mut primary: HashMap<String, (Option<String>, PathBuf)> = HashMap::new();
+    let mut deviation: HashMap<String, (Option<String>, PathBuf)> = HashMap::new();
+    let mut annotation: HashMap<String, (Option<String>, PathBuf)> = HashMap::new();
     let mut search_paths = BTreeSet::new();
     let mut notes: Vec<String> = Vec::new();
     let mut skipped = 0usize;
@@ -258,11 +286,13 @@ fn generate(args: &GenBundleArgs) -> Result<String, String> {
             skipped += 1;
             continue;
         };
+        let name = header.arg.clone().unwrap_or_default();
+        let rev = header
+            .get_substmt(BuiltInKeyword::Revision)
+            .and_then(|r| r.arg.clone());
         let rel = relativize(&bundle_dir, file);
         match classify(&header, &ann_exts) {
-            Some(Role::Primary) => {
-                modules.insert(rel);
-            }
+            Some(Role::Primary) => insert_latest(&mut primary, name, rev, rel, &mut notes),
             Some(Role::Deviation) => {
                 if has_data_nodes(&header) {
                     notes.push(format!(
@@ -270,14 +300,12 @@ fn generate(args: &GenBundleArgs) -> Result<String, String> {
                         rel.display()
                     ));
                 }
-                deviation_modules.insert(rel);
+                insert_latest(&mut deviation, name, rev, rel, &mut notes);
             }
-            Some(Role::Annotation) => {
-                annotation_modules.insert(rel);
-            }
+            Some(Role::Annotation) => insert_latest(&mut annotation, name, rev, rel, &mut notes),
             Some(Role::Submodule) => {
                 // Not a primary target; ensure its directory is searchable so
-                // `include` resolution finds it.
+                // `include` resolution finds it (latest revision; RFC 7950 §5.1).
                 if let Some(parent) = file.parent() {
                     search_paths.insert(relativize(&bundle_dir, parent));
                 }
@@ -285,6 +313,10 @@ fn generate(args: &GenBundleArgs) -> Result<String, String> {
             None => skipped += 1,
         }
     }
+
+    let modules: BTreeSet<PathBuf> = primary.into_values().map(|(_, p)| p).collect();
+    let deviation_modules: BTreeSet<PathBuf> = deviation.into_values().map(|(_, p)| p).collect();
+    let annotation_modules: BTreeSet<PathBuf> = annotation.into_values().map(|(_, p)| p).collect();
 
     // Dependency directories given with -p are carried over verbatim.
     for p in &args.paths {

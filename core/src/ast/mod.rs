@@ -400,6 +400,21 @@ impl ModuleKey {
     pub fn latest(name: impl Into<String>) -> Self {
         ModuleKey { name: name.into(), revision: None }
     }
+
+    /// Order two YANG revision dates. An absent revision (`None`) sorts oldest;
+    /// present revisions compare lexically, which — for the canonical
+    /// `YYYY-MM-DD` form (RFC 7950 §7.1.9) — is chronological order. Used to
+    /// resolve a revision-less `import`/`include` to the latest available
+    /// revision (RFC 7950 §5.1.1).
+    pub fn revision_cmp(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        match (a, b) {
+            (None, None) => Equal,
+            (None, Some(_)) => Less,
+            (Some(_), None) => Greater,
+            (Some(x), Some(y)) => x.cmp(y),
+        }
+    }
 }
 
 impl fmt::Display for ModuleKey {
