@@ -93,6 +93,14 @@ Bundle files are valid TOML.  All keys are optional except `modules`.
 > (by which key/flag lists it) — yangest does not infer a file's role from its
 > contents, so primary modules, deviation modules, and annotation modules must be
 > kept in separate directories (or listed separately) to be classified correctly.
+>
+> **Multiple revisions.** A directory may hold several revisions of the same module
+> (RFC 7950 §5.2, e.g. `acme-router@2026-01-01.yang` and
+> `acme-router@2026-06-07.yang`). yangest keys modules by `(name, revision)` taken
+> from the `revision` statement *inside* the file (the filename's `@date` is not
+> parsed). A revision-less `import`/`include` resolves to the **latest** revision; a
+> `revision-date` substatement selects that exact revision (RFC 7950 §5.1.1). Output
+> is produced for at most one revision per module name — the latest.
 
 ### `modules` (required)
 
@@ -323,7 +331,9 @@ its statements:
 - a `submodule` → not listed; its directory is added to `search_paths` so
   `include` resolves;
 - each `-p <DEP_DIR>` → carried over verbatim into `search_paths` as a
-  dependency-only path.
+  dependency-only path;
+- when several revisions of the same module are present, only the **latest** is
+  listed (older ones are reported in a `# note:` comment).
 
 Paths are written relative to the output file's directory (`-o`), or to the
 current directory when writing to stdout.

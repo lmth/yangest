@@ -224,7 +224,13 @@ by inspecting its statements, and writes a starter `.yangbundle` (to stdout, or 
 - `submodule` files are not listed; their directories are added to `search_paths`
   so `include` resolves;
 - directories passed with `-p` are carried over verbatim into `search_paths` as
-  dependency-only paths.
+  dependency-only paths;
+- where several revisions of a module coexist (`name@date.yang`), only the latest
+  is listed.
+
+When a directory holds multiple revisions of a module, yangest keys them by the
+`revision` statement inside each file: a revision-less `import`/`include` resolves
+to the latest revision, a `revision-date` selects the exact one (RFC 7950 §5.1.1).
 
 The one distinction that cannot be made from a file's contents — *primary target*
 vs. *dependency-only* — is resolved by convention: everything in the scanned tree
