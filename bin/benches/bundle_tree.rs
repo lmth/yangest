@@ -18,23 +18,36 @@
 //!     cargo bench --bench bundle_tree --features bench-alloc
 //! ```
 //!
-//! Two criterion groups mirror the real pipeline in `bin/src/main.rs`:
+//! Two criterion groups mirror the real pipeline in `bin/src/main.rs`, and now
+//! run BOTH phases in parallel (rayon) exactly as `main.rs` does — parse and
+//! per-wave compile in `compile_all`, per-module emit in `emit_tree`. The
+//! earlier version was single-threaded, which hid the real bottleneck (emit
+//! does not scale past ~2.5 cores — see below).
 //!   * `compile_only` — parse every module and compile into a `ModuleRegistry`.
 //!   * `tree_emit`    — the constraint-critical path: build an `ExpansionCtx`
 //!                      with a shared expand cache (exactly as `main.rs`) and run
 //!                      the tree plugin's `emit_module` for every module.
 //!
-//! BASELINE (record after a clean run on the reference machine/fixture set;
-//! re-run after every feature phase and keep within ~±2%):
-//!   compile_only : <fill in>
-//!   tree_emit    : <fill in>
-//!   peak alloc   : <fill in>  (requires --features bench-alloc)
+//! BASELINE — 2026-06-06, 20-core host, Cisco IOS-XE bundle (~1003–1071 .yang).
+//! Cross-check via the real binary (authoritative, parse+compile+emit+write),
+//! full tree build at j=20, showing the two landed optimizations stacking:
+//!   glibc malloc, Vec children      : 2.94 s / 2.09 GB   (original)
+//!   + mimalloc global allocator     : 1.34 s / 1.81 GB
+//!   + Arc-shared SchemaNode children: 0.67 s / 0.92 GB   ← current (4.4× / 2.3×)
+//! Why: callgrind showed ~50% of emit in libc malloc/free deep-cloning expanded
+//! SchemaNode subtrees. mimalloc cut allocator cost; Arc<Vec> children made
+//! SchemaNode::clone shallow (copy-on-write via Arc::make_mut), removing the
+//! churn at its source — halving both time and peak RSS.
+//! Residual: parallel scaling is ~1.6× (j1 1.06s → j20 0.67s) — load imbalance
+//! from one giant module (Cisco-IOS-XE-native = 58% of output), NOT lock/alloc
+//! contention. Only intra-module parallelism would lift that.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use criterion::{black_box, Criterion};
+use rayon::prelude::*;
 
 use yangest_core::annindex::AnnotationIndex;
 use yangest_core::astannindex::AstAnnotationIndex;
@@ -105,21 +118,22 @@ fn collect_yang_files(dir: &PathBuf, out: &mut Vec<PathBuf>) {
 
 /// Parse all files into `(ModuleKey, Stmt)` pairs, deduplicated by module name.
 fn parse_all(files: &[PathBuf]) -> Vec<(ModuleKey, ast::Stmt)> {
-    let mut mods = Vec::new();
-    for path in files {
-        let Ok(src) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let file_arc: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
-        let (stmts, _errs) = yangest_core::parser::parse_yang(&src, Arc::clone(&file_arc));
-        if let Some(stmt) = stmts.into_iter().next() {
+    // Parse files in parallel (mirrors main.rs). `par_iter().collect()` preserves
+    // input order, so the subsequent name-dedup stays deterministic.
+    let mut mods: Vec<(ModuleKey, ast::Stmt)> = files
+        .par_iter()
+        .filter_map(|path| {
+            let src = std::fs::read_to_string(path).ok()?;
+            let file_arc: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
+            let (stmts, _errs) = yangest_core::parser::parse_yang(&src, Arc::clone(&file_arc));
+            let stmt = stmts.into_iter().next()?;
             let name = stmt.arg.clone().unwrap_or_default();
             let revision = stmt
                 .get_substmt(ast::BuiltInKeyword::Revision)
                 .and_then(|r| r.arg.clone());
-            mods.push((ModuleKey::new(name, revision), stmt));
-        }
-    }
+            Some((ModuleKey::new(name, revision), stmt))
+        })
+        .collect();
     let mut seen = HashSet::new();
     mods.retain(|(k, _)| seen.insert(k.name.clone()));
     mods
@@ -139,15 +153,20 @@ fn compile_all(modules: Vec<(ModuleKey, ast::Stmt)>) -> ModuleRegistry {
     let mut stmt_map: HashMap<ModuleKey, ast::Stmt> = modules.into_iter().collect();
     let mut reg = ModuleRegistry::new();
     for wave in waves {
-        let mut compiled_wave = Vec::new();
-        for key in wave {
-            let Some(stmt) = stmt_map.remove(&key) else {
-                continue;
-            };
-            let stmt = ast_ann_index.apply(stmt, &key.name);
-            let compiled = compile_module(&key, stmt, &reg, &dev_index, &ann_index, &ast_ann_index);
-            compiled_wave.push(compiled);
-        }
+        // Collect this wave's work, then compile its modules in parallel
+        // (mirrors main.rs: `into_par_iter` over each dependency wave, reading the
+        // registry of already-compiled lower waves through a shared `&reg`).
+        let wave_work: Vec<(ModuleKey, ast::Stmt)> = wave
+            .into_iter()
+            .filter_map(|key| stmt_map.remove(&key).map(|stmt| (key, stmt)))
+            .collect();
+        let compiled_wave: Vec<CompiledModule> = wave_work
+            .into_par_iter()
+            .map(|(key, stmt)| {
+                let stmt = ast_ann_index.apply(stmt, &key.name);
+                compile_module(&key, stmt, &reg, &dev_index, &ann_index, &ast_ann_index)
+            })
+            .collect();
         for c in compiled_wave {
             reg.insert(Arc::new(c));
         }
@@ -174,15 +193,19 @@ fn emit_tree(reg: &ModuleRegistry) -> usize {
     let bundle_ctx = make_ctx();
     let bundle = plugin.prepare_bundle(&modules, reg, &bundle_ctx);
 
-    let mut total = 0usize;
-    for module in &modules {
-        let ctx = make_ctx();
-        let mut sink: Vec<u8> = Vec::new();
-        let mut state = EmitState::new();
-        let _ = plugin.emit_module(module, reg, &ctx, &bundle, &mut state, &mut sink);
-        total += sink.len();
-    }
-    total
+    // Emit every module in parallel (mirrors main.rs: `par_iter` over modules,
+    // sharing one expand cache). This is where concurrent expansion of the same
+    // big shared groupings happens — the case the lazy model is built for.
+    modules
+        .par_iter()
+        .map(|module| {
+            let ctx = make_ctx();
+            let mut sink: Vec<u8> = Vec::new();
+            let mut state = EmitState::new();
+            let _ = plugin.emit_module(module, reg, &ctx, &bundle, &mut state, &mut sink);
+            sink.len()
+        })
+        .sum()
 }
 
 fn main() {

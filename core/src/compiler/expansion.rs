@@ -7,8 +7,8 @@ use std::sync::{Arc, RwLock};
 
 use super::compile::{expand_children, expand_children_all, expand_children_and_all, expand_children_with_secondary, find_child_in_raw};
 use super::{
-    CompiledModule, Grouping, IfFeatureExpr, ModuleRegistry, NodeOverlayMap, PathStep, SchemaNode,
-    SchemaNodeKind, SchemaPath, Status,
+    AugmentEntry, CompiledModule, Grouping, IfFeatureExpr, ModuleRegistry, NodeOverlayMap, PathStep,
+    SchemaNode, SchemaNodeKind, SchemaPath, Status,
 };
 
 #[derive(Clone)]
@@ -67,6 +67,12 @@ pub struct ExpansionCtx<'a> {
     /// the expansion cache. This prevents the Arcs from being deallocated (and their
     /// memory addresses reused), which would corrupt the pointer-based cache keys.
     cache_keepalive: RefCell<Vec<Arc<Grouping>>>,
+    /// Cache of *expanded* augment bodies, keyed by `(AugmentEntry ptr, own_prefix)`.
+    /// A `uses g;` augment body stores a single `Uses` node in `aug.nodes`; the
+    /// cursor must expand it so the grouping's leaves are visible. The
+    /// `AugmentEntry` lives in a registry-held `CompiledModule` that outlives the
+    /// ctx, so the pointer key is stable.
+    augment_cache: RefCell<HashMap<(*const AugmentEntry, String), Arc<Vec<SchemaNode>>>>,
 }
 
 impl<'a> ExpansionCtx<'a> {
@@ -86,7 +92,27 @@ impl<'a> ExpansionCtx<'a> {
             unlisted_modules_enabled: false,
             file_module_overlay: Cell::new(std::ptr::null()),
             cache_keepalive: RefCell::new(Vec::new()),
+            augment_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Return the *expanded* children contributed by an augment body, caching the
+    /// result. `own_prefix`/`module_name` are the augmenting module's.
+    pub(crate) fn expand_augment_body(
+        &self,
+        aug: &AugmentEntry,
+        own_prefix: &str,
+        module_name: &str,
+    ) -> Arc<Vec<SchemaNode>> {
+        let key = (aug as *const AugmentEntry, own_prefix.to_string());
+        if let Some(cached) = self.augment_cache.borrow().get(&key) {
+            return Arc::clone(cached);
+        }
+        let empty = NodeOverlayMap::new();
+        let expanded = expand_children(&aug.nodes, own_prefix, module_name, &empty, &[], self);
+        let arc = Arc::new(expanded);
+        self.augment_cache.borrow_mut().insert(key, Arc::clone(&arc));
+        arc
     }
 
     pub fn with_max_status(mut self, max_status: Status) -> Self {

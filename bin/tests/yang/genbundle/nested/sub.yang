@@ -1,0 +1,3 @@
+submodule sub {
+  belongs-to prim { prefix p; }
+}

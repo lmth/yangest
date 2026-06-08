@@ -82,6 +82,26 @@ yangest --bundle project.yangbundle --errors-only
 
 Bundle files are valid TOML.  All keys are optional except `modules`.
 
+> **Files or directories.** Every entry in the four path-list keys — `modules`,
+> `search_paths`, `deviation_modules`, and `annotation_modules` — may name either
+> a single `.yang` file **or a directory**. A directory entry contributes every
+> `.yang` file located *directly inside* it; the scan is **not** recursive, so
+> nested subdirectories are not descended (list each subdirectory explicitly, or
+> the parent of a flat layout). The same applies to the equivalent command-line
+> arguments (positional `FILE`, `-p`, `--deviation-module`, `--annotation-module`).
+> Note that a directory only sets *where* files are found and *what role* they play
+> (by which key/flag lists it) — yangest does not infer a file's role from its
+> contents, so primary modules, deviation modules, and annotation modules must be
+> kept in separate directories (or listed separately) to be classified correctly.
+>
+> **Multiple revisions.** A directory may hold several revisions of the same module
+> (RFC 7950 §5.2, e.g. `acme-router@2026-01-01.yang` and
+> `acme-router@2026-06-07.yang`). yangest keys modules by `(name, revision)` taken
+> from the `revision` statement *inside* the file (the filename's `@date` is not
+> parsed). A revision-less `import`/`include` resolves to the **latest** revision; a
+> `revision-date` substatement selects that exact revision (RFC 7950 §5.1.1). Output
+> is produced for at most one revision per module name — the latest.
+
 ### `modules` (required)
 
 ```toml
@@ -194,7 +214,10 @@ This makes bundles portable: the same bundle file works correctly regardless of
 where you invoke yangest from, as long as the YANG files are in the expected
 locations relative to the bundle itself.
 
-Absolute paths are used as-is.
+Absolute paths are used as-is.  Directory entries (see the note in
+[File format reference](#3-file-format-reference)) resolve the same way — a
+relative directory is taken relative to the bundle file's directory, then scanned
+for `.yang` files.
 
 ```toml
 # If the bundle is at /project/bundles/mydevice.yangbundle, these resolve to:
@@ -291,7 +314,40 @@ and get the exact same compiled schema regardless of their working directory.
 
 ## 7. Writing bundle files
 
-Bundle files are plain text and can be written by hand. For projects that need
-to generate or modify them programmatically, a future `bundle` output plugin will
-be able to read the current compilation inputs and write them back out as a
-`.yangbundle` file.
+Bundle files are plain text and can be written by hand. For projects that would
+rather start from an existing directory tree, the built-in `generate-bundle`
+subcommand scaffolds one for you:
+
+```
+yangest generate-bundle <DIR>... [-p <DEP_DIR>]... [-o project.yangbundle]
+```
+
+It walks the tree(s) recursively and classifies each `.yang` file by inspecting
+its statements:
+
+- a plain `module` → `modules` (a primary, emitted module);
+- a module with top-level `deviation` statements → `deviation_modules`;
+- a module using a plugin-declared overlay/annotation extension → `annotation_modules`;
+- a `submodule` → not listed; its directory is added to `search_paths` so
+  `include` resolves;
+- each `-p <DEP_DIR>` → carried over verbatim into `search_paths` as a
+  dependency-only path;
+- when several revisions of the same module are present, only the **latest** is
+  listed (older ones are reported in a `# note:` comment).
+
+Paths are written relative to the output file's directory (`-o`), or to the
+current directory when writing to stdout.
+
+Because some distinctions cannot be made from a file's contents alone — most
+notably *primary target* versus *dependency-only* module — the generated bundle is
+a **scaffold to edit**, not a final answer; everything in the scanned tree is
+treated as primary, and pure dependencies are expected to come from `-p`
+directories. Modules that carry *both* their own data and `deviation` statements
+are classified as deviation modules but flagged with a `# note:` comment for review.
+
+Generation is a built-in subcommand rather than an output plugin: it runs *before*
+compilation, on raw parsed files (which may not yet form a compilable set), whereas
+output plugins operate on the already `CompiledModule`-level schema. (A separate,
+simpler capability — serialising the *resolved* inputs of a successful compile back
+into a `.yangbundle` — could instead be offered as a normal post-compile facility,
+since by then classification is already known.)

@@ -18,6 +18,7 @@ yangest-plugin-yin = { path = "../plugins/yin" }
 yangest-plugin-swagger = { path = "../plugins/swagger" }
 clap = { version = "4.6.1", features = ["derive"] }
 inventory = "0.3"
+mimalloc = "0.1"
 rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -25,6 +26,10 @@ toml = "0.8"
 [features]
 # Enables an in-process peak-allocation tracker in the bundle_tree benchmark.
 bench-alloc = []
+# Pulls in core's retired encounter-order walker for the walker_probe bench.
+# Off by default; the walker has no in-tree consumer (see
+# docs/core-walker-design.md STATUS banner).
+experimental-walker = ["yangest-core/experimental-walker"]
 
 [dev-dependencies]
 # integration tests use the binary via CARGO_BIN_EXE_yangest
@@ -37,3 +42,5 @@ harness = false
 [[bench]]
 name = "walker_probe"
 harness = false
+# Exercises the retired walker; only built when its feature is explicitly enabled.
+required-features = ["experimental-walker"]

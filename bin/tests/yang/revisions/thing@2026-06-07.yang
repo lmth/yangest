@@ -1,0 +1,6 @@
+module thing {
+  namespace "urn:example:thing";
+  prefix t;
+  revision 2026-06-07;
+  leaf b { type string; }
+}

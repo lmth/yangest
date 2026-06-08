@@ -48,11 +48,6 @@ pub struct CompilationFlags {
     /// Format: `(module_name, extension_name)`.
     /// When present, its argument is stored in [`Typedef::opaque_type_name`].
     pub opaque_type_extension: Option<(String, String)>,
-    /// Extensions that count as "metadata" for source-ordering computations.
-    /// [`SchemaNode::status_before_ext_meta`] is `true` when `status` appears
-    /// before the first instance of any of these extensions in the YANG source.
-    /// Format: `[(module_name, extension_name), ...]`.
-    pub meta_extensions: Vec<(String, String)>,
     /// Extension that declares an explicit dependency path inside a `must` or
     /// `when` statement. When set, the argument of each occurrence is collected
     /// into [`MustExpr::explicit_deps`] / [`WhenExpr::explicit_deps`].
@@ -226,14 +221,6 @@ pub struct SchemaNode {
     pub origin_module: String,
     pub pos: Pos,
     pub status: Status,
-    /// True if the `status` statement is declared before the first plugin-defined
-    /// metadata extension in the YANG source.  Used by emit plugins that need to
-    /// reproduce source-order-dependent output ordering.
-    /// See [`CompilationFlags::meta_extensions`] for the configured extension list.
-    pub status_before_ext_meta: bool,
-    /// True if the `status` statement is declared before `units` in the YANG source.
-    /// Emit plugins use this to reproduce source-order-dependent output ordering.
-    pub units_before_status: bool,
     pub config: Option<bool>,
     pub when: Vec<WhenExpr>,
     pub if_features: Vec<IfFeatureExpr>,
@@ -242,10 +229,6 @@ pub struct SchemaNode {
     /// Extension statements applied to this node, in declaration order.
     pub extensions: Vec<ExtensionInstance>,
     pub kind: SchemaNodeKind,
-    /// Statuses of groupings directly referenced by `uses` in this node's YANG substmts,
-    /// captured at compile time before expansion replaces children.
-    /// Used by emit plugins that need grouping-status information for output ordering.
-    pub uses_grouping_statuses: Vec<Status>,
     pub pmap: PMap,
 }
 
@@ -258,8 +241,6 @@ impl std::fmt::Debug for SchemaNode {
             .field("origin_module", &self.origin_module)
             .field("pos", &self.pos)
             .field("status", &self.status)
-            .field("status_before_ext_meta", &self.status_before_ext_meta)
-            .field("units_before_status", &self.units_before_status)
             .field("config", &self.config)
             .field("when", &self.when)
             .field("if_features", &self.if_features)
@@ -280,8 +261,6 @@ impl Clone for SchemaNode {
             origin_module: self.origin_module.clone(),
             pos: self.pos.clone(),
             status: self.status,
-            status_before_ext_meta: self.status_before_ext_meta,
-            units_before_status: self.units_before_status,
             config: self.config,
             when: self.when.clone(),
             if_features: self.if_features.clone(),
@@ -289,7 +268,6 @@ impl Clone for SchemaNode {
             reference: self.reference.clone(),
             extensions: self.extensions.clone(),
             kind: self.kind.clone(),
-            uses_grouping_statuses: self.uses_grouping_statuses.clone(),
             pmap: HashMap::new(), // pmap holds renderer-private data; not cloned
         }
     }
@@ -335,7 +313,7 @@ impl SchemaNode {
 pub enum SchemaNodeKind {
     Container {
         presence: Option<String>,
-        children: Vec<SchemaNode>,
+        children: Arc<Vec<SchemaNode>>,
         musts: Vec<MustExpr>,
     },
     Leaf {
@@ -357,7 +335,7 @@ pub enum SchemaNodeKind {
     List {
         key: Vec<String>,
         unique: Vec<String>,
-        children: Vec<SchemaNode>,
+        children: Arc<Vec<SchemaNode>>,
         min_elements: u64,
         max_elements: Option<u64>,
         ordered_by: OrderedBy,
@@ -366,22 +344,22 @@ pub enum SchemaNodeKind {
     Choice {
         default: Option<String>,
         mandatory: bool,
-        cases: Vec<SchemaNode>,
+        cases: Arc<Vec<SchemaNode>>,
     },
     Case {
-        children: Vec<SchemaNode>,
+        children: Arc<Vec<SchemaNode>>,
     },
     Rpc {
-        input: Vec<SchemaNode>,
-        output: Vec<SchemaNode>,
+        input: Arc<Vec<SchemaNode>>,
+        output: Arc<Vec<SchemaNode>>,
         musts: Vec<MustExpr>,
     },
     Action {
-        input: Vec<SchemaNode>,
-        output: Vec<SchemaNode>,
+        input: Arc<Vec<SchemaNode>>,
+        output: Arc<Vec<SchemaNode>>,
     },
     Notification {
-        children: Vec<SchemaNode>,
+        children: Arc<Vec<SchemaNode>>,
         musts: Vec<MustExpr>,
     },
     AnyXml {
@@ -631,7 +609,21 @@ impl ModuleRegistry {
     }
 
     pub fn insert(&mut self, module: Arc<CompiledModule>) {
-        self.name_index.insert(module.key.name.clone(), Arc::clone(&module));
+        // The name-only index must point at the *latest* revision so that a
+        // revision-less `resolve_import` / `include` resolves to it (RFC 7950
+        // §5.1.1), regardless of compile/insert order.
+        let is_latest = match self.name_index.get(&module.key.name) {
+            Some(existing) => {
+                crate::ast::ModuleKey::revision_cmp(
+                    module.key.revision.as_deref(),
+                    existing.key.revision.as_deref(),
+                ) != std::cmp::Ordering::Less
+            }
+            None => true,
+        };
+        if is_latest {
+            self.name_index.insert(module.key.name.clone(), Arc::clone(&module));
+        }
         self.modules.insert(module.key.clone(), module);
     }
 

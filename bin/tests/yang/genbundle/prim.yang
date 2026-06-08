@@ -1,0 +1,7 @@
+module prim {
+  namespace "urn:example:prim";
+  prefix p;
+  container c {
+    leaf x { type string; }
+  }
+}

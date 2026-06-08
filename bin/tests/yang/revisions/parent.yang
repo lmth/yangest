@@ -1,0 +1,8 @@
+module parent {
+  namespace "urn:example:parent";
+  prefix p;
+  include sub;
+  container c {
+    uses g;
+  }
+}

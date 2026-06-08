@@ -822,3 +822,86 @@ fn refine_deviate_mode_removed_timeout_optional() {
         "retries should be optional (refine mandatory false)\n{stdout}"
     );
 }
+
+// ── generate-bundle subcommand ───────────────────────────────────────────────
+
+/// `generate-bundle` walks a tree and classifies each file by role: plain
+/// modules → `modules`, deviation modules → `deviation_modules`, submodules →
+/// their directory under `search_paths` (never listed as a primary target).
+#[test]
+fn generate_bundle_classifies_by_role() {
+    let dir = yang_dir("genbundle");
+    let out = Command::new(yangest_bin())
+        .arg("generate-bundle")
+        .arg(&dir)
+        .output()
+        .expect("failed to run yangest generate-bundle");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "unexpected exit\nstderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    // prim.yang is primary; dev.yang (has a `deviation`) is a deviation module,
+    // listed after the modules array.
+    assert_contains_in_order(
+        &stdout,
+        &["modules = [", "prim.yang", "deviation_modules = [", "dev.yang"],
+    );
+    // The submodule's directory is carried into search_paths so `include` resolves.
+    assert_contains_in_order(&stdout, &["search_paths = [", "nested"]);
+    // The submodule file itself is never listed (not a primary, not by filename).
+    assert!(
+        !stdout.contains("sub.yang"),
+        "submodule sub.yang must not be listed as an input\n{stdout}"
+    );
+    // dev.yang must not appear in the primary `modules` array (it precedes the
+    // deviation_modules header).
+    let modules_section = stdout.split("deviation_modules").next().unwrap_or("");
+    assert!(
+        !modules_section.contains("dev.yang"),
+        "deviation module must not be listed as primary\n{stdout}"
+    );
+}
+
+// ── revision resolution (RFC 7950 §5.1.1) ────────────────────────────────────
+
+/// A revision-less `include` must resolve to the latest submodule revision. The
+/// `revisions/` fixture has `sub@2024-01-01` (grouping g → old_leaf) and
+/// `sub@2026-06-07` (grouping g → new_leaf); `parent` does `include sub; uses g;`.
+#[test]
+fn include_without_revision_uses_latest_submodule() {
+    let dir = yang_dir("revisions");
+    let out = Command::new(yangest_bin())
+        .arg("-f")
+        .arg("tree")
+        .arg("-p")
+        .arg(&dir)
+        .arg(dir.join("parent.yang"))
+        .output()
+        .expect("failed to run yangest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("new_leaf"), "expected the latest submodule revision\n{stdout}");
+    assert!(!stdout.contains("old_leaf"), "must not use the old submodule revision\n{stdout}");
+}
+
+/// `generate-bundle` lists only the latest revision of a module that appears in
+/// several revisions (`thing@2024-01-01` and `thing@2026-06-07`).
+#[test]
+fn generate_bundle_lists_latest_revision() {
+    let dir = yang_dir("revisions");
+    let out = Command::new(yangest_bin())
+        .arg("generate-bundle")
+        .arg(&dir)
+        .output()
+        .expect("failed to run yangest generate-bundle");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // Consider only listed entries, not `# note:` comments (which mention the
+    // superseded revision by name).
+    let listed = |needle: &str| {
+        stdout
+            .lines()
+            .any(|l| !l.trim_start().starts_with('#') && l.contains(needle))
+    };
+    assert!(listed("thing@2026-06-07.yang"), "latest revision should be listed\n{stdout}");
+    assert!(!listed("thing@2024-01-01.yang"), "older revision must not be listed\n{stdout}");
+}

@@ -5,6 +5,13 @@ edition = "2024"
 license = "Apache-2.0"
 authors = ["Magnus Thoäng <magnusthoang@gmail.com>"]
 
+[features]
+# The SchemaWalker / encounter-order machinery is retired from core's critical
+# path (see docs/core-walker-design.md STATUS banner). It is byte-faithful
+# emission support with no in-tree consumer, kept behind this opt-in feature for
+# possible downstream revival. Off by default.
+experimental-walker = []
+
 [dependencies]
 clap = { version = "4", default-features = false, features = ["std"] }
 indexmap = "2.14.0"

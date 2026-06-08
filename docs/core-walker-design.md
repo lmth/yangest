@@ -1,41 +1,85 @@
 # Core Schema Walker Design
 
-> **Contract update (2026-06)**: The walker's contract is **content
-> parity, not byte parity**. Backends that need to enumerate every
-> module-and-type relationship a `CompiledModule` declares — for
-> example, to populate an `ns_to_prefix_maps` section — need a single
-> driver that visits each relevant node exactly once in a
-> *deterministic* order. They do **not** need an order that matches a
-> particular reference compiler's. Byte-identical output against an
-> external compiler is a stretch goal, achieved only when the
-> backend's emit stage explicitly sorts to that compiler's
-> convention.
->
-> Earlier drafts of this document specified the walker's order as
-> "matches the reference compiler's encounter order". That over-
-> specification cost a regrettable amount of complexity (per-descent
-> expansion, cursor mutations, fragile name-matching) and two runtime
-> regressions on heavy bundles (`84da49f` reverted in `ce12eea`; the
-> path-1 cache attempt recorded in `ffeaee0`'s bench commit). §3
-> (Goals and non-goals), §11 (Step 3 detail — Uses-body), and §14
-> (Verification) have been rewritten under the relaxed contract.
-
-A backend that needs to enumerate every type-resolution and
-extension-attribution event a `CompiledModule` declares — for example,
-to build its `ns_to_prefix_maps` section — cannot rely on the
-finalised tree alone, because some attribution information (which
-*injection-source* module supplied an extension; which *constraint-
-source* module supplied a `when`/`must`) is per-instance metadata
-that traditional schema walkers do not surface.
+A backend that needs to *reproduce* the reference compiler's
+`ns_to_prefix_maps` order — or any other byte-identical artefact whose
+content depends on the order in which the compiler resolved types and
+leafrefs — cannot use a fully-built compiled tree as its starting point.
+The encounter order is information that is *thrown away* once the
+`CompiledModule` is finalised: it must be observed *during* traversal.
 
 The existing `TypeResolutionObserver` (see
 [`core::types_registry::observer`](../core/src/types_registry/observer.rs))
-exposes the *event* surface: every typedef and leafref resolution,
-every constraint source, every foreign extension attached, fires a
-callback. What it lacks is a *driver* — a canonical visitor that
-walks the compiled schema once and calls those callbacks at the
-right moments. This document specifies that driver: the
-**`SchemaWalker`**.
+already exposes the *event* surface: every typedef and leafref
+resolution fires a callback. What it does not yet expose is a *driver*
+— a canonical visitor that walks the compiled schema in the order the
+reference compiler walks it, calling `TypeRegistry::resolve_with_observer`
+at the right moments.
+
+This document specifies that driver: the **`SchemaWalker`** — and its
+contract with backends. It is the missing piece between the
+already-present observer and a working byte-faithful (or any
+order-sensitive) backend.
+
+---
+
+## STATUS (2026-06-06): retired from core's critical path — read this first
+
+The `SchemaWalker` and the encounter-order machinery described below are
+**frozen and quarantined as an experimental, downstream-plugin concern.** They
+are no longer extended, and byte-faithful emission is **not** a core goal. This
+section records why; the rest of the document is preserved as the design of a
+capability that may be revived *downstream*, but should not drive core decisions.
+
+**Why this was retired:**
+
+1. **The byte-identity requirement was validation-convenience, not a hard
+   constraint.** No external system checksums the reference compiler's exact
+   output bytes. Byte-diffing against the reference was simply the easiest way
+   the (external, downstream) byte-faithful plugin author gained confidence the
+   port was correct. **Normalized/semantic equivalence** — canonicalising the
+   semantically-unordered sets (notably `ns_to_prefix_maps`) before comparing —
+   satisfies that need without reproducing encounter order. That is now the
+   intended validation path.
+
+2. **The apparatus has zero in-tree consumers.** `SchemaWalker` /
+   `TypeResolutionObserver` are referenced only by the walker module itself, its
+   tests, and `bin/benches/walker_probe.rs`. The ordering-witness fields
+   (`status_before_ext_meta`, `units_before_status`, `uses_grouping_statuses`)
+   were written by the compiler but read by no emitter, and have been removed.
+   None of the in-tree plugins (tree / yang / yang-expanded / yin / depend /
+   swagger) use any of it.
+
+3. **Byte-identity is the load that made the lazy model expensive — the
+   §1↔§11 trade-off.** yangest's whole thesis is that a small per-module memory
+   footprint lets it hold many modules resident and compile the dependency DAG
+   in *parallel waves* (low memory ⟹ parallelism ⟹ speed). The lazy grouping
+   model (`uses` stored as a reference, refine/deviate/annotation applied as
+   overlays) is what keeps the footprint small. **Byte-identity (§1) requires a
+   whole-tree, encounter-order traversal of the expanded forest; on a lazily
+   expanded tree that means re-expanding via `SchemaNode::clone`, which is
+   O(subtree)** — so the walk deep-clones shared groupings per descent
+   (~440 s / 3.5 GB on a ~1071-module bundle; >10 GB and non-terminating once
+   `uses`-body augments are expanded, see §11). The encounter-order requirement
+   and the lazy model are in direct tension, and the walker is the seam where
+   they grind. Retiring the requirement dissolves the tension and restores the
+   memory/speed thesis. The reference compiler gets the order "for free" only
+   because it expands eagerly and collects data as a side effect of one in-order
+   build — a trade yangest deliberately does not make.
+
+**Framing correction (the order is deterministic, not OTP-random).** Earlier
+discussion described the reference order as "undefined but predictable for a
+given OTP/Erlang version," implying runtime hash randomness. The evidence says
+otherwise: the reference orders insertions **by source position** (see the
+`AugmentEntry` doc-comment in `core/src/compiler/types.rs`). The order is
+*deterministic but process-dependent* — the interleaving of visit pattern,
+augment splicing, and typedef-chain walking. The three failed derivation
+attempts (§1: alphabetical / reverse / DFS) failed because none of them sorted
+by the source `Pos` the data model already carries. So if a hard byte-identity
+need is ever revived **downstream**, prefer reconstructing the order by *sorting
+carried source positions* over reviving the expensive live walk — it preserves
+the fast lazy model. (Caveat: position-sort reconstructs node-visit order but
+may not capture intra-node type-resolution order, e.g. innermost-base-type-chain
+first; probe before betting on it.)
 
 ---
 
@@ -135,11 +179,8 @@ This ordering is what the SchemaWalker contract guarantees.
 
 ### Goals
 
-* Provide a single canonical schema-walker that visits each relevant
-  node exactly once in a *deterministic* order, firing
-  `TypeResolutionObserver` events as it goes. The order must be
-  reproducible across runs and across parallelism settings, but is
-  otherwise implementation-defined.
+* Provide a single canonical schema-walker that drives
+  `resolve_with_observer` in the order the reference compiler does.
 * Keep the `TypeResolutionObserver` trait unchanged — backends that
   already implement it (none in-tree today) gain a drop-in driver.
 * Be cheap when no observer is supplied: the walker takes a generic
@@ -156,30 +197,15 @@ This ordering is what the SchemaWalker contract guarantees.
 
 ### Non-goals
 
-* **Matching any external compiler's encounter order.** A backend
-  that wants byte-identical output against e.g. the reference
-  compiler may sort observer-collected data into that compiler's
-  convention at emit time, but the walker itself is not in the
-  business of replicating that order. The cost of doing so (see
-  §11 history) is too high for the benefit (cosmetic byte
-  equality).
 * Changing or extending the `TypeResolutionObserver` event set. Adding
   events (e.g. `on_node_enter`) is a separate, later proposal; this
   document is strictly about the driver.
 * Replacing `Plugin::emit` or `Plugin::emit_module`. The walker is a
   utility plugins call from inside `emit_module`, not a new top-level
   hook.
-
-### What "deterministic" means
-
-For two runs of `SchemaWalker::walk(observer)` over the same
-`CompiledModule`, the sequence of observer events must be identical:
-same set of events, same sequence. The walker therefore must not
-depend on `HashMap` iteration order, thread scheduling, or any other
-non-deterministic source. Iteration of `aug.nodes`,
-`module.children(ctx)`, `module.augments`, `node.extensions`, and
-`node.when`/`musts` follows the declared/compiled order in the
-`CompiledModule` — which is itself deterministic by construction.
+* Reproducing every micro-detail of the reference compiler. The
+  contract is "encounter order matches for typedef/leafref events";
+  ordering of nodes that produce *no* type events is unconstrained.
 
 ---
 
@@ -445,19 +471,17 @@ For a maintainer picking up step 4:
 |---|---|---|
 | 1 | `core::walker` skeleton | **Done** (`ea920e4`) |
 | 2 | Wire observer firing at resolution sites | **Done** (`ea920e4`) |
-| 3 | `walk_own_augments` (own-augment traversal) | **Done** (`d3a5cf5`); Uses-body follow-up **path-2 recommended** (compile-time pre-expand of `aug.nodes`); cursor-side approaches (path 1 cache; runtime expansion) ruled out by bench (`ffeaee0`, `84da49f`); annotation source-module attribution **Done** (`ExtensionInstance::injection_source_module`) |
-| 4 | Content-parity reference tests (was `ref-data`-gated byte-cmp) | **Pending** — see §9 / §14 |
+| 3 | `walk_own_augments` (own-augment traversal) | **Done** (`d3a5cf5`); Uses-body follow-up **Reverted** (the obvious approach in `84da49f` regressed runtime — see §11); annotation source-module attribution **Done** (`ExtensionInstance::injection_source_module`) |
+| 4 | `ref-data`-gated parity tests | **Pending** — see §9 |
 | 5 | `on_constraint_source` for `when`/`must` | **Done** (`53062f7`) |
 | 6 | `on_extension_attached` for foreign-module extensions | **Done** (`813bd2f`) |
 
-Only step 4 (content-parity reference tests) and the §11 Uses-body
-follow-up remain. Step 4 is insurance against future regressions
-and needs checked-in reference outputs; the Uses-body follow-up
-should be implemented as path-2 (compile-time pre-expand) per the
-revised §11 — cursor-side runtime approaches were tried (`84da49f`
-reverted in `ce12eea`; path-1 cache benchmarked in `ffeaee0`) and
-both regress on heavy bundles, and the order-preserving complexity
-they bought is unnecessary under the content-parity contract (§0).
+Only step 4 (the `ref-data`-gated reference-parity tests) and the
+§11 Uses-body follow-up remain. Step 4 is insurance against future
+regressions and needs checked-in reference outputs; the Uses-body
+follow-up is documented in §11 with three candidate paths
+forward — the natural approach was tried in `84da49f` and reverted
+because of catastrophic runtime regression.
 
 ### Original step descriptions
 
@@ -623,112 +647,111 @@ panics on schema gaps.
 `visit_node` with `data_cursor` positioned at the enclosing data
 node, not the case.
 
-**Recursive bodies / `uses grouping;`**: An augment body of the
-form `augment X { uses g; }` stores `aug.nodes` as a single
+**Recursive bodies / `uses grouping;`**: ⚠️ *Open follow-up; the
+obvious fix is unsafe at scale.* An augment body of the form
+`augment X { uses g; }` stores `aug.nodes` as a single
 `SchemaNode` of `kind::Uses` whose `name` is `"__uses__"`, **not**
-the grouping's expanded leaves. The walker therefore needs the
-expanded leaves *somewhere* to surface their type-resolution and
-extension events. Empirically the dominant pattern in real-world
-yangbundles — almost every augment body uses the grouping idiom.
+the grouping's expanded leaves. Two pitfalls follow:
 
-**Recommended resolution under the relaxed contract (path 2):
-compile pre-expands augment bodies** so `aug.nodes` stores
-post-grouping leaves directly. The walker then iterates
-`aug.nodes` with no special case for Uses, no host-tree cursoring
-through `augment_children`, no per-descent expansion overhead.
+* **`body_node.children(ctx)` returns nothing** when called directly
+  on the Uses node. Uses are expanded by their *parent's*
+  `expand_children` call, not by descending into the Uses itself.
+* **Host-tree `child_nodes()` does not show expanded leaves either**
+  for foreign-augment contributions: `Cursor::augment_children`
+  currently extends with `aug.nodes.iter().cloned()` — i.e. the raw
+  Uses node — so cursoring at the augment target sees
+  `Uses{name:"__uses__"}` on the cursor's child list.
 
-Why path 2 (instead of paths 1 or 3 explored earlier):
+The simple "match `aug.nodes[i].name` against `host_children` by
+name" loop therefore visits *zero* nodes for any Uses-shaped
+augment body — empirically the dominant pattern in real-world
+yangbundles, where almost every augment body uses the grouping
+idiom.
 
-* Path 1 (per-`ExpansionCtx` cache) was implemented and
-  benchmarked — it does **not** fix the regression. See "Path 1
-  empirically ruled out" below; the deep-clone cost is in
-  `Cursor::current_children`, not in re-expansion.
-* Path 3 (synthetic walker frames) preserves yanger's exact
-  iteration order through the splice, which is no longer a
-  contract goal (§3) — so its complexity is unjustified.
-* Path 2 moves the work to compile, where it happens once per
-  module and is amortised over every subsequent walker run. The
-  iteration order through the body is "declared leaf order from
-  the grouping body" — deterministic and natural.
+**Resolution attempted (commit `84da49f`, reverted in
+`<this commit>`):** the natural fix — make
+`Cursor::augment_children` and the walker's body iteration call
+`compile::expand_children` on `aug.nodes` — is *correct* on a
+small fixture but **scales catastrophically on heavy bundles**.
+The probe `walker.walk` per module climbs from a few minutes to
+runaway memory growth (>7 GB and still rising at termination) on
+the reference yangbundle (~461 modules, deep augment-target paths).
+Two amplification factors compound:
 
-Care points for path 2:
-
-* Refines applied at the `uses g { refine x { ... } }` level must
-  be applied during pre-expansion (same way they're applied when
-  `expand_children` walks the parent today).
-* Local `augment "..." { ... }` inside the grouping must be
-  expanded relative to the augment-body's leaves.
-* `when` / `if-feature` on the `uses` statement itself must be
-  carried through to each expanded leaf or kept as the
-  `aug.when` / `aug.if_features` of the enclosing `augment`.
-* The original `Uses` node should not be retained in `aug.nodes`
-  alongside the expansion (otherwise downstream consumers that
-  iterate `aug.nodes` would double-count). One way: replace
-  `aug.nodes = vec![Uses{...}]` with `aug.nodes = vec![leaf_a,
-  leaf_b, ...]` at the end of compile.
-* `bin/benches/walker_probe` (added in `ffeaee0`) is the
-  validation harness — path 2 must show RSS within ~baseline
-  (~3.5 GB peak on the heavy bundle) and a runtime within the
-  baseline ~440 s. Because path 2 *avoids* the
-  `Cursor::current_children` hot path, this is expected to be
-  comfortable; the bench is the proof.
-
-### Historical: paths 1, runtime expansion, and synthetic frames
-
-This sub-section is preserved as implementation guidance for
-anyone tempted to revisit those approaches.
-
-**Failed attempt 1 — runtime cursor expansion (`84da49f`,
-reverted in `ce12eea`):** make `Cursor::augment_children` and
-the walker's body iteration call `compile::expand_children` on
-`aug.nodes`. Correct on a small fixture; on heavy bundles RSS
-climbs past 7 GB and keeps rising. Two amplification factors:
-
-1. `augment_children` is invoked on every cursor descent
+1. **`augment_children` is invoked on every cursor descent**
    (`Cursor::current_children` is on the path of `find_child`,
    `child_nodes`, and augment-target navigation). The walker
    descends a lot.
-2. `expand_children_inner` clones every node of an
+2. **`expand_children_inner` clones every node** of an
    `expand_uses_lazy`-cached body into the returned `Vec`. The
    grouping cache short-circuits `expand_uses_lazy` itself, but
    the per-call `Vec::clone` is O(grouping_size) in deep
    `SchemaNode` clones (each carries `pmap`, `extensions`,
-   `Vec<WhenExpr>`, etc.).
+   `Vec<WhenExpr>`, etc.). With many matching Uses-shaped
+   augments per descent, allocator pressure dominates.
 
 A targeted "fast-path-clone unless aug.nodes contains a Uses"
 optimisation was tried but did not help materially.
 
-**Failed attempt 2 — Path-1 cache (recorded in `ffeaee0`,
-measured but not landed).** A per-`ExpansionCtx`
-`expand_augment_body` cache keyed on `*const AugmentEntry`, with
-both `Cursor::augment_children` and the walker's body iteration
-`Arc::clone`-ing the cached expansion. Run through
-`bin/benches/walker_probe` — a parallel, bundle-mode walk of a
+**Status (2026-06-06): RETIRED / won't-fix in core.** This follow-up only
+matters for byte-faithful encounter-order emission, which has been retired from
+core (see the STATUS banner at the top of this document). It is not pursued. The
+candidate paths below are preserved only for a possible *downstream* revival; do
+not invest core effort here. The diagnosis remains accurate and is the reason
+the requirement was dropped rather than chased: the real cost is the O(subtree)
+`SchemaNode::clone` in the cursor's per-descent `current_children`, which the
+byte-identity walk hits hardest.
+
+*(Historical) three candidate paths, ranked by perceived robustness:*
+
+1. **Cache expanded augment bodies once per
+   `(AugmentEntry, ExpansionCtx)`** via a new per-`ExpansionCtx`
+   cache keyed on `*const AugmentEntry` (or interior-mutable
+   storage on `CompiledModule`). `Cursor::augment_children` then
+   `Arc::clone`s the cached `Vec` instead of re-walking it.
+   Per-call cost in `current_children` becomes O(N) in result
+   size, not O(N × matches × per-call expansion).
+2. **Compile pre-expands augment bodies** so `aug.nodes` always
+   stores post-grouping leaves. One-time cost at compile. Care
+   needed to keep refines / local augments / when / if-feature
+   intact at re-expansion.
+3. **Keep the cursor raw, push synthetic frames in the walker**
+   for visited body leaves — bypass `find_child` entirely for
+   the per-augment-body iteration.
+
+Path (1) is the most defensive; (3) is closest in spirit to the
+host-tree-iteration rule the upstream tests pin. All need fresh
+heavy-bundle bench numbers before declaring done.
+
+**Path (1) empirically ruled out (measured, not landed).** Path (1)
+was implemented (a per-`ExpansionCtx` `expand_augment_body` cache keyed
+on `*const AugmentEntry`, with both `Cursor::augment_children` and the
+walker's body iteration `Arc::clone`-ing the cached expansion) and run
+through `bin/benches/walker_probe` — a parallel, bundle-mode walk of a
 representative ~1071-module vendor bundle. It **reproduces the
-regression**: RSS climbs past 10 GB and never completes. The
-cache removes the *re-expansion*, but not the per-call deep
-clone of the expanded body: `Cursor::current_children` rebuilds
-an owned `Vec<SchemaNode>` on every `find_child`/`child_nodes`
-call, and the walker calls those O(children) times per node.
-The baseline walk (no Uses expansion at all) already costs ~440
-s / ~3.5 GB peak on that bundle for exactly this reason —
-expanding the augment bodies only amplifies a cost that is
-already in `current_children`.
+regression**: RSS climbs past 10 GB and never completes. The cache
+removes the *re-expansion*, but not the per-call **deep clone** of the
+expanded body: `Cursor::current_children` rebuilds an owned
+`Vec<SchemaNode>` on *every* `find_child`/`child_nodes` call, and the
+walker calls those O(children) times per node. The baseline walk (no
+Uses expansion at all) already costs ~440 s / ~3.5 GB peak on that
+bundle for exactly this reason — expanding the augment bodies only
+amplifies a cost that is already in `current_children`.
 
-**Implication.** A cursor-side fix (whether expansion-based or
-caching-based) drives `Cursor::current_children` further into
-the hot path, where its per-call deep clone dominates. Path 2
-sidesteps this entirely by ensuring `aug.nodes` already contains
-expanded leaves *before* the walker runs — so the augment-body
-iteration in `walk_own_augments_inner` does not need to reach
-into `current_children` at all.
+**Implication.** The real fix is not "cache the augment body" — it is
+"stop `current_children` from deep-cloning per descent." Candidates:
+memoize `current_children` by absolute path in the `ExpansionCtx`
+(bounded by tree size, but the fully-expanded forest is itself large —
+needs its own bench), or restructure the cursor to share subtrees by
+`Arc` instead of cloning. This is a cursor-level performance redesign,
+larger than a localized augment helper, and must be validated with
+`walker_probe` against the heavy bundle before landing.
 
-A separate, longer-term improvement would be to make
-`Cursor::current_children` itself cheap (subtree sharing via
-`Arc`, or path-keyed memoisation). That is a cursor-level
-performance redesign, valuable independently of the Uses-body
-problem; under the current contract it is not on the critical
-path.
+The §14 verification table (post step 3) still applies: even
+without the Uses-body fix, step 3 unblocks two cases. The dominant
+17 Uses-body misses are blocked on this follow-up; do not assume
+they are easy — and the obvious cache (path 1) is *not* the answer.
+
 **Cross-module augment chains**: when module A augments into B, and B
 augments into C, A's walk visits A's augment into B *only*. B's augment
 into C is B's responsibility, fired during B's own walk. This
@@ -1086,10 +1109,9 @@ categories). The remaining 17 miss-only follow two patterns:
    host-children loop visits zero nodes per augment (Uses node's
    name is the grouping name, no host-side counterpart by that
    name). See §11 "Recursive bodies / `uses grouping;`" for the
-   recommended resolution (path 2: compile-time pre-expand).
-   *(Cursor-side runtime approaches were attempted in `84da49f` —
-   reverted in `ce12eea` — and benchmarked as the path-1 cache in
-   `ffeaee0`; both regress on heavy bundles.)*
+   three candidate paths forward. *(Attempted in `84da49f` and
+   reverted because of catastrophic runtime regression on heavy
+   bundles; remains an open follow-up.)*
 2. **Annotation source-module attribution**: even when step 3
    reaches the host-tree node carrying a foreign extension, the
    walker fires `on_extension_attached(ext.module, …)` where
@@ -1187,19 +1209,15 @@ Suggested investigation steps:
    (`ExtensionInstance::injection_source_module` so
    `on_extension_attached` reports the annotation-source module,
    not the extension-definition module). Follow-up (a) — Uses-body
-   expansion — recommended path-2 (compile-time pre-expand of
-   `aug.nodes`), see §11. Cursor-side runtime approaches were
-   attempted (`84da49f` reverted in `ce12eea`) and benchmarked
-   (path-1 cache in `ffeaee0`); both regressed on heavy bundles.
-   Open.
+   expansion — was attempted in `84da49f` and reverted because of
+   catastrophic runtime regression on heavy bundles; **open** with
+   three candidate paths in §11.
 4. **Backend filter** — drop walker-observed modules already in
    `yang_header.imports`. Pure downstream work; collapses the
    ~264 extra-only to near zero.
 
-Total expected coverage under content parity if step 3 follow-up
-(a) + filter land: **content-equivalent to 461/461** on the
-reference bundle. Byte-identical output is not the contract; see
-§0 contract update at the top of this document.
+Total expected coverage if step 3 follow-ups + filter land: 461/461
+on the reference bundle.
 
 ---
 

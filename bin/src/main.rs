@@ -8,6 +8,13 @@ use std::sync::{Arc, RwLock};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use rayon::prelude::*;
 
+// Heavy-bundle builds are allocation-bound: tree emit spends ~50% of its time in
+// the system allocator deep-cloning expanded `SchemaNode` subtrees. mimalloc cuts
+// that ~2.2× on the Cisco IOS-XE bundle (2.94 s → 1.34 s wall, lower peak RSS) over
+// glibc malloc, with no code changes elsewhere. See docs / bundle_tree baseline.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use yangest_core::annindex::AnnotationIndex;
 use yangest_core::astannindex::AstAnnotationIndex;
 use yangest_core::ast::{self, ModuleKey};
@@ -17,6 +24,7 @@ use yangest_core::devindex::DeviationIndex;
 use yangest_core::plugin::{AstOverlayDescriptor, EmitState, OverlayExtension, Plugin, PluginRegistration};
 
 mod bundle;
+mod generate_bundle;
 
 include!(concat!(env!("OUT_DIR"), "/plugin_externs.rs"));
 
@@ -27,7 +35,8 @@ include!(concat!(env!("OUT_DIR"), "/plugin_externs.rs"));
 #[command(
     name = "yangest",
     version,
-    about = "Parallel YANG schema validator and converter"
+    about = "Parallel YANG schema validator and converter",
+    after_help = "Subcommands:\n  generate-bundle <DIR>...  Scaffold a .yangbundle from a directory tree\n                            (run `yangest generate-bundle --help` for options)"
 )]
 struct Cli {
     /// Output format (tree, depend, yang, yin, swagger)
@@ -101,6 +110,12 @@ struct Cli {
 }
 
 fn main() {
+    // Subcommand dispatch happens before the (dynamically built) compile CLI is
+    // parsed, so it does not interfere with positional FILE / plugin args.
+    if std::env::args().nth(1).as_deref() == Some("generate-bundle") {
+        generate_bundle::run();
+    }
+
     // Collect all plugins registered via inventory::submit! in plugin crates.
     // Sorted by name for consistent --help output and format lookup.
     let mut plugins: Vec<Box<dyn Plugin>> = inventory::iter::<PluginRegistration>
@@ -297,12 +312,36 @@ fn main() {
     }
     modules.retain(|(k, _)| reachable.contains(k.name.as_str()));
 
-    // Deduplicate modules by name.  A module can appear twice when it is
-    // listed as an explicit annotation/deviation file AND also found by the
-    // search-path directory scan.  Keep the first (higher-priority) entry.
+    // Deduplicate modules by exact (name, revision).  The same file can appear
+    // twice when it is listed explicitly AND also found by the search-path scan;
+    // keep the first (higher-priority) entry.  Distinct *revisions* of the same
+    // module are all kept, so a revision-dated import resolves to the exact one
+    // and a revision-less import/include resolves to the latest (RFC 7950 §5.1.1).
     {
-        let mut seen: HashSet<String> = HashSet::new();
-        modules.retain(|(k, _)| seen.insert(k.name.clone()));
+        let mut seen: HashSet<ModuleKey> = HashSet::new();
+        modules.retain(|(k, _)| seen.insert(k.clone()));
+    }
+
+    // Emit at most one revision per module name — the latest. A directory may
+    // hold several revisions of the same module; older ones still compile (so
+    // revision-dated imports resolve) but are not emitted as separate output.
+    {
+        let mut latest: HashMap<&str, &ModuleKey> = HashMap::new();
+        for k in &file_order {
+            latest
+                .entry(k.name.as_str())
+                .and_modify(|cur| {
+                    if ModuleKey::revision_cmp(cur.revision.as_deref(), k.revision.as_deref())
+                        == std::cmp::Ordering::Less
+                    {
+                        *cur = k;
+                    }
+                })
+                .or_insert(k);
+        }
+        let keep: HashSet<ModuleKey> = latest.values().map(|k| (*k).clone()).collect();
+        let mut emitted: HashSet<String> = HashSet::new();
+        file_order.retain(|k| keep.contains(k) && emitted.insert(k.name.clone()));
     }
 
     let dep_graph = DepGraph::build(&modules, &mut all_parse_errors);

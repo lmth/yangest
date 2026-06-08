@@ -337,26 +337,33 @@ An enum with one variant per YANG data-node type:
 
 ```rust
 pub enum SchemaNodeKind {
-    Container { presence: Option<String>, children: Vec<SchemaNode>, musts: Vec<MustExpr> },
+    Container { presence: Option<String>, children: Arc<Vec<SchemaNode>>, musts: Vec<MustExpr> },
     Leaf      { type_stmt: Stmt, units: Option<String>, default: Option<String>,
                 mandatory: bool, musts: Vec<MustExpr> },
     LeafList  { type_stmt: Stmt, units: Option<String>, default: Vec<String>,
                 min_elements: u64, max_elements: Option<u64>,
                 ordered_by: OrderedBy, musts: Vec<MustExpr> },
-    List      { key: Vec<String>, unique: Vec<String>, children: Vec<SchemaNode>,
+    List      { key: Vec<String>, unique: Vec<String>, children: Arc<Vec<SchemaNode>>,
                 min_elements: u64, max_elements: Option<u64>,
                 ordered_by: OrderedBy, musts: Vec<MustExpr> },
-    Choice    { default: Option<String>, mandatory: bool, cases: Vec<SchemaNode> },
-    Case      { children: Vec<SchemaNode> },
-    Rpc       { input: Vec<SchemaNode>, output: Vec<SchemaNode>, musts: Vec<MustExpr> },
-    Action    { input: Vec<SchemaNode>, output: Vec<SchemaNode> },
-    Notification { children: Vec<SchemaNode>, musts: Vec<MustExpr> },
+    Choice    { default: Option<String>, mandatory: bool, cases: Arc<Vec<SchemaNode>> },
+    Case      { children: Arc<Vec<SchemaNode>> },
+    Rpc       { input: Arc<Vec<SchemaNode>>, output: Arc<Vec<SchemaNode>>, musts: Vec<MustExpr> },
+    Action    { input: Arc<Vec<SchemaNode>>, output: Arc<Vec<SchemaNode>> },
+    Notification { children: Arc<Vec<SchemaNode>>, musts: Vec<MustExpr> },
     AnyXml    { mandatory: bool, musts: Vec<MustExpr> },
     AnyData   { mandatory: bool, musts: Vec<MustExpr> },
     // Plugins never match on this variant directly — call node.children(ctx) instead.
     Uses      { grouping: Arc<Grouping>, source_module_name: Option<String>, overlay: UsesOverlay },
 }
 ```
+
+Child collections are `Arc<Vec<SchemaNode>>` (not `Vec<SchemaNode>`) so that
+`SchemaNode::clone` is a shallow reference bump rather than an O(subtree) deep
+copy — the expanded forest is structurally shared, and overlays are applied
+copy-on-write. This is another reason to read children through `node.children(ctx)`
+rather than matching `kind` directly: the accessor hands you the owned, expanded
+`Vec<SchemaNode>` you want without reasoning about the shared representation.
 
 `Leaf` and `LeafList` carry the raw `type_stmt` AST node rather than a resolved type
 object.  The full type (including typedef resolution) is preserved in the AST; plugins

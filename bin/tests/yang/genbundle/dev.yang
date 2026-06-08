@@ -1,0 +1,8 @@
+module dev {
+  namespace "urn:example:dev";
+  prefix d;
+  import prim { prefix p; }
+  deviation "/p:c/p:x" {
+    deviate not-supported;
+  }
+}

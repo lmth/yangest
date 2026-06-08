@@ -13,6 +13,12 @@ expanded lazily when a plugin traverses the tree; deviations and refinements are
 kept as overlays and applied on demand. This means large shared groupings are parsed
 once regardless of how many modules `use` them.
 
+The expanded schema forest is structurally shared — node children are reference-counted
+and cloned copy-on-write — so emitting a large collection stays cheap in both time and
+memory. As a reference point, a ~1000-module Cisco IOS-XE bundle compiles and emits RFC
+8340 tree output for every module in roughly **0.7 s using under 1 GB of peak memory** on
+a 20-core host.
+
 > **Note on provenance:** yangest is an independent from-scratch Rust implementation.
 > No source code was derived from yanger. yanger is copyright Tail-f Systems AB,
 > written by Martin Björklund, and is licensed under the Apache License 2.0.
@@ -27,6 +33,11 @@ cargo build --release
 ```
 
 The binary is `target/release/yangest`.
+
+yangest uses [mimalloc](https://github.com/microsoft/mimalloc) as its global allocator —
+heavy-bundle builds are allocation-bound, and mimalloc roughly halves wall-clock time
+over the system allocator. It is an ordinary Cargo dependency built from source, so a C
+compiler (e.g. `cc` or `clang`) must be available on the build host.
 
 ---
 
@@ -190,6 +201,41 @@ reference and a full walkthrough of the tree plugin.
 
 See [docs/bundle-file-format.md](docs/bundle-file-format.md) for the complete
 `.yangbundle` file format reference.
+
+Each path in a bundle (and the corresponding `-p` / `--deviation-module` /
+`--annotation-module` flags) may name a directory; yangest includes the `.yang`
+files directly inside it (one level, non-recursive). A file's *role* is set by
+which key/flag lists it, not by its contents, so keep primary, deviation, and
+annotation modules in separate directories.
+
+### Generating a bundle from a directory tree
+
+```
+yangest generate-bundle <DIR>... [-p <DEP_DIR>]... [-o project.yangbundle]
+```
+
+`generate-bundle` walks the given directory tree(s), classifies each `.yang` file
+by inspecting its statements, and writes a starter `.yangbundle` (to stdout, or to
+`-o FILE`):
+
+- every plain `module` becomes a **primary** (emitted) module;
+- a module with top-level `deviation` statements goes to `deviation_modules`;
+- a module using a plugin-declared annotation extension goes to `annotation_modules`;
+- `submodule` files are not listed; their directories are added to `search_paths`
+  so `include` resolves;
+- directories passed with `-p` are carried over verbatim into `search_paths` as
+  dependency-only paths;
+- where several revisions of a module coexist (`name@date.yang`), only the latest
+  is listed.
+
+When a directory holds multiple revisions of a module, yangest keys them by the
+`revision` statement inside each file: a revision-less `import`/`include` resolves
+to the latest revision, a `revision-date` selects the exact one (RFC 7950 §5.1.1).
+
+The one distinction that cannot be made from a file's contents — *primary target*
+vs. *dependency-only* — is resolved by convention: everything in the scanned tree
+is treated as primary, and pure dependencies belong in `-p` directories. The
+result is a scaffold to review and refine, not a final answer.
 
 ---
 
