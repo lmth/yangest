@@ -248,3 +248,108 @@ module m {
     assert!(cur.find_child(&QName::qualified("m", "top")).is_some());
     assert!(cur.find_child(&QName::qualified("other", "top")).is_none());
 }
+
+#[test]
+fn child_nodes_structural_preserves_choice_and_case() {
+    let reg = registry_from(&[(
+        "m",
+        r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  container c {
+    leaf protocol { type string; }
+    choice ch {
+      case a { leaf x { type string; } }
+      case b { leaf y { type string; } }
+    }
+  }
+}
+"#,
+    )]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("m", None).unwrap();
+    let mut cur = Cursor::root_of(&m, &cx);
+    cur.move_to_child(&QName::bare("c")).unwrap();
+
+    // Flattened view (child_nodes): choice/case spliced away — protocol/x/y are
+    // siblings and `ch` is gone.
+    let flat: Vec<String> = cur.child_nodes().iter().map(|n| n.name.clone()).collect();
+    assert!(flat.iter().any(|n| n == "protocol"));
+    assert!(flat.iter().any(|n| n == "x"));
+    assert!(flat.iter().any(|n| n == "y"));
+    assert!(!flat.iter().any(|n| n == "ch"));
+
+    // Structural view: the `choice` survives as a Choice node; the case leaves
+    // are NOT direct children (they live inside its cases).
+    let structural = cur.child_nodes_structural();
+    let names: Vec<String> = structural.iter().map(|n| n.name.clone()).collect();
+    assert!(names.iter().any(|n| n == "protocol"));
+    let ch = structural
+        .iter()
+        .find(|n| n.name == "ch")
+        .expect("structural view must keep the choice node");
+    assert!(
+        matches!(ch.kind, crate::compiler::SchemaNodeKind::Choice { .. }),
+        "ch must be preserved as a Choice variant"
+    );
+    assert!(
+        !names.iter().any(|n| n == "x") && !names.iter().any(|n| n == "y"),
+        "case leaves must not be direct structural children"
+    );
+}
+
+#[test]
+fn child_nodes_structural_composes_external_augment_and_uses_body() {
+    // The structural view must still include cross-module augments — including
+    // the §11 case where the augment body is `uses grouping;` (the property a
+    // plugin cannot reproduce without core's expand_augment_body).
+    let reg = registry_from(&[
+        (
+            "base",
+            r#"
+module base {
+  namespace "urn:base";
+  prefix b;
+  container c { leaf own { type string; } }
+}
+"#,
+        ),
+        (
+            "aug",
+            r#"
+module aug {
+  namespace "urn:aug";
+  prefix a;
+  import base { prefix b; }
+  grouping g {
+    leaf added { type uint32; }
+    container extra { leaf deep { type string; } }
+  }
+  augment "/b:c" { uses g; }
+}
+"#,
+        ),
+    ]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("base", None).unwrap();
+    let mut cur = Cursor::root_of(&m, &cx);
+    cur.move_to_child(&QName::bare("c")).unwrap();
+
+    let names: Vec<String> = cur
+        .child_nodes_structural()
+        .iter()
+        .map(|n| n.name.clone())
+        .collect();
+    assert!(names.iter().any(|n| n == "own"), "own child present: {names:?}");
+    assert!(
+        names.iter().any(|n| n == "added"),
+        "augment body `uses g` leaf must be composed structurally: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "extra"),
+        "augment body `uses g` container must be composed structurally: {names:?}"
+    );
+}

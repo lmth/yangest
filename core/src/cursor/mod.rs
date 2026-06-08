@@ -200,6 +200,41 @@ impl<'a> Cursor<'a> {
         self.current_children()
     }
 
+    /// Composed children of the current position **without** `choice`/`case`
+    /// flattening.
+    ///
+    /// The returned list holds the same nodes as
+    /// [`child_nodes`](Self::child_nodes) — the node's own children plus every
+    /// node spliced in by external augments targeting the current position
+    /// (including augment bodies that are themselves `uses grouping;`, expanded
+    /// per `docs/core-walker-design.md` §11) — except that `choice` and `case`
+    /// structural nodes are preserved as `SchemaNodeKind::Choice`/`Case`
+    /// variants instead of being spliced away.
+    ///
+    /// Use this for a *structural* walk that must distinguish data nodes from
+    /// choice/case wrappers — e.g. an emitter that records choice-depth metadata
+    /// or attributes a `case` to its `choice`. Most callers should keep using
+    /// [`child_nodes`](Self::child_nodes): the logical (flattened) view is what
+    /// RFC 7950 §6.5/§9.9.2 require for leafref / XPath / `when` resolution, and
+    /// it is the view that [`find_child`](Self::find_child) /
+    /// [`move_to_child`](Self::move_to_child) navigate. (This list is not
+    /// addressable by those methods — `choice`/`case` are not navigable steps.)
+    pub fn child_nodes_structural(&self) -> Arc<Vec<SchemaNode>> {
+        let Some(f) = self.stack.last() else {
+            // Root: the module's own top-level children, un-flattened. Augments
+            // never target the module root, so there is nothing to splice here.
+            return Arc::new(self.module.children(self.ctx));
+        };
+        let node = &f.siblings[f.index];
+        // Same composition as `current_children`, but without the final
+        // `flatten_transparent`. `node.children` already preserves choice/case
+        // (flattening is a cursor-only concern) and `augment_children` returns
+        // its (un-flattened) spliced nodes.
+        let mut kids = node.children(self.ctx);
+        kids.extend(self.augment_children());
+        Arc::new(kids)
+    }
+
     /// The logical children available at the current position, including nodes
     /// spliced in by external augments targeting the current node (the data tree
     /// is the union of every module's contributions).
