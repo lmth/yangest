@@ -29,7 +29,9 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use crate::compiler::{CompiledModule, ExpansionCtx, PathStep, SchemaNode, SchemaNodeKind};
+use crate::compiler::{
+    AugmentEntry, CompiledModule, ExpansionCtx, PathStep, SchemaNode, SchemaNodeKind,
+};
 
 /// A resolved node identifier: a node name plus the *module that owns its
 /// namespace*. `module == None` matches by local name only (used when the
@@ -261,7 +263,12 @@ impl<'a> Cursor<'a> {
 
     /// The module-qualified absolute path of the current node, as
     /// `(module, name)` per step (root-first). Empty at the module root.
-    fn current_abs_path(&self) -> Vec<(String, String)> {
+    ///
+    /// `module` is the name of the module owning each step's namespace (the
+    /// definition module for augment/grouping-injected nodes), so a backend can
+    /// use this as a stable, fully-qualified key for the records it emits without
+    /// re-deriving prefixes.
+    pub fn current_abs_path(&self) -> Vec<(String, String)> {
         self.stack
             .iter()
             .map(|f| {
@@ -294,10 +301,44 @@ impl<'a> Cursor<'a> {
                     // expansion is cached per augment, and `current_children`
                     // memoizes this whole list per position, so the per-descent
                     // re-expansion that regressed in `84da49f` is avoided.
-                    let expanded =
-                        self.ctx
-                            .expand_augment_body(aug, &module.prefix, &module.key.name);
+                    let expanded = self.ctx.expand_augment_body(module, aug);
                     out.extend(expanded.iter().cloned());
+                }
+            }
+        }
+        out
+    }
+
+    /// Every external augment that targets the current position, with provenance:
+    /// the augmenting module, the source [`AugmentEntry`], and that augment's
+    /// composed (expanded, overlay-applied) body.
+    ///
+    /// This is the emit-side companion to [`child_nodes`](Self::child_nodes):
+    /// where `child_nodes`/`child_nodes_structural` merge every augment's nodes
+    /// into one list, `augments_at` preserves *which augment contributed which
+    /// nodes*. A backend that emits per-augment records (e.g. a `load_augment`
+    /// record, or a cs-record range attributed to its source augment) can pair
+    /// each record with its `AugmentEntry` and the bodies the cursor view already
+    /// splices in — without re-walking the raw schema or re-implementing the §11
+    /// `uses`-body expansion. The returned bodies are the same `Arc`-shared,
+    /// cached expansions `child_nodes` uses, so this allocates nothing new.
+    ///
+    /// To enumerate the augments a module *declares* (rather than those landing at
+    /// a position), iterate [`CompiledModule::augments`] directly and call
+    /// [`ExpansionCtx::expand_augment_body`](crate::compiler::ExpansionCtx::expand_augment_body)
+    /// per entry — the cursor is the read-side view, that field is the emit-side one.
+    pub fn augments_at(&self) -> Vec<(&'a CompiledModule, &'a AugmentEntry, Arc<Vec<SchemaNode>>)> {
+        let abs = self.current_abs_path();
+        if abs.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for module in self.ctx.registry.modules.values() {
+            let module = module.as_ref();
+            for aug in &module.augments {
+                if augment_target_matches(module, &aug.target_path, &abs) {
+                    let body = self.ctx.expand_augment_body(module, aug);
+                    out.push((module, aug, body));
                 }
             }
         }

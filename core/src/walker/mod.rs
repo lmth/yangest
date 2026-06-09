@@ -200,9 +200,7 @@ impl<'a> SchemaWalker<'a> {
             // Contributed names come from the *expanded* augment body (a `uses g;`
             // body stores a single `Uses` node), served from the cached expansion
             // the cursor also uses.
-            let body = self
-                .ctx
-                .expand_augment_body(aug, &self.module.prefix, &self.module.key.name);
+            let body = self.ctx.expand_augment_body(self.module, aug);
             let host_children = target_cursor.child_nodes();
             for body_node in body.iter() {
                 if let Some(child) = host_children.iter().find(|c| {

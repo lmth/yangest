@@ -10,6 +10,7 @@ use crate::ast::ModuleKey;
 use crate::compiler::{compile_module, ModuleRegistry};
 use crate::devindex::DeviationIndex;
 use crate::parser::parse_yang;
+use crate::plugin::OverlayExtension;
 
 fn registry_from(sources: &[(&str, &str)]) -> ModuleRegistry {
     let mut reg = ModuleRegistry::new();
@@ -351,5 +352,173 @@ module aug {
     assert!(
         names.iter().any(|n| n == "extra"),
         "augment body `uses g` container must be composed structurally: {names:?}"
+    );
+}
+
+#[test]
+fn augments_at_yields_source_provenance() {
+    // `augments_at` is the emit-side companion to `child_nodes`: it preserves
+    // which augment (and which module) contributed which nodes, with each
+    // augment's body already expanded (the `uses g;` body is the §11 case).
+    let reg = registry_from(&[
+        (
+            "base",
+            r#"
+module base {
+  namespace "urn:base";
+  prefix b;
+  container c { leaf own { type string; } }
+}
+"#,
+        ),
+        (
+            "aug",
+            r#"
+module aug {
+  namespace "urn:aug";
+  prefix a;
+  import base { prefix b; }
+  grouping g { leaf added { type uint32; } }
+  augment "/b:c" { uses g; }
+}
+"#,
+        ),
+    ]);
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("base", None).unwrap();
+    let mut cur = Cursor::root_of(&m, &cx);
+    cur.move_to_child(&QName::bare("c")).unwrap();
+
+    let provenance = cur.augments_at();
+    assert_eq!(provenance.len(), 1, "exactly one augment targets /b:c");
+    let (src_module, aug_entry, body) = &provenance[0];
+    assert_eq!(
+        src_module.key.name, "aug",
+        "provenance points back to the augmenting module"
+    );
+    assert_eq!(
+        format_augment_target(&aug_entry.target_path),
+        "b:c",
+        "the source AugmentEntry is carried through"
+    );
+    let body_names: Vec<&str> = body.iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(
+        body_names,
+        vec!["added"],
+        "the `uses g` body is expanded, not surfaced as a raw Uses node"
+    );
+
+    // The provenance bodies are exactly the nodes the merged view splices in.
+    let child_names: Vec<String> = cur.child_nodes().iter().map(|n| n.name.clone()).collect();
+    assert!(child_names.iter().any(|n| n == "own"));
+    assert!(child_names.iter().any(|n| n == "added"));
+
+    // At the module root there are no augments.
+    let root = Cursor::root_of(&m, &cx);
+    assert!(root.augments_at().is_empty());
+}
+
+/// Render an augment target path as `prefix:name/...` for assertions.
+fn format_augment_target(path: &[crate::compiler::PathStep]) -> String {
+    path.iter()
+        .map(|s| match &s.prefix {
+            Some(p) => format!("{p}:{}", s.name),
+            None => s.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[test]
+fn augment_body_carries_augmenting_module_overlay() {
+    // The cursor composes an external augment whose body is `uses g;`, and a
+    // separate annotation module annotates a node *inside* that grouping. Because
+    // the annotated node does not exist until the `uses` is expanded, its
+    // annotation cannot be baked in at compile time — it lands in the *augmenting*
+    // module's overlay and is applied during expansion. The cursor's composed view
+    // must carry it: `expand_augment_body` expands the body with the augmenting
+    // module's overlay and the augment target path (the same call the tree plugin
+    // makes), not an empty overlay. Composing it overlay-less silently drops the
+    // annotation — the deep-`when`/`must` regression a byte-faithful backend hit.
+    let parse = |src: &str| {
+        let (stmts, errs) = parse_yang(src, Arc::from("t.yang"));
+        assert!(errs.is_empty(), "parse errors: {errs:?}");
+        let stmt = stmts.into_iter().next().unwrap();
+        let name = stmt.arg.clone().unwrap();
+        (ModuleKey::latest(&name), stmt)
+    };
+
+    let base_src = r#"
+module base {
+  namespace "urn:base";
+  prefix b;
+  container c { leaf own { type string; } }
+}
+"#;
+    let aug_src = r#"
+module aug {
+  namespace "urn:aug";
+  prefix a;
+  import base { prefix b; }
+  grouping g { leaf added { type uint32; } }
+  augment "/b:c" { uses g; }
+}
+"#;
+    // Annotation module: annotates the grouping-introduced node inside the augment
+    // body. Fed only through the annotation index (not compiled into the registry).
+    let ann_src = r#"
+module annmod {
+  namespace "urn:annmod";
+  prefix am;
+  import base { prefix b; }
+  import aug { prefix a; }
+  import xann { prefix xann; }
+  xann:annotate "/b:c/a:added" {
+    xann:callpoint "cp";
+  }
+}
+"#;
+    let (base_key, base_stmt) = parse(base_src);
+    let (aug_key, aug_stmt) = parse(aug_src);
+    let (ann_key, ann_stmt) = parse(ann_src);
+
+    static OVERLAY: &[OverlayExtension] = &[OverlayExtension {
+        module: "xann",
+        name: "annotate",
+        source_plugin: "test",
+    }];
+    let ann_index = AnnotationIndex::build(&[(ann_key, ann_stmt)], OVERLAY);
+
+    let mut reg = ModuleRegistry::new();
+    for (key, stmt) in [(base_key, base_stmt), (aug_key, aug_stmt)] {
+        let compiled = compile_module(
+            &key,
+            stmt,
+            &reg,
+            &DeviationIndex::default(),
+            &ann_index,
+            &AstAnnotationIndex::default(),
+        );
+        reg.insert(Arc::new(compiled));
+    }
+
+    let feats = HashSet::new();
+    let cx = ctx(&reg, &feats);
+    let m = reg.resolve_import("base", None).unwrap();
+    let mut cur = Cursor::root_of(&m, &cx);
+    cur.move_to_child(&QName::bare("c")).unwrap();
+
+    let kids = cur.child_nodes();
+    let added = kids
+        .iter()
+        .find(|n| n.name == "added")
+        .expect("grouping node `added` from the `uses g` augment body is composed in");
+    assert!(
+        added.extensions.iter().any(|e| e.name == "callpoint"),
+        "the annotation on the grouping node inside the augment body must surface \
+         on the cursor view, proving the augmenting module's overlay is applied to \
+         the expanded `uses` body: got {:?}",
+        added.extensions.iter().map(|e| &e.name).collect::<Vec<_>>()
     );
 }

@@ -622,6 +622,21 @@ For incremental namespace registration during type resolution, implement
 `follow_leafref_with_observer`; the default resolution paths use a zero-cost no-op
 observer.
 
+### Structural and emit-side cursor views
+
+The logical view (`find_child` / `child_nodes`) flattens `choice`/`case` away, which
+is what RFC 7950 §6.5/§9.9.2 require for leafref / XPath / `when` resolution. A backend
+that must instead *render* the schema — distinguishing data nodes from `choice`/`case`
+wrappers, or attributing emitted records to the augment that produced them — has these
+companions:
+
+| Method | What it gives |
+|--------|---------------|
+| `Cursor::child_nodes_structural()` | The same composed children as `child_nodes()` — node children plus every external augment targeting the position, including augment bodies that are themselves `uses grouping;` — **without** the `choice`/`case` flattening, so those nodes survive as `SchemaNodeKind::Choice`/`Case`. Use it to detect or record structural nesting (e.g. when an augment target's last step is a `case`). It is *not* addressable by `find_child` — `choice`/`case` are not navigable steps. |
+| `Cursor::augments_at()` | The emit-side companion to `child_nodes`: each augment targeting the current position as a `(&CompiledModule, &AugmentEntry, Arc<Vec<SchemaNode>>)` triple — the augmenting module, the source augment, and its composed (expanded, overlay-applied) body. Preserves which augment contributed which nodes, so per-augment records can be paired with their source without re-walking the schema. |
+| `Cursor::current_abs_path()` | The module-qualified absolute path of the current node (`Vec<(module, name)>`, root-first) — a stable fully-qualified key for emitted records. |
+| `ExpansionCtx::expand_augment_body(module, aug)` | The composed body of a *single* `&AugmentEntry`, expanded with the augmenting module's overlay and the augment target path (identical to how the tree plugin renders an `augment` section) and cached. This is the only correct way to expand a body that is `uses grouping;`: a hand-rolled `expand_children` with an empty overlay silently drops annotations (`when`/`must`/extensions) that an annotation module attaches to nodes inside the grouping. To enumerate the augments a module *declares*, iterate `CompiledModule::augments` and call this per entry; to find the augments landing *at a position*, use `augments_at`. |
+
 ---
 
 ## 4. Creating a plugin crate

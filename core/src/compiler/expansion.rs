@@ -97,19 +97,37 @@ impl<'a> ExpansionCtx<'a> {
     }
 
     /// Return the *expanded* children contributed by an augment body, caching the
-    /// result. `own_prefix`/`module_name` are the augmenting module's.
-    pub(crate) fn expand_augment_body(
+    /// result keyed on the augment.
+    ///
+    /// The augmenting `module`'s own overlay is applied with the augment's target
+    /// path as the parent path, so target-path-keyed annotations (e.g. a `when` or
+    /// `must` that an annotation module attaches several levels into the augment
+    /// body) land on the composed view. This is the same expansion the tree plugin
+    /// and compile path perform for an augment section
+    /// (`expand_children(&aug.nodes, &module.prefix, &module.key.name,
+    /// &module.overlay, &aug.target_path, ctx)`); composing the body without the
+    /// overlay would silently drop those annotations.
+    ///
+    /// Exposed (`pub`) so a backend can obtain the composed body of a *single*
+    /// augment with provenance — see
+    /// [`Cursor::augments_at`](crate::cursor::Cursor::augments_at).
+    pub fn expand_augment_body(
         &self,
+        module: &CompiledModule,
         aug: &AugmentEntry,
-        own_prefix: &str,
-        module_name: &str,
     ) -> Arc<Vec<SchemaNode>> {
-        let key = (aug as *const AugmentEntry, own_prefix.to_string());
+        let key = (aug as *const AugmentEntry, module.prefix.clone());
         if let Some(cached) = self.augment_cache.borrow().get(&key) {
             return Arc::clone(cached);
         }
-        let empty = NodeOverlayMap::new();
-        let expanded = expand_children(&aug.nodes, own_prefix, module_name, &empty, &[], self);
+        let expanded = expand_children(
+            &aug.nodes,
+            &module.prefix,
+            &module.key.name,
+            &module.overlay,
+            &aug.target_path,
+            self,
+        );
         let arc = Arc::new(expanded);
         self.augment_cache.borrow_mut().insert(key, Arc::clone(&arc));
         arc
