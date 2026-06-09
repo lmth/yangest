@@ -62,6 +62,8 @@ pub trait Plugin: Send + Sync {
 
     fn yang_grammar(&self) -> &'static [ExtensionGrammar] { &[] }
 
+    fn configure_compilation(&self, _flags: &mut CompilationFlags) {}
+
     fn prepare_bundle(
         &self,
         _modules: &[Arc<CompiledModule>],
@@ -128,6 +130,32 @@ and long names should be namespaced with the plugin name (e.g. `"tree-depth"` /
 Called once, after CLI parsing, with the global `ArgMatches`. Extract the plugin's own
 arguments here and apply them to `self`. Plugins without CLI arguments can leave the
 default no-op in place.
+
+### `configure_compilation`
+
+Called once after all plugins are configured but **before any module is compiled**, with
+a mutable reference to the registry's `CompilationFlags`. A plugin uses this to ask the
+compiler to honour a behaviour it depends on — most usefully, to extract a plugin-specific
+`typedef` extension into the compiled `Typedef` (`opaque_type_name` / `ext_info`), or to
+recognise an explicit-dependency extension on `must`/`when`. Because the compiler reads
+these flags *during* compilation, this is the only point at which they can be set.
+
+It is the seam that keeps backend-specific extension bindings inside the plugin: core and
+the generic `yangest` binary never name a vendor extension. For example, a byte-faithful
+backend that resolves opaque types at runtime via a named type-point would set:
+
+```rust
+fn configure_compilation(&self, flags: &mut CompilationFlags) {
+    flags.opaque_type_extension = Some(("acme-ext".into(), "typepoint".into()));
+    flags.typedef_info_extension = Some(("acme-ext".into(), "info".into()));
+}
+```
+
+With this in place, a `typedef` carrying `acme:typepoint "name"` compiles to a `Typedef`
+whose `has_opaque_type` is `true` and `opaque_type_name` is `Some("name")`, so a backend
+can emit `{user_defined, name}` rather than expanding the full restriction body. Set only
+the fields your plugin owns; if two plugins set the same field the later (by `name()`
+order) wins, so distinct plugins must not claim the same flag.
 
 ### `overlay_extensions`
 

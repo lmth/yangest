@@ -4490,6 +4490,90 @@ module example {
     }
 
     #[test]
+    fn extracts_opaque_type_and_info_when_flags_configured() {
+        // A backend plugin declares (via Plugin::configure_compilation) that the
+        // compiler should extract two typedef extensions: an opaque-type marker
+        // and an info string. With the flags set, compilation populates
+        // Typedef::{has_opaque_type, opaque_type_name, ext_info}. Without them
+        // (the default), those stay empty even though the extensions are present.
+        let stmt = parse_module(
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  import acme-ext { prefix acme; }
+  typedef opaque-prefix {
+    acme:info "human readable";
+    acme:typepoint "opaque_name";
+    type string { pattern 'x.*'; }
+  }
+}
+"#,
+        );
+
+        // Default flags: extensions present but not extracted.
+        let plain = compile_module(
+            &ModuleKey::latest("m"),
+            stmt.clone(),
+            &ModuleRegistry::default(),
+            &DeviationIndex::default(),
+            &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
+        );
+        let td = plain.typedefs.get("opaque-prefix").expect("typedef present");
+        assert!(!td.has_opaque_type, "no extraction without flags");
+        assert_eq!(td.opaque_type_name, None);
+        assert_eq!(td.ext_info, None);
+
+        // Flags configured exactly as Plugin::configure_compilation would set them.
+        let mut reg = ModuleRegistry::default();
+        reg.flags.opaque_type_extension = Some(("acme-ext".into(), "typepoint".into()));
+        reg.flags.typedef_info_extension = Some(("acme-ext".into(), "info".into()));
+        let compiled = compile_module(
+            &ModuleKey::latest("m"),
+            stmt,
+            &reg,
+            &DeviationIndex::default(),
+            &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
+        );
+        let td = compiled.typedefs.get("opaque-prefix").expect("typedef present");
+        assert!(td.has_opaque_type, "opaque-type extension extracted");
+        assert_eq!(td.opaque_type_name.as_deref(), Some("opaque_name"));
+        assert_eq!(td.ext_info.as_deref(), Some("human readable"));
+    }
+
+    #[test]
+    fn configure_compilation_hook_sets_flags() {
+        // The Plugin trait hook is the seam the binary uses to apply each
+        // plugin's required flags before compilation.
+        use crate::plugin::Plugin;
+
+        struct OpaqueBackend;
+        impl Plugin for OpaqueBackend {
+            fn name(&self) -> &'static str {
+                "opaque-backend"
+            }
+            fn configure_compilation(&self, flags: &mut CompilationFlags) {
+                flags.opaque_type_extension = Some(("acme-ext".into(), "typepoint".into()));
+                flags.typedef_info_extension = Some(("acme-ext".into(), "info".into()));
+            }
+        }
+
+        let mut flags = CompilationFlags::default();
+        assert!(flags.opaque_type_extension.is_none());
+        OpaqueBackend.configure_compilation(&mut flags);
+        assert_eq!(
+            flags.opaque_type_extension,
+            Some(("acme-ext".into(), "typepoint".into()))
+        );
+        assert_eq!(
+            flags.typedef_info_extension,
+            Some(("acme-ext".into(), "info".into()))
+        );
+    }
+
+    #[test]
     fn builds_prefix_map_from_imports() {
         let dep_stmt = parse_module(
             r#"

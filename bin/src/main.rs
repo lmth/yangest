@@ -397,6 +397,13 @@ fn main() {
     let mut initial_registry = ModuleRegistry::new();
     initial_registry.grammar = grammar_registry;
     initial_registry.flags.ignore_unknown_features = cli.ignore_unknown_features;
+    // Let each plugin declare the compilation-flag bindings it needs (e.g. a
+    // backend that extracts a typedef extension into the compiled typedef).
+    // Applied before the wave loop because the compiler reads these flags while
+    // compiling; core and this binary stay agnostic to the actual extensions.
+    for plugin in &plugins {
+        plugin.configure_compilation(&mut initial_registry.flags);
+    }
     let registry = Arc::new(RwLock::new(initial_registry));
     let mut all_compile_errors: Vec<ast::YError> = Vec::new();
 

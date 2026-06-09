@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use clap::{Arg, ArgMatches};
 
-use crate::compiler::{CompiledModule, ExpansionCtx, ModuleRegistry};
+use crate::compiler::{CompilationFlags, CompiledModule, ExpansionCtx, ModuleRegistry};
 use crate::grammar::ExtensionGrammar;
 
 /// Bundle-level shared state computed once before any per-module emission.
@@ -287,6 +287,34 @@ pub trait Plugin: Send + Sync {
     fn yang_grammar(&self) -> &'static [ExtensionGrammar] {
         &[]
     }
+
+    /// Declare the [`CompilationFlags`] this plugin needs the compiler to honour.
+    ///
+    /// Called once after all plugins are registered and have configured
+    /// themselves from the CLI, but **before any module is compiled** — the
+    /// compiler reads these flags during compilation, so they cannot be set
+    /// later. The host applies every plugin's configuration to the one shared
+    /// `CompilationFlags` on the registry.
+    ///
+    /// This is the seam that keeps backend-specific extension bindings inside
+    /// the plugin that needs them: core and the generic binary stay agnostic,
+    /// while a plugin can ask the compiler to, for example, extract a typedef
+    /// extension into [`Typedef::opaque_type_name`](crate::compiler::Typedef) /
+    /// [`Typedef::ext_info`](crate::compiler::Typedef), or recognise an
+    /// explicit-dependency extension on `must`/`when`.
+    ///
+    /// A plugin should set only the fields it owns. If two plugins set the same
+    /// field, the later registration wins (plugins are applied in `name()`
+    /// order), so distinct plugins must not claim the same flag. The default
+    /// implementation sets nothing.
+    ///
+    /// ```rust,ignore
+    /// fn configure_compilation(&self, flags: &mut CompilationFlags) {
+    ///     flags.opaque_type_extension = Some(("acme-ext".into(), "typepoint".into()));
+    ///     flags.typedef_info_extension = Some(("acme-ext".into(), "info".into()));
+    /// }
+    /// ```
+    fn configure_compilation(&self, _flags: &mut CompilationFlags) {}
 
     /// Compute bundle-level shared state once, before any per-module emission.
     ///
