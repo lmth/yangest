@@ -2550,6 +2550,7 @@ fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> 
                 overlay.source_module.as_deref().unwrap_or(""),
                 None,
                 false, // deviation, not refine
+                false, // if-feature parsing is refine-only; unused for deviations
                 &mut ignored_errors,
             ),
             Some("replace") => apply_node_mutation(
@@ -2559,6 +2560,7 @@ fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> 
                 overlay.source_module.as_deref().unwrap_or(""),
                 None,
                 false, // deviation, not refine
+                false, // if-feature parsing is refine-only; unused for deviations
                 &mut ignored_errors,
             ),
             Some("delete") => apply_node_mutation(
@@ -2568,6 +2570,7 @@ fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> 
                 overlay.source_module.as_deref().unwrap_or(""),
                 None,
                 false, // deviation, not refine
+                false, // if-feature parsing is refine-only; unused for deviations
                 &mut ignored_errors,
             ),
             _ => {}
@@ -2749,7 +2752,14 @@ fn expand_uses_lazy(
         let using_module = ctx.registry.resolve_import(module_name, None);
         let prefix_ctx = using_module.as_ref().map(|m| (own_prefix, &m.prefix_map));
         for refine in &uses_overlay.refine_stmts {
-            apply_refine_stmt(refine, &mut nodes, module_name, prefix_ctx, &mut ignored_errors);
+            apply_refine_stmt(
+                refine,
+                &mut nodes,
+                module_name,
+                prefix_ctx,
+                ctx.registry.flags.ignore_unknown_features,
+                &mut ignored_errors,
+            );
         }
         for augment in &uses_overlay.local_augments {
             apply_local_augment_entry(augment, &mut nodes, ctx);
@@ -2871,7 +2881,14 @@ fn expand_uses_lazy(
     let using_module2 = ctx.registry.resolve_import(module_name, None);
     let prefix_ctx2 = using_module2.as_ref().map(|m| (own_prefix, &m.prefix_map));
     for refine in &uses_overlay.refine_stmts {
-        apply_refine_stmt(refine, &mut nodes, module_name, prefix_ctx2, &mut ignored_errors);
+        apply_refine_stmt(
+            refine,
+            &mut nodes,
+            module_name,
+            prefix_ctx2,
+            ctx.registry.flags.ignore_unknown_features,
+            &mut ignored_errors,
+        );
     }
     for augment in &uses_overlay.local_augments {
         apply_local_augment_entry(augment, &mut nodes, ctx);
@@ -3086,6 +3103,7 @@ fn apply_refine_stmt(
     nodes: &mut Vec<SchemaNode>,
     source_module_name: &str,
     prefix_ctx: Option<(&str, &PrefixMap)>,
+    ignore_unknown: bool,
     module_errors: &mut Vec<YError>,
 ) {
     let Some(path) = parse_relative_schema_path(
@@ -3115,7 +3133,8 @@ fn apply_refine_stmt(
         MutationMode::Replace,
         source_module_name,
         prefix_ctx,
-        true, // refine: `must` is additive (RFC 7950 §7.13.2)
+        true, // refine: `must`/`if-feature` are additive (RFC 7950 §7.13.2)
+        ignore_unknown,
         module_errors,
     );
 }
@@ -3532,7 +3551,7 @@ fn apply_deviation_edit(
         return;
     };
 
-    apply_node_mutation(target, stmts, mode, source_module_name, None, false, module_errors);
+    apply_node_mutation(target, stmts, mode, source_module_name, None, false, false, module_errors);
 }
 
 fn apply_node_mutation(
@@ -3542,9 +3561,13 @@ fn apply_node_mutation(
     source_module_name: &str,
     prefix_ctx: Option<(&str, &PrefixMap)>,
     // True when the mutation comes from a `refine` (vs a `deviation`). Per RFC
-    // 7950 §7.13.2, a refine's `must` is *added* to the target's existing `must`
-    // expressions, not replaced — unlike `deviate replace`, which replaces.
+    // 7950 §7.13.2, a refine's `must` and `if-feature` are *added* to the
+    // target's existing lists, not replaced — unlike `deviate replace`.
     is_refine: bool,
+    // Whether unknown features/prefixes in a refine's `if-feature` are tolerated
+    // (treated as disabled) rather than reported. Only consulted on the refine
+    // path; deviations never parse `if-feature` here.
+    ignore_unknown: bool,
     module_errors: &mut Vec<YError>,
 ) {
     for stmt in stmts {
@@ -3567,7 +3590,27 @@ fn apply_node_mutation(
             }
             Some(BuiltInKeyword::When) => mutate_when_exprs(&mut node.when, stmt, mode, source_module_name, None),
             Some(BuiltInKeyword::IfFeature) => {
-                if mode == MutationMode::Delete {
+                if is_refine {
+                    // RFC 7950 §7.13.2: a refine adds `if-feature` expressions to
+                    // the target's existing list (like `must`). Parse in the using
+                    // module's context (its prefix/imports), which `prefix_ctx`
+                    // carries.
+                    if let (Some((own_prefix, prefix_map)), Some(raw)) =
+                        (prefix_ctx, stmt.arg.as_deref())
+                    {
+                        if let Some(expr) = parse_if_feature_expr(
+                            raw,
+                            own_prefix,
+                            source_module_name,
+                            prefix_map,
+                            &stmt.pos,
+                            module_errors,
+                            ignore_unknown,
+                        ) {
+                            node.if_features.push(expr);
+                        }
+                    }
+                } else if mode == MutationMode::Delete {
                     node.if_features.clear();
                 }
             }
@@ -4562,6 +4605,72 @@ module m {
             xpaths,
             vec!["../a", "../b", "../d"],
             "refine must must append after the grouping's existing musts, not replace them"
+        );
+    }
+
+    #[test]
+    fn refine_if_feature_appends_to_grouping_if_features() {
+        // RFC 7950 §7.13.2: a refine's `if-feature` is ADDED to the target's
+        // existing `if-feature` list, not replaced (and not dropped). A grouping
+        // leaf guarded by `f1`, used with a refine adding `if-feature f2`, must
+        // expand to a leaf carrying both.
+        let stmt = parse_module(
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  feature f1;
+  feature f2;
+  grouping g {
+    leaf l {
+      type string;
+      if-feature f1;
+    }
+  }
+  container c {
+    uses g {
+      refine "l" {
+        if-feature f2;
+      }
+    }
+  }
+}
+"#,
+        );
+        let compiled = compile_module(
+            &ModuleKey::latest("m"),
+            stmt,
+            &ModuleRegistry::default(),
+            &DeviationIndex::default(),
+            &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
+        );
+        assert!(compiled.errors.is_empty(), "compile errors: {:?}", compiled.errors);
+
+        let mut reg = ModuleRegistry::new();
+        reg.insert(Arc::new(compiled));
+        let module = reg.resolve_import("m", None).unwrap();
+        let ctx = ExpansionCtx::all_features(&reg);
+        let c = module
+            .children
+            .iter()
+            .find(|n| n.name == "c")
+            .expect("container c");
+        let kids = c.children(&ctx);
+        let l = kids.iter().find(|n| n.name == "l").expect("leaf l from grouping");
+        let names: Vec<&str> = l
+            .if_features
+            .iter()
+            .map(|f| match f {
+                IfFeatureExpr::Name(n, _) => n.as_str(),
+                _ => panic!("expected a bare feature name, got {f:?}"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["f1", "f2"],
+            "refine if-feature must append after the grouping's existing if-features, \
+             not drop or replace them"
         );
     }
 
