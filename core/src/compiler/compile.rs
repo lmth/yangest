@@ -2549,6 +2549,7 @@ fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> 
                 MutationMode::Add,
                 overlay.source_module.as_deref().unwrap_or(""),
                 None,
+                false, // deviation, not refine
                 &mut ignored_errors,
             ),
             Some("replace") => apply_node_mutation(
@@ -2557,6 +2558,7 @@ fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> 
                 MutationMode::Replace,
                 overlay.source_module.as_deref().unwrap_or(""),
                 None,
+                false, // deviation, not refine
                 &mut ignored_errors,
             ),
             Some("delete") => apply_node_mutation(
@@ -2565,6 +2567,7 @@ fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> 
                 MutationMode::Delete,
                 overlay.source_module.as_deref().unwrap_or(""),
                 None,
+                false, // deviation, not refine
                 &mut ignored_errors,
             ),
             _ => {}
@@ -3112,6 +3115,7 @@ fn apply_refine_stmt(
         MutationMode::Replace,
         source_module_name,
         prefix_ctx,
+        true, // refine: `must` is additive (RFC 7950 §7.13.2)
         module_errors,
     );
 }
@@ -3528,7 +3532,7 @@ fn apply_deviation_edit(
         return;
     };
 
-    apply_node_mutation(target, stmts, mode, source_module_name, None, module_errors);
+    apply_node_mutation(target, stmts, mode, source_module_name, None, false, module_errors);
 }
 
 fn apply_node_mutation(
@@ -3537,6 +3541,10 @@ fn apply_node_mutation(
     mode: MutationMode,
     source_module_name: &str,
     prefix_ctx: Option<(&str, &PrefixMap)>,
+    // True when the mutation comes from a `refine` (vs a `deviation`). Per RFC
+    // 7950 §7.13.2, a refine's `must` is *added* to the target's existing `must`
+    // expressions, not replaced — unlike `deviate replace`, which replaces.
+    is_refine: bool,
     module_errors: &mut Vec<YError>,
 ) {
     for stmt in stmts {
@@ -3563,17 +3571,24 @@ fn apply_node_mutation(
                     node.if_features.clear();
                 }
             }
-            Some(BuiltInKeyword::Must) => match &mut node.kind {
-                SchemaNodeKind::Container { musts, .. }
-                | SchemaNodeKind::Leaf { musts, .. }
-                | SchemaNodeKind::LeafList { musts, .. }
-                | SchemaNodeKind::List { musts, .. }
-                | SchemaNodeKind::Rpc { musts, .. }
-                | SchemaNodeKind::Notification { musts, .. }
-                | SchemaNodeKind::AnyXml { musts, .. }
-                | SchemaNodeKind::AnyData { musts, .. } => mutate_must_exprs(musts, stmt, mode, source_module_name, None),
-                _ => {}
-            },
+            Some(BuiltInKeyword::Must) => {
+                // RFC 7950 §7.13.2: a refine adds `must` expressions to the
+                // existing list; only a deviation replaces them.
+                let must_mode = if is_refine { MutationMode::Add } else { mode };
+                match &mut node.kind {
+                    SchemaNodeKind::Container { musts, .. }
+                    | SchemaNodeKind::Leaf { musts, .. }
+                    | SchemaNodeKind::LeafList { musts, .. }
+                    | SchemaNodeKind::List { musts, .. }
+                    | SchemaNodeKind::Rpc { musts, .. }
+                    | SchemaNodeKind::Notification { musts, .. }
+                    | SchemaNodeKind::AnyXml { musts, .. }
+                    | SchemaNodeKind::AnyData { musts, .. } => {
+                        mutate_must_exprs(musts, stmt, must_mode, source_module_name, None)
+                    }
+                    _ => {}
+                }
+            }
             Some(BuiltInKeyword::Mandatory) => match &mut node.kind {
                 SchemaNodeKind::Leaf { mandatory, .. }
                 | SchemaNodeKind::Choice { mandatory, .. }
@@ -4487,6 +4502,67 @@ module example {
         assert_eq!(compiled.yang_version, YangVersion::V11);
         assert_eq!(compiled.namespace, "urn:example");
         assert_eq!(compiled.prefix, "ex");
+    }
+
+    #[test]
+    fn refine_must_appends_to_grouping_musts() {
+        // RFC 7950 §7.13.2: a refine's `must` is ADDED to the target's existing
+        // `must` list, not replaced. A grouping leaf with two musts, used with a
+        // refine adding a third, must expand to a leaf carrying all three.
+        let stmt = parse_module(
+            r#"
+module m {
+  namespace "urn:m";
+  prefix m;
+  grouping g {
+    leaf l {
+      type string;
+      must "../a";
+      must "../b";
+    }
+  }
+  container c {
+    uses g {
+      refine "l" {
+        must "../d";
+      }
+    }
+  }
+}
+"#,
+        );
+        let compiled = compile_module(
+            &ModuleKey::latest("m"),
+            stmt,
+            &ModuleRegistry::default(),
+            &DeviationIndex::default(),
+            &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
+        );
+        assert!(compiled.errors.is_empty(), "compile errors: {:?}", compiled.errors);
+
+        let mut reg = ModuleRegistry::new();
+        reg.insert(Arc::new(compiled));
+        let module = reg.resolve_import("m", None).unwrap();
+        let ctx = ExpansionCtx::all_features(&reg);
+        // Expand `c`'s children (drives the `uses g { refine }` expansion).
+        let c = module
+            .children
+            .iter()
+            .find(|n| n.name == "c")
+            .expect("container c");
+        let kids = c.children(&ctx);
+        let l = kids.iter().find(|n| n.name == "l").expect("leaf l from grouping");
+        let musts = match &l.kind {
+            SchemaNodeKind::Leaf { musts, .. } => musts,
+            other => panic!("expected leaf, got {other:?}"),
+        };
+        let xpaths: Vec<&str> = musts.iter().map(|m| m.xpath.as_str()).collect();
+        assert_eq!(
+            xpaths,
+            vec!["../a", "../b", "../d"],
+            "refine must must append after the grouping's existing musts, not replace them"
+        );
     }
 
     #[test]
