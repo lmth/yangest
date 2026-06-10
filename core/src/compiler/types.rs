@@ -221,6 +221,12 @@ pub struct SchemaNode {
     pub origin_module: String,
     pub pos: Pos,
     pub status: Status,
+    /// Source position of the `status` substatement, when one was explicitly
+    /// declared on this node. `None` when `status` is implicit (`current`), or
+    /// when the node is synthesised (e.g. an implicit `case`). Lets a backend
+    /// order `status` against other substatements (extensions, etc.) by source
+    /// position when reproducing declaration-order-sensitive output.
+    pub status_pos: Option<Pos>,
     pub config: Option<bool>,
     pub when: Vec<WhenExpr>,
     pub if_features: Vec<IfFeatureExpr>,
@@ -261,6 +267,7 @@ impl Clone for SchemaNode {
             origin_module: self.origin_module.clone(),
             pos: self.pos.clone(),
             status: self.status,
+            status_pos: self.status_pos.clone(),
             config: self.config,
             when: self.when.clone(),
             if_features: self.if_features.clone(),

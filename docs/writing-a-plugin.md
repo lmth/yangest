@@ -336,6 +336,7 @@ A single node in the compiled data tree (container, leaf, list, choice, RPC, …
 | `module_prefix` | `String` | Own prefix of the defining module, used as a fallback when rendering augmented nodes. |
 | `pos` | `Pos` | Source file location (file path and line number). |
 | `status` | `Status` | `Current`, `Deprecated`, or `Obsolete`. |
+| `status_pos` | `Option<Pos>` | Source position of the `status` substatement, when one was explicitly declared (`None` for implicit `current` or synthesised nodes). Lets a backend order `status` against neighbouring substatements (e.g. extensions, via `ExtensionInstance::pos`) by declaration position. |
 | `config` | `Option<bool>` | Explicit `config` statement; `None` means "inherit from parent". |
 | `when` | `Vec<WhenExpr>` | `when` XPath constraints on this node (empty if none). |
 | `if_features` | `Vec<IfFeatureExpr>` | `if-feature` guards; evaluated by `ExpansionCtx` to determine node visibility. |

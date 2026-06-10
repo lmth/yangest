@@ -23,6 +23,7 @@ struct NodeCommon {
     name: String,
     pos: Pos,
     status: Status,
+    status_pos: Option<Pos>,
     config: Option<bool>,
     when: Vec<WhenExpr>,
     if_features: Vec<IfFeatureExpr>,
@@ -895,6 +896,7 @@ fn compile_uses_node(
         origin_module: key.name.clone(),
         pos: uses_stmt.pos.clone(),
         status: Status::Current,
+        status_pos: None, // synthetic `__uses__` placeholder node
         config: None,
         when: Vec::new(),
         if_features: Vec::new(),
@@ -1131,6 +1133,7 @@ fn compile_schema_node(
         origin_module: source_module_name.to_string(),
         pos: common.pos,
         status: common.status,
+        status_pos: common.status_pos,
         config: common.config,
         when: common.when,
         if_features: common.if_features,
@@ -1220,6 +1223,8 @@ fn compile_choice_cases(
                     origin_module: source_module_name.to_string(),
                     pos: sub.pos.clone(),
                     status: Status::Current,
+                    // `case` status is not parsed here (kept `current`); no position.
+                    status_pos: None,
                     config: None,
                     when: Vec::new(),
                     if_features: Vec::new(),
@@ -1283,6 +1288,9 @@ fn compile_node_common(
         name: required_stmt_name(stmt, module_errors).unwrap_or_default(),
         pos: stmt.pos.clone(),
         status: parse_status(stmt, module_errors),
+        status_pos: stmt
+            .get_substmt(BuiltInKeyword::Status)
+            .map(|s| s.pos.clone()),
         config: opt_bool_substmt(stmt, BuiltInKeyword::Config, module_errors),
         when: collect_when_exprs(stmt, own_prefix, prefix_map, source_module_name, module_errors, flags),
         if_features: collect_if_features(
@@ -2965,6 +2973,7 @@ fn inline_local_augment_into(
                                 origin_module: case_origin,
                                 pos: case_pos,
                                 status: Status::Current,
+                                status_pos: None, // synthetic implicit `case` wrapper
                                 config: None,
                                 when: Vec::new(),
                                 if_features: Vec::new(),
@@ -3617,9 +3626,16 @@ fn apply_node_mutation(
                 _ => node.config = opt_bool_arg(stmt, module_errors),
             },
             Some(BuiltInKeyword::Status) => match mode {
-                MutationMode::Delete => node.status = Status::Current,
+                MutationMode::Delete => {
+                    node.status = Status::Current;
+                    node.status_pos = None;
+                }
                 MutationMode::Add if node.status != Status::Current => {}
-                _ => node.status = parse_status_arg(stmt, module_errors),
+                _ => {
+                    node.status = parse_status_arg(stmt, module_errors);
+                    // Re-point to the refine/deviate `status` substatement.
+                    node.status_pos = Some(stmt.pos.clone());
+                }
             },
             Some(BuiltInKeyword::Description) => {
                 apply_opt_string(mode, &mut node.description, stmt.arg.clone())
@@ -4858,6 +4874,111 @@ module example-dev {
             musts,
             vec![("../sibling".to_string(), vec!["../sibling".to_string()], false)],
             "deviate-added must on a uses-introduced node must keep its explicit_deps"
+        );
+    }
+
+    #[test]
+    fn status_pos_records_declaration_position_for_ordering() {
+        // status_pos lets a backend order `status` against neighbouring
+        // substatements (here an extension) by source position. The two lists
+        // declare the pair in opposite order; the relative line of status_pos vs
+        // the extension's pos must reflect that.
+        let ext_mod = parse_module(
+            r#"
+module acme-ext {
+  namespace "urn:acme:ext";
+  prefix acme;
+  extension alt-name { argument name; }
+}
+"#,
+        );
+        let stmt = parse_module(
+            r#"
+module example-status-pos {
+  yang-version 1.1;
+  namespace "urn:example:status-pos";
+  prefix esp;
+  import acme-ext { prefix acme; }
+
+  // alt-name declared BEFORE status
+  list a {
+    key id;
+    acme:alt-name "a-old";
+    status obsolete;
+    leaf id { type string; }
+  }
+  // status declared BEFORE alt-name
+  list b {
+    key id;
+    status obsolete;
+    acme:alt-name "b-old";
+    leaf id { type string; }
+  }
+  // no explicit status
+  list c {
+    key id;
+    leaf id { type string; }
+  }
+}
+"#,
+        );
+        let mut reg = ModuleRegistry::new();
+        reg.insert(Arc::new(compile_module(
+            &ModuleKey::latest("acme-ext"),
+            ext_mod,
+            &reg,
+            &DeviationIndex::default(),
+            &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
+        )));
+        let compiled = compile_module(
+            &ModuleKey::latest("example-status-pos"),
+            stmt,
+            &reg,
+            &DeviationIndex::default(),
+            &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
+        );
+        assert!(compiled.errors.is_empty(), "errors: {:?}", compiled.errors);
+
+        let line = |p: &Pos| match p {
+            Pos::FilePos { line, .. } => *line,
+            other => panic!("expected FilePos, got {other:?}"),
+        };
+        let get = |name: &str| {
+            compiled
+                .children
+                .iter()
+                .find(|n| n.name == name)
+                .unwrap_or_else(|| panic!("node {name}"))
+        };
+        let alt_name_pos = |n: &SchemaNode| {
+            n.extensions
+                .iter()
+                .find(|e| e.name == "alt-name")
+                .unwrap_or_else(|| panic!("alt-name on {}", n.name))
+                .pos
+                .clone()
+        };
+
+        let a = get("a");
+        let a_status = a.status_pos.as_ref().expect("a has explicit status");
+        assert!(
+            line(a_status) > line(&alt_name_pos(a)),
+            "in `a`, status is declared after alt-name"
+        );
+
+        let b = get("b");
+        let b_status = b.status_pos.as_ref().expect("b has explicit status");
+        assert!(
+            line(b_status) < line(&alt_name_pos(b)),
+            "in `b`, status is declared before alt-name"
+        );
+
+        assert_eq!(
+            get("c").status_pos,
+            None,
+            "implicit `current` status carries no position"
         );
     }
 
