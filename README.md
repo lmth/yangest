@@ -79,10 +79,11 @@ Core options:
                                  Like gcc -Werror: any warning fails the run, and
                                  compile/parse warnings stop before output.
       --scope-grouping-annotations
-                                 Scope annotation-injected must/when to the
-                                 annotated module: a constraint an annotate-module
-                                 overlay injects into a grouping is dropped from
-                                 other modules that reuse the grouping via `uses`
+                                 Scope annotation-injected statements (must/when
+                                 and extensions like hidden/cli-*) to the annotated
+                                 module: a statement an annotate-module overlay
+                                 injects into a grouping is dropped from other
+                                 modules that reuse the grouping via `uses`
                                  (reference/yanger behaviour). Off by default.
 
 Input bundle:

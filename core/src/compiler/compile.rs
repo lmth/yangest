@@ -2774,16 +2774,16 @@ fn expand_uses_lazy(
     // shared Arc. The scan is the cost the flag opts into.
     if expanded
         .iter()
-        .any(|n| node_has_foreign_annotation_constraint(n, module_name, ann))
+        .any(|n| node_has_foreign_annotation(n, module_name, ann))
     {
-        Arc::new(filter_foreign_annotation_constraints(&expanded, module_name, ann))
+        Arc::new(filter_foreign_annotations(&expanded, module_name, ann))
     } else {
         expanded
     }
 }
 
-/// True when a `must`/`when` was injected by an annotation module whose target is
-/// not `consuming` (so it must be dropped from `consuming`'s expansion).
+/// True when a `must`/`when` (identified by its already-resolved `source_module`)
+/// was injected by an annotation module whose target is not `consuming`.
 fn is_foreign_annotation_constraint(
     source_module: &str,
     consuming: &str,
@@ -2792,8 +2792,25 @@ fn is_foreign_annotation_constraint(
     ann.is_annotation_module(source_module) && !ann.annotation_targets(source_module, consuming)
 }
 
-/// Recursively scan for any annotation-injected `must`/`when` foreign to `consuming`.
-fn node_has_foreign_annotation_constraint(
+/// True when an extension instance was injected by an annotation module whose
+/// target is not `consuming`. Extensions don't carry a resolved source-module the
+/// way `must`/`when` do, so provenance comes from the statement's *original* file
+/// (`pos.orig_file()`, which survives `uses` expansion) — the same resolution
+/// `compile_must_expr` uses to stamp `MustExpr::source_module`.
+fn is_foreign_annotation_ext(
+    ext: &ExtensionInstance,
+    consuming: &str,
+    ann: &AstAnnotationIndex,
+) -> bool {
+    match ann.module_key_for_file(ext.pos.orig_file()) {
+        Some(ann_key) => !ann.annotation_targets(&ann_key.name, consuming),
+        None => false,
+    }
+}
+
+/// Recursively scan for any annotation-injected `must`/`when`/extension foreign to
+/// `consuming`.
+fn node_has_foreign_annotation(
     node: &SchemaNode,
     consuming: &str,
     ann: &AstAnnotationIndex,
@@ -2802,6 +2819,10 @@ fn node_has_foreign_annotation_constraint(
         .when
         .iter()
         .any(|w| is_foreign_annotation_constraint(&w.source_module, consuming, ann))
+        || node
+            .extensions
+            .iter()
+            .any(|e| is_foreign_annotation_ext(e, consuming, ann))
     {
         return true;
     }
@@ -2812,7 +2833,7 @@ fn node_has_foreign_annotation_constraint(
     };
     let kids_foreign = |kids: &[SchemaNode]| {
         kids.iter()
-            .any(|k| node_has_foreign_annotation_constraint(k, consuming, ann))
+            .any(|k| node_has_foreign_annotation(k, consuming, ann))
     };
     match &node.kind {
         SchemaNodeKind::Container { children, musts, .. }
@@ -2834,9 +2855,9 @@ fn node_has_foreign_annotation_constraint(
     }
 }
 
-/// Clone `nodes`, dropping annotation-injected `must`/`when` foreign to `consuming`,
-/// recursing into children/cases/input/output.
-fn filter_foreign_annotation_constraints(
+/// Clone `nodes`, dropping annotation-injected `must`/`when`/extension statements
+/// foreign to `consuming`, recursing into children/cases/input/output.
+fn filter_foreign_annotations(
     nodes: &[SchemaNode],
     consuming: &str,
     ann: &AstAnnotationIndex,
@@ -2845,13 +2866,15 @@ fn filter_foreign_annotation_constraints(
         musts.retain(|m| !is_foreign_annotation_constraint(&m.source_module, consuming, ann));
     };
     let recurse =
-        |kids: &Arc<Vec<SchemaNode>>| Arc::new(filter_foreign_annotation_constraints(kids, consuming, ann));
+        |kids: &Arc<Vec<SchemaNode>>| Arc::new(filter_foreign_annotations(kids, consuming, ann));
     nodes
         .iter()
         .map(|node| {
             let mut node = node.clone();
             node.when
                 .retain(|w| !is_foreign_annotation_constraint(&w.source_module, consuming, ann));
+            node.extensions
+                .retain(|e| !is_foreign_annotation_ext(e, consuming, ann));
             match &mut node.kind {
                 SchemaNodeKind::Container { children, musts, .. }
                 | SchemaNodeKind::Notification { children, musts, .. }
@@ -5254,6 +5277,7 @@ module base-ann {
     acme:annotate-statement "grouping[name='threshold-pair']" {
       acme:annotate-statement "leaf[name='falling-threshold']" {
         must "../rising-threshold" { error-message "needs rising"; }
+        acme:cli-hidden "deprecated";
       }
     }
   }
@@ -5281,15 +5305,20 @@ module overlay {
         // Provenance must have resolved to the annotation module.
         assert!(ast_ann.is_annotation_module("base-ann"));
 
-        // Count musts on the leaf reached at `path` (".../falling-threshold").
+        // Count musts on the falling-threshold leaf.
         let musts_on = |node: &SchemaNode| match &node.kind {
             SchemaNodeKind::Leaf { musts, .. } => musts.clone(),
             other => panic!("expected leaf, got {other:?}"),
         };
+        // Count the annotation-injected `cli-hidden` extension on a node.
+        let hidden_exts = |node: &SchemaNode| -> usize {
+            node.extensions.iter().filter(|e| e.name == "cli-hidden").count()
+        };
 
         // Build the registry + check the leaf in both `native` (base) and the
         // overlay augment body, for a given value of the opt-in flag.
-        let run = |flag: bool| -> (usize, usize, String) {
+        // Returns (base_musts, overlay_musts, base_hidden, overlay_hidden, must_src).
+        let run = |flag: bool| -> (usize, usize, usize, usize, String) {
             let mut reg = ModuleRegistry::new();
             reg.flags.scope_grouping_annotations_to_target = flag;
             for (key, stmt) in [base.clone(), overlay.clone()] {
@@ -5328,22 +5357,25 @@ module overlay {
             let overlay_musts = musts_on(&of);
 
             let src = base_musts.first().map(|m| m.source_module.clone()).unwrap_or_default();
-            (base_musts.len(), overlay_musts.len(), src)
+            (base_musts.len(), overlay_musts.len(), hidden_exts(&bf), hidden_exts(&of), src)
         };
 
-        // Flag ON: the annotation targets `base`, so base keeps the must
-        // (attributed to base-ann) but `overlay` — which only reuses the
-        // grouping — must not.
-        let (base_on, overlay_on, src) = run(true);
-        assert_eq!(base_on, 1, "base keeps its annotation-injected must");
+        // Flag ON: the annotation targets `base`, so base keeps both the must and
+        // the injected extension, but `overlay` — which only reuses the grouping —
+        // must inherit neither.
+        let (base_must, overlay_must, base_hidden, overlay_hidden, src) = run(true);
+        assert_eq!(base_must, 1, "base keeps its annotation-injected must");
         assert_eq!(src, "base-ann", "must is attributed to the annotation module");
-        assert_eq!(overlay_on, 0, "overlay must NOT inherit the annotation must");
+        assert_eq!(base_hidden, 1, "base keeps the annotation-injected extension");
+        assert_eq!(overlay_must, 0, "overlay must NOT inherit the annotation must");
+        assert_eq!(overlay_hidden, 0, "overlay must NOT inherit the annotation extension");
 
-        // Flag OFF (default): standard YANG copies the grouping's must to every
+        // Flag OFF (default): standard YANG copies the grouping's body to every
         // consumer — unchanged behaviour.
-        let (base_off, overlay_off, _) = run(false);
-        assert_eq!(base_off, 1);
-        assert_eq!(overlay_off, 1, "default: the must propagates through uses");
+        let (base_must, overlay_must, _, overlay_hidden, _) = run(false);
+        assert_eq!(base_must, 1);
+        assert_eq!(overlay_must, 1, "default: the must propagates through uses");
+        assert_eq!(overlay_hidden, 1, "default: the extension propagates through uses");
     }
 
     #[test]

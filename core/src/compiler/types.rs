@@ -58,12 +58,13 @@ pub struct CompilationFlags {
     /// [`MustExpr::override_auto_deps`] / [`WhenExpr::override_auto_deps`] to
     /// `true`. Format: `(module_name, extension_name)`.
     pub override_auto_deps_extension: Option<(String, String)>,
-    /// Scope annotation-injected `must`/`when` constraints to the module the
-    /// annotation module targets. When `true`, a `must`/`when` injected into a
-    /// `grouping` body by an `annotate-module "X"` overlay is dropped from the
-    /// expanded tree of any module *other than* X that reuses the grouping via
-    /// `uses` — matching reference (yanger) behaviour, where such constraints do
-    /// not cross module boundaries. Off by default: the standard YANG reading is
+    /// Scope annotation-injected statements to the module the annotation module
+    /// targets. When `true`, a `must`/`when` or extension (e.g. a `hidden` /
+    /// `cli-*` flag) injected into a `grouping` body by an `annotate-module "X"`
+    /// overlay is dropped from the expanded tree of any module *other than* X that
+    /// reuses the grouping via `uses` — matching reference (yanger) behaviour,
+    /// where such statements do not cross module boundaries. Off by default: the
+    /// standard YANG reading is
     /// that annotating a grouping modifies the grouping for every consumer.
     /// Opt-in because it (a) changes output for all plugins and (b) makes a
     /// grouping's expansion consumer-dependent, defeating Arc-sharing for the
