@@ -64,6 +64,13 @@ struct Cli {
     #[arg(long = "werror")]
     werror: bool,
 
+    /// Scope annotation-injected must/when to the annotated module: a constraint
+    /// an annotate-module overlay injects into a grouping is dropped from other
+    /// modules that reuse the grouping via `uses` (reference/yanger behaviour).
+    /// Off by default (standard YANG copies grouping constraints to all consumers).
+    #[arg(long = "scope-grouping-annotations")]
+    scope_grouping_annotations: bool,
+
     /// Enable a feature as MODULE:FEATURE (may be repeated)
     #[arg(long = "feature", value_name = "MODULE:FEATURE")]
     features: Vec<String>,
@@ -403,6 +410,7 @@ fn main() {
     let mut initial_registry = ModuleRegistry::new();
     initial_registry.grammar = grammar_registry;
     initial_registry.flags.ignore_unknown_features = cli.ignore_unknown_features;
+    initial_registry.flags.scope_grouping_annotations_to_target = cli.scope_grouping_annotations;
     // Let each plugin declare the compilation-flag bindings it needs (e.g. a
     // backend that extracts a typedef extension into the compiled typedef).
     // Applied before the wave loop because the compiler reads these flags while
@@ -509,7 +517,9 @@ fn main() {
     // per-call RefCell cache that is !Sync.  Construction is cheap: the ctx
     // only borrows the shared read-only registry and feature sets.
     let make_ctx = || {
-        let mut ctx = ExpansionCtx::new(&reg, &enabled_features).with_diagnostics(&diagnostics);
+        let mut ctx = ExpansionCtx::new(&reg, &enabled_features)
+            .with_diagnostics(&diagnostics)
+            .with_annotation_index(&ast_ann_index);
         if let Some(ms) = max_status {
             ctx = ctx.with_max_status(ms);
         }

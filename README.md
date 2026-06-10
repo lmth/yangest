@@ -78,6 +78,12 @@ Core options:
       --werror                   Treat warnings as errors (compile and plugin).
                                  Like gcc -Werror: any warning fails the run, and
                                  compile/parse warnings stop before output.
+      --scope-grouping-annotations
+                                 Scope annotation-injected must/when to the
+                                 annotated module: a constraint an annotate-module
+                                 overlay injects into a grouping is dropped from
+                                 other modules that reuse the grouping via `uses`
+                                 (reference/yanger behaviour). Off by default.
 
 Input bundle:
       --bundle <FILE>            Load modules, search paths, deviation modules,

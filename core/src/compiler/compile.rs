@@ -2737,7 +2737,151 @@ fn fully_expand_nodes(
     result
 }
 
+/// Expand a `uses` of `grouping` into module `module_name`.
+///
+/// Thin wrapper over [`expand_uses_lazy_inner`] that, when
+/// [`CompilationFlags::scope_grouping_annotations_to_target`] is set, drops
+/// annotation-injected `must`/`when` constraints that belong to an annotation
+/// module not targeting the consuming module — so a constraint an
+/// `annotate-module "base"` overlay injected into a grouping does not ride into
+/// another module that merely reuses the grouping. Off by default; when off this
+/// is a zero-cost pass-through that preserves the shared/Arc-cached expansion.
 fn expand_uses_lazy(
+    grouping: &Arc<Grouping>,
+    source_module_name: Option<&str>,
+    uses_overlay: &UsesOverlay,
+    own_prefix: &str,
+    module_name: &str,
+    overlay: &NodeOverlayMap,
+    ctx: &ExpansionCtx<'_>,
+) -> Arc<Vec<SchemaNode>> {
+    let expanded = expand_uses_lazy_inner(
+        grouping,
+        source_module_name,
+        uses_overlay,
+        own_prefix,
+        module_name,
+        overlay,
+        ctx,
+    );
+    if !ctx.registry.flags.scope_grouping_annotations_to_target {
+        return expanded;
+    }
+    let Some(ann) = ctx.annotation_index() else {
+        return expanded;
+    };
+    // Only clone+filter when something actually needs dropping; otherwise keep the
+    // shared Arc. The scan is the cost the flag opts into.
+    if expanded
+        .iter()
+        .any(|n| node_has_foreign_annotation_constraint(n, module_name, ann))
+    {
+        Arc::new(filter_foreign_annotation_constraints(&expanded, module_name, ann))
+    } else {
+        expanded
+    }
+}
+
+/// True when a `must`/`when` was injected by an annotation module whose target is
+/// not `consuming` (so it must be dropped from `consuming`'s expansion).
+fn is_foreign_annotation_constraint(
+    source_module: &str,
+    consuming: &str,
+    ann: &AstAnnotationIndex,
+) -> bool {
+    ann.is_annotation_module(source_module) && !ann.annotation_targets(source_module, consuming)
+}
+
+/// Recursively scan for any annotation-injected `must`/`when` foreign to `consuming`.
+fn node_has_foreign_annotation_constraint(
+    node: &SchemaNode,
+    consuming: &str,
+    ann: &AstAnnotationIndex,
+) -> bool {
+    if node
+        .when
+        .iter()
+        .any(|w| is_foreign_annotation_constraint(&w.source_module, consuming, ann))
+    {
+        return true;
+    }
+    let musts_foreign = |musts: &[MustExpr]| {
+        musts
+            .iter()
+            .any(|m| is_foreign_annotation_constraint(&m.source_module, consuming, ann))
+    };
+    let kids_foreign = |kids: &[SchemaNode]| {
+        kids.iter()
+            .any(|k| node_has_foreign_annotation_constraint(k, consuming, ann))
+    };
+    match &node.kind {
+        SchemaNodeKind::Container { children, musts, .. }
+        | SchemaNodeKind::Notification { children, musts, .. }
+        | SchemaNodeKind::List { children, musts, .. } => {
+            musts_foreign(musts) || kids_foreign(children)
+        }
+        SchemaNodeKind::Leaf { musts, .. }
+        | SchemaNodeKind::LeafList { musts, .. }
+        | SchemaNodeKind::AnyXml { musts, .. }
+        | SchemaNodeKind::AnyData { musts, .. } => musts_foreign(musts),
+        SchemaNodeKind::Rpc { input, output, musts, .. } => {
+            musts_foreign(musts) || kids_foreign(input) || kids_foreign(output)
+        }
+        SchemaNodeKind::Action { input, output } => kids_foreign(input) || kids_foreign(output),
+        SchemaNodeKind::Case { children } => kids_foreign(children),
+        SchemaNodeKind::Choice { cases, .. } => kids_foreign(cases),
+        SchemaNodeKind::Uses { .. } => false,
+    }
+}
+
+/// Clone `nodes`, dropping annotation-injected `must`/`when` foreign to `consuming`,
+/// recursing into children/cases/input/output.
+fn filter_foreign_annotation_constraints(
+    nodes: &[SchemaNode],
+    consuming: &str,
+    ann: &AstAnnotationIndex,
+) -> Vec<SchemaNode> {
+    let retain_musts = |musts: &mut Vec<MustExpr>| {
+        musts.retain(|m| !is_foreign_annotation_constraint(&m.source_module, consuming, ann));
+    };
+    let recurse =
+        |kids: &Arc<Vec<SchemaNode>>| Arc::new(filter_foreign_annotation_constraints(kids, consuming, ann));
+    nodes
+        .iter()
+        .map(|node| {
+            let mut node = node.clone();
+            node.when
+                .retain(|w| !is_foreign_annotation_constraint(&w.source_module, consuming, ann));
+            match &mut node.kind {
+                SchemaNodeKind::Container { children, musts, .. }
+                | SchemaNodeKind::Notification { children, musts, .. }
+                | SchemaNodeKind::List { children, musts, .. } => {
+                    retain_musts(musts);
+                    *children = recurse(children);
+                }
+                SchemaNodeKind::Leaf { musts, .. }
+                | SchemaNodeKind::LeafList { musts, .. }
+                | SchemaNodeKind::AnyXml { musts, .. }
+                | SchemaNodeKind::AnyData { musts, .. } => retain_musts(musts),
+                SchemaNodeKind::Rpc { input, output, musts, .. } => {
+                    retain_musts(musts);
+                    *input = recurse(input);
+                    *output = recurse(output);
+                }
+                SchemaNodeKind::Action { input, output } => {
+                    *input = recurse(input);
+                    *output = recurse(output);
+                }
+                SchemaNodeKind::Case { children } => *children = recurse(children),
+                SchemaNodeKind::Choice { cases, .. } => *cases = recurse(cases),
+                SchemaNodeKind::Uses { .. } => {}
+            }
+            node
+        })
+        .collect()
+}
+
+fn expand_uses_lazy_inner(
     grouping: &Arc<Grouping>,
     source_module_name: Option<&str>,
     uses_overlay: &UsesOverlay,
@@ -5073,6 +5217,133 @@ module target-deviation {
         let item = root.children(&ctx).into_iter().find(|n| n.name == "item").unwrap();
         let id = item.children(&ctx).into_iter().find(|n| n.name == "id").unwrap();
         assert_eq!(range_of(&id), "1..64", "main path also deviated (sanity)");
+    }
+
+    #[test]
+    fn scope_grouping_annotations_to_target_drops_cross_uses_must() {
+        use crate::plugin::{AstOverlayDescriptor, ExtensionId};
+
+        let parse = |name: &str, src: &str| {
+            let (stmts, errs) = parse_yang(src, Arc::from(format!("{name}.yang").as_str()));
+            assert!(errs.is_empty(), "parse {name}: {errs:?}");
+            (ModuleKey::latest(name), stmts.into_iter().next().unwrap())
+        };
+
+        let base = parse(
+            "base",
+            r#"
+module base {
+  namespace "urn:base"; prefix b;
+  grouping threshold-pair {
+    leaf rising-threshold { type uint32; }
+    leaf falling-threshold { type uint32; }
+  }
+  container native { uses threshold-pair; }
+}
+"#,
+        );
+        let ann = parse(
+            "base-ann",
+            r#"
+module base-ann {
+  yang-version 1.1;
+  namespace "urn:base-ann"; prefix bann;
+  import acme-ext { prefix acme; }
+  import base { prefix b; }
+  acme:annotate-module "base" {
+    acme:annotate-statement "grouping[name='threshold-pair']" {
+      acme:annotate-statement "leaf[name='falling-threshold']" {
+        must "../rising-threshold" { error-message "needs rising"; }
+      }
+    }
+  }
+}
+"#,
+        );
+        let overlay = parse(
+            "overlay",
+            r#"
+module overlay {
+  namespace "urn:overlay"; prefix o;
+  import base { prefix b; }
+  augment "/b:native" {
+    container also-here { uses b:threshold-pair; }
+  }
+}
+"#,
+        );
+
+        let descs = vec![AstOverlayDescriptor {
+            module_selector: ExtensionId { module: "acme-ext", name: "annotate-module" },
+            stmt_selector: ExtensionId { module: "acme-ext", name: "annotate-statement" },
+        }];
+        let ast_ann = AstAnnotationIndex::build(&[ann.clone()], &descs);
+        // Provenance must have resolved to the annotation module.
+        assert!(ast_ann.is_annotation_module("base-ann"));
+
+        // Count musts on the leaf reached at `path` (".../falling-threshold").
+        let musts_on = |node: &SchemaNode| match &node.kind {
+            SchemaNodeKind::Leaf { musts, .. } => musts.clone(),
+            other => panic!("expected leaf, got {other:?}"),
+        };
+
+        // Build the registry + check the leaf in both `native` (base) and the
+        // overlay augment body, for a given value of the opt-in flag.
+        let run = |flag: bool| -> (usize, usize, String) {
+            let mut reg = ModuleRegistry::new();
+            reg.flags.scope_grouping_annotations_to_target = flag;
+            for (key, stmt) in [base.clone(), overlay.clone()] {
+                let patched = ast_ann.apply(stmt, &key.name);
+                let compiled = compile_module(
+                    &key,
+                    patched,
+                    &reg,
+                    &DeviationIndex::default(),
+                    &AnnotationIndex::default(),
+                    &ast_ann,
+                );
+                reg.insert(Arc::new(compiled));
+            }
+            let ctx = ExpansionCtx::all_features(&reg).with_annotation_index(&ast_ann);
+
+            // base: /native/falling-threshold
+            let base_m = reg.resolve_import("base", None).unwrap();
+            let native = base_m.children.iter().find(|n| n.name == "native").unwrap();
+            let bf = native
+                .children(&ctx)
+                .into_iter()
+                .find(|n| n.name == "falling-threshold")
+                .unwrap();
+            let base_musts = musts_on(&bf);
+
+            // overlay: augment body /b:native/also-here/falling-threshold
+            let overlay_m = reg.resolve_import("overlay", None).unwrap();
+            let body = ctx.expand_augment_body(&overlay_m, &overlay_m.augments[0]);
+            let also = body.iter().find(|n| n.name == "also-here").unwrap();
+            let of = also
+                .children(&ctx)
+                .into_iter()
+                .find(|n| n.name == "falling-threshold")
+                .unwrap();
+            let overlay_musts = musts_on(&of);
+
+            let src = base_musts.first().map(|m| m.source_module.clone()).unwrap_or_default();
+            (base_musts.len(), overlay_musts.len(), src)
+        };
+
+        // Flag ON: the annotation targets `base`, so base keeps the must
+        // (attributed to base-ann) but `overlay` — which only reuses the
+        // grouping — must not.
+        let (base_on, overlay_on, src) = run(true);
+        assert_eq!(base_on, 1, "base keeps its annotation-injected must");
+        assert_eq!(src, "base-ann", "must is attributed to the annotation module");
+        assert_eq!(overlay_on, 0, "overlay must NOT inherit the annotation must");
+
+        // Flag OFF (default): standard YANG copies the grouping's must to every
+        // consumer — unchanged behaviour.
+        let (base_off, overlay_off, _) = run(false);
+        assert_eq!(base_off, 1);
+        assert_eq!(overlay_off, 1, "default: the must propagates through uses");
     }
 
     #[test]

@@ -146,6 +146,22 @@ impl AstAnnotationIndex {
         self.file_to_key.get(file)
     }
 
+    /// True if `module_name` is an annotation module (declares `annotate-module`).
+    /// Used to tell an annotation-injected `must`/`when` (whose `source_module` is
+    /// the annotation module) from a native one when scoping constraints to their
+    /// target module.
+    pub fn is_annotation_module(&self, module_name: &str) -> bool {
+        self.file_to_key.values().any(|k| k.name == module_name)
+    }
+
+    /// True if the annotation module `ann_module` targets `target` via
+    /// `annotate-module`.
+    pub fn annotation_targets(&self, ann_module: &str, target: &str) -> bool {
+        self.ann_sources
+            .get(target)
+            .is_some_and(|srcs| srcs.iter().any(|(k, _)| k.name == ann_module))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.by_module.is_empty()
     }

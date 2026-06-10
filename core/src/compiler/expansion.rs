@@ -77,6 +77,11 @@ pub struct ExpansionCtx<'a> {
     /// emit (see [`with_diagnostics`](Self::with_diagnostics)); plugins reach it
     /// via [`diagnostics`](Self::diagnostics). `None` on the compile path.
     diagnostics: Option<&'a crate::diagnostics::Diagnostics>,
+    /// Optional AST-annotation index, needed only when
+    /// [`CompilationFlags::scope_grouping_annotations_to_target`] is set, to scope
+    /// annotation-injected `must`/`when` constraints to their target module during
+    /// `uses` expansion.
+    annotation_index: Option<&'a crate::astannindex::AstAnnotationIndex>,
 }
 
 impl<'a> ExpansionCtx<'a> {
@@ -98,6 +103,7 @@ impl<'a> ExpansionCtx<'a> {
             cache_keepalive: RefCell::new(Vec::new()),
             augment_cache: RefCell::new(HashMap::new()),
             diagnostics: None,
+            annotation_index: None,
         }
     }
 
@@ -112,6 +118,22 @@ impl<'a> ExpansionCtx<'a> {
     /// diagnostic with e.g. `ctx.diagnostics().map(|d| d.warning(self.name(), msg))`.
     pub fn diagnostics(&self) -> Option<&'a crate::diagnostics::Diagnostics> {
         self.diagnostics
+    }
+
+    /// Attach the AST-annotation index, enabling
+    /// [`CompilationFlags::scope_grouping_annotations_to_target`](crate::compiler::CompilationFlags)
+    /// scoping during `uses` expansion. Harmless when that flag is off.
+    pub fn with_annotation_index(
+        mut self,
+        index: &'a crate::astannindex::AstAnnotationIndex,
+    ) -> Self {
+        self.annotation_index = Some(index);
+        self
+    }
+
+    /// The AST-annotation index, if attached.
+    pub fn annotation_index(&self) -> Option<&'a crate::astannindex::AstAnnotationIndex> {
+        self.annotation_index
     }
 
     /// Return the *expanded* children contributed by an augment body, caching the
