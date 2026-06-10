@@ -15,7 +15,7 @@
 //! itself.  These have no schema-nodeid, so they cannot be reached via the
 //! existing path-based overlay mechanism.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BuiltInKeyword, Keyword, ModuleKey, Stmt};
 use crate::plugin::AstOverlayDescriptor;
@@ -63,6 +63,15 @@ pub struct AstAnnotationIndex {
     /// Used during compilation to identify which annotation module injected a particular
     /// statement (must/when) by checking `stmt.pos.file()` against this map.
     file_to_key: HashMap<String, ModuleKey>,
+    /// Maps annotation-module name → the set of modules it effectively targets.
+    /// This is the *literal* `annotate-module` argument plus, when that argument
+    /// names a **submodule**, the submodule's parent module — because the parent
+    /// merges the submodule's definitions, so an annotation targeting the
+    /// submodule applies to the parent's compilation. Consulted only by
+    /// [`annotation_targets`](Self::annotation_targets) (the
+    /// `scope_grouping_annotations_to_target` filter); the `ann_sources` /
+    /// `sources_for` view keeps the literal targets unchanged.
+    ann_effective_targets: HashMap<String, HashSet<String>>,
 }
 
 impl AstAnnotationIndex {
@@ -75,7 +84,20 @@ impl AstAnnotationIndex {
             return Self::default();
         }
         let mut index = Self::default();
-        let mut seen: std::collections::HashSet<&ModuleKey> = std::collections::HashSet::new();
+        // submodule name → parent module name (from `belongs-to`). An annotation
+        // targeting a submodule also targets its parent, since the parent merges
+        // the submodule's definitions at compile time.
+        let submodule_parents: HashMap<&str, String> = modules
+            .iter()
+            .filter(|(_, s)| s.keyword.is_builtin(BuiltInKeyword::Submodule))
+            .filter_map(|(k, s)| {
+                s.get_substmt(BuiltInKeyword::BelongsTo)
+                    .and_then(|bt| bt.arg.clone())
+                    .map(|parent| (k.name.as_str(), parent))
+            })
+            .collect();
+
+        let mut seen: HashSet<&ModuleKey> = HashSet::new();
         for (key, stmt) in modules {
             if !seen.insert(key) {
                 continue; // same module parsed twice (e.g. as annotation-module and search-path dep)
@@ -100,7 +122,7 @@ impl AstAnnotationIndex {
                 // Track the annotation module source for import resolution.
                 index
                     .ann_sources
-                    .entry(target_module)
+                    .entry(target_module.clone())
                     .or_default()
                     .push((key.clone(), prefix_map.clone()));
                 // Track the annotation file path → module key, so that compilation
@@ -108,6 +130,13 @@ impl AstAnnotationIndex {
                 // checking stmt.pos.orig_file() against this map.
                 let file_path = stmt.pos.file().to_string();
                 index.file_to_key.entry(file_path).or_insert_with(|| key.clone());
+                // Effective targets: the literal target, plus its parent module if
+                // the literal target is a submodule.
+                let effective = index.ann_effective_targets.entry(key.name.clone()).or_default();
+                if let Some(parent) = submodule_parents.get(target_module.as_str()) {
+                    effective.insert(parent.clone());
+                }
+                effective.insert(target_module);
             }
         }
         index
@@ -155,11 +184,13 @@ impl AstAnnotationIndex {
     }
 
     /// True if the annotation module `ann_module` targets `target` via
-    /// `annotate-module`.
+    /// `annotate-module` — directly, or because `target`'s submodule was the
+    /// literal `annotate-module` argument (the parent merges the submodule's
+    /// definitions, so the annotation applies to the parent's compilation).
     pub fn annotation_targets(&self, ann_module: &str, target: &str) -> bool {
-        self.ann_sources
-            .get(target)
-            .is_some_and(|srcs| srcs.iter().any(|(k, _)| k.name == ann_module))
+        self.ann_effective_targets
+            .get(ann_module)
+            .is_some_and(|targets| targets.contains(target))
     }
 
     pub fn is_empty(&self) -> bool {

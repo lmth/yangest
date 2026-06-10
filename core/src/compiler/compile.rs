@@ -5379,6 +5379,137 @@ module overlay {
     }
 
     #[test]
+    fn scope_grouping_annotations_recognises_submodule_target() {
+        // The annotation targets a *submodule* (`base-iface`, belongs-to `base`),
+        // whose grouping is merged into the parent `base` at compile. Under the
+        // flag, `base`'s own use of the grouping must KEEP the injected
+        // must/extension (the annotation effectively targets base), while a foreign
+        // module (`overlay`) reusing the grouping must still drop them.
+        use crate::plugin::{AstOverlayDescriptor, ExtensionId};
+
+        let parse = |name: &str, src: &str| {
+            let (stmts, errs) = parse_yang(src, Arc::from(format!("{name}.yang").as_str()));
+            assert!(errs.is_empty(), "parse {name}: {errs:?}");
+            (ModuleKey::latest(name), stmts.into_iter().next().unwrap())
+        };
+
+        let iface = parse(
+            "base-iface",
+            r#"
+submodule base-iface {
+  belongs-to base { prefix b; }
+  grouping threshold-pair {
+    leaf rising-threshold { type uint32; }
+    leaf falling-threshold { type uint32; }
+  }
+}
+"#,
+        );
+        let base = parse(
+            "base",
+            r#"
+module base {
+  namespace "urn:base"; prefix b;
+  include base-iface;
+  container native { uses threshold-pair; }
+}
+"#,
+        );
+        let ann = parse(
+            "base-ann",
+            r#"
+module base-ann {
+  yang-version 1.1;
+  namespace "urn:base-ann"; prefix bann;
+  import acme-ext { prefix acme; }
+  import base-iface { prefix bi; }
+  acme:annotate-module "base-iface" {
+    acme:annotate-statement "grouping[name='threshold-pair']" {
+      acme:annotate-statement "leaf[name='falling-threshold']" {
+        must "../rising-threshold" { error-message "needs rising"; }
+        acme:cli-hidden "deprecated";
+      }
+    }
+  }
+}
+"#,
+        );
+        let overlay = parse(
+            "overlay",
+            r#"
+module overlay {
+  namespace "urn:overlay"; prefix o;
+  import base { prefix b; }
+  augment "/b:native" {
+    container also-here { uses b:threshold-pair; }
+  }
+}
+"#,
+        );
+
+        let descs = vec![AstOverlayDescriptor {
+            module_selector: ExtensionId { module: "acme-ext", name: "annotate-module" },
+            stmt_selector: ExtensionId { module: "acme-ext", name: "annotate-statement" },
+        }];
+        // Pool includes the submodule (for the submodule→parent map) and the
+        // annotation module (which declares the annotate-module).
+        let ast_ann = AstAnnotationIndex::build(
+            &[iface.clone(), base.clone(), ann.clone(), overlay.clone()],
+            &descs,
+        );
+        // The fix: the submodule-targeting annotation also targets the parent.
+        assert!(ast_ann.annotation_targets("base-ann", "base"));
+        assert!(ast_ann.annotation_targets("base-ann", "base-iface"));
+        assert!(!ast_ann.annotation_targets("base-ann", "overlay"));
+
+        let leaf_musts = |node: &SchemaNode| match &node.kind {
+            SchemaNodeKind::Leaf { musts, .. } => musts.len(),
+            other => panic!("expected leaf, got {other:?}"),
+        };
+        let hidden = |node: &SchemaNode| node.extensions.iter().filter(|e| e.name == "cli-hidden").count();
+
+        let mut reg = ModuleRegistry::new();
+        reg.flags.scope_grouping_annotations_to_target = true;
+        // Submodule before parent (parent merges its groupings via the registry).
+        for (key, stmt) in [iface, base, overlay] {
+            let patched = ast_ann.apply(stmt, &key.name);
+            let compiled = compile_module(
+                &key,
+                patched,
+                &reg,
+                &DeviationIndex::default(),
+                &AnnotationIndex::default(),
+                &ast_ann,
+            );
+            reg.insert(Arc::new(compiled));
+        }
+        let ctx = ExpansionCtx::all_features(&reg).with_annotation_index(&ast_ann);
+
+        // base/native/falling-threshold — must be KEPT (was over-dropped before).
+        let base_m = reg.resolve_import("base", None).unwrap();
+        let native = base_m.children.iter().find(|n| n.name == "native").unwrap();
+        let bf = native
+            .children(&ctx)
+            .into_iter()
+            .find(|n| n.name == "falling-threshold")
+            .unwrap();
+        assert_eq!(leaf_musts(&bf), 1, "parent keeps the submodule-targeted must");
+        assert_eq!(hidden(&bf), 1, "parent keeps the submodule-targeted extension");
+
+        // overlay/also-here/falling-threshold — still DROPPED (foreign module).
+        let overlay_m = reg.resolve_import("overlay", None).unwrap();
+        let body = ctx.expand_augment_body(&overlay_m, &overlay_m.augments[0]);
+        let also = body.iter().find(|n| n.name == "also-here").unwrap();
+        let of = also
+            .children(&ctx)
+            .into_iter()
+            .find(|n| n.name == "falling-threshold")
+            .unwrap();
+        assert_eq!(leaf_musts(&of), 0, "foreign reuse still drops the must");
+        assert_eq!(hidden(&of), 0, "foreign reuse still drops the extension");
+    }
+
+    #[test]
     fn refine_must_appends_to_grouping_musts() {
         // RFC 7950 §7.13.2: a refine's `must` is ADDED to the target's existing
         // `must` list, not replaced. A grouping leaf with two musts, used with a
