@@ -291,6 +291,28 @@ needed whenever the plugin traverses the compiled tree via `module.children(ctx)
 `state.get_or_insert::<T>()` to keep mutable per-module scratch state without
 `&mut self` or interior mutability on the plugin struct.
 
+### Raising warnings and errors
+
+A plugin reports problems through a thread-safe diagnostics sink reached from the
+context, rather than printing to stderr itself:
+
+```rust
+if let Some(diags) = ctx.diagnostics() {
+    diags.warning(self.name(), "…");                     // fatal only under --werror
+    diags.warning_with_code(self.name(), "my-code", "…"); // code enables -Werror=<code>-style policy
+    diags.error(self.name(), "…");                        // always fatal
+}
+```
+
+`ctx.diagnostics()` is `None` on the pure compile path; treat that as "no sink,
+skip". The same sink is shared by reference across the parallel per-module emit
+path, so it is safe to use from `emit_module`. The binary drains it after
+emission, prints each diagnostic uniformly, and decides the exit status —
+applying `--werror` (treat warnings as errors). Plugins never call
+`std::process::exit` or hard-code severity policy. Full details, the yanger
+comparison, and the `--werror` semantics are in
+[`plugin-options-and-diagnostics.md`](plugin-options-and-diagnostics.md).
+
 ---
 
 ## 3. Core types available to plugins
@@ -471,6 +493,9 @@ filtered out.
 
 Do **not** access `module.children` or `kind.children` directly; those are the
 pre-expansion raw lists.
+
+`ctx.diagnostics()` returns the optional plugin [diagnostics](#raising-warnings-and-errors)
+sink (`Option<&Diagnostics>`), the channel for raising warnings/errors during emit.
 
 ### `ExtensionGrammar`
 

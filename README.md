@@ -71,9 +71,13 @@ Arguments:
 
 Core options:
   -f, --format <FORMAT>          Output format [default: tree]
-                                 Available: tree, yang, yang-expanded, yin, depend, swagger
+                                 Available: tree, yang, yang-expanded, yin, depend,
+                                 swagger, bundle-imports
   -p, --path <DIR>               Add a directory to the module search path (repeatable)
   -e, --errors-only              Validate only — print errors/warnings, no output
+      --werror                   Treat warnings as errors (compile and plugin).
+                                 Like gcc -Werror: any warning fails the run, and
+                                 compile/parse warnings stop before output.
 
 Input bundle:
       --bundle <FILE>            Load modules, search paths, deviation modules,
@@ -126,6 +130,7 @@ Format-specific options:
 | `yin` | YIN (XML) representation |
 | `depend` | Module dependency list |
 | `swagger` | Swagger/OpenAPI 2.0 JSON (experimental) |
+| `bundle-imports` | JSON report of the modules a file set provides and its non-local (cross-bundle) imports |
 
 ---
 
