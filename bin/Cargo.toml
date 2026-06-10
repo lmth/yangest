@@ -16,6 +16,7 @@ yangest-plugin-depend = { path = "../plugins/depend" }
 yangest-plugin-yang = { path = "../plugins/yang" }
 yangest-plugin-yin = { path = "../plugins/yin" }
 yangest-plugin-swagger = { path = "../plugins/swagger" }
+yangest-plugin-bundle-imports = { path = "../plugins/bundle-imports" }
 clap = { version = "4.6.1", features = ["derive"] }
 inventory = "0.3"
 mimalloc = "0.1"

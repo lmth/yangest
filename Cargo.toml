@@ -6,6 +6,7 @@ members = [
     "plugins/yang",
     "plugins/yin",
     "plugins/swagger",
+    "plugins/bundle-imports",
     "bin",
 ]
 resolver = "2"

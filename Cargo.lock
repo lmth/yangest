@@ -1063,6 +1063,7 @@ dependencies = [
  "serde",
  "toml",
  "yangest-core",
+ "yangest-plugin-bundle-imports",
  "yangest-plugin-depend",
  "yangest-plugin-swagger",
  "yangest-plugin-tree",
@@ -1080,6 +1081,16 @@ dependencies = [
  "nom",
  "quick-xml",
  "regexml",
+]
+
+[[package]]
+name = "yangest-plugin-bundle-imports"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "serde",
+ "serde_json",
+ "yangest-core",
 ]
 
 [[package]]
