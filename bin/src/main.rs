@@ -58,6 +58,12 @@ struct Cli {
     #[arg(short, long)]
     errors_only: bool,
 
+    /// Treat warnings as errors (compile and plugin). Like gcc's -Werror:
+    /// any warning then fails the run, and compile/parse warnings stop before
+    /// output is produced.
+    #[arg(long = "werror")]
+    werror: bool,
+
     /// Enable a feature as MODULE:FEATURE (may be repeated)
     #[arg(long = "feature", value_name = "MODULE:FEATURE")]
     features: Vec<String>,
@@ -446,11 +452,21 @@ fn main() {
     all_errors.extend(all_compile_errors);
 
     let has_errors = all_errors.iter().any(|e| e.level == ast::Level::Error);
+    let has_warnings = all_errors.iter().any(|e| e.level == ast::Level::Warning);
     for e in &all_errors {
         eprintln!("{}", e);
     }
+    // gcc-style --werror: compile/parse warnings are promoted to errors and stop
+    // the run before any output is produced.
+    let compile_fatal = has_errors || (cli.werror && has_warnings);
     if cli.errors_only {
-        std::process::exit(if has_errors { 1 } else { 0 });
+        std::process::exit(if compile_fatal { 1 } else { 0 });
+    }
+    if cli.werror && compile_fatal {
+        if has_warnings && !has_errors {
+            eprintln!("yangest: warnings treated as errors (--werror); no output produced");
+        }
+        std::process::exit(1);
     }
 
     let reg = registry.read().unwrap();
@@ -483,12 +499,17 @@ fn main() {
     let shared_expand_cache: Arc<RwLock<HashMap<(usize, String), Arc<Vec<yangest_core::compiler::SchemaNode>>>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
+    // Thread-safe sink for plugin-raised diagnostics. Shared by `&` across all
+    // (possibly parallel) per-module emits; drained after emission to decide the
+    // exit status (honouring --werror).
+    let diagnostics = yangest_core::diagnostics::Diagnostics::new();
+
     // Build a fresh ExpansionCtx for one emission task.
     // Each parallel worker gets its own instance because ExpansionCtx holds a
     // per-call RefCell cache that is !Sync.  Construction is cheap: the ctx
     // only borrows the shared read-only registry and feature sets.
     let make_ctx = || {
-        let mut ctx = ExpansionCtx::new(&reg, &enabled_features);
+        let mut ctx = ExpansionCtx::new(&reg, &enabled_features).with_diagnostics(&diagnostics);
         if let Some(ms) = max_status {
             ctx = ctx.with_max_status(ms);
         }
@@ -622,7 +643,18 @@ fn main() {
         }
     }
     plugin.finish_bundle(&bundle);
-    std::process::exit(if has_errors { 1 } else { 0 });
+
+    // Report and weigh plugin-raised diagnostics. Plugin errors are always fatal;
+    // plugin warnings are fatal only under --werror (gcc-style).
+    let plugin_diags = diagnostics.take();
+    for d in &plugin_diags {
+        eprintln!("{}", d);
+    }
+    let plugin_fatal = plugin_diags
+        .iter()
+        .any(|d| yangest_core::diagnostics::is_fatal(d.level, cli.werror));
+
+    std::process::exit(if has_errors || plugin_fatal { 1 } else { 0 });
 }
 
 fn scan_files(inputs: &[PathBuf], extra_paths: &[PathBuf]) -> Vec<PathBuf> {

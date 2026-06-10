@@ -1,0 +1,5 @@
+module base {
+  namespace "urn:werror:base";
+  prefix b;
+  revision 2020-01-01;
+}

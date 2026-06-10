@@ -11,6 +11,9 @@ use clap::{Arg, ArgMatches};
 use crate::compiler::{CompilationFlags, CompiledModule, ExpansionCtx, ModuleRegistry};
 use crate::grammar::ExtensionGrammar;
 
+#[doc(inline)]
+pub use crate::diagnostics::{Diagnostic, Diagnostics};
+
 /// Bundle-level shared state computed once before any per-module emission.
 ///
 /// Created by [`Plugin::prepare_bundle`] before the per-module loop starts and

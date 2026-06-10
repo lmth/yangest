@@ -27,6 +27,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
 
+use clap::{Arg, ArgAction, ArgMatches};
 use serde::{Deserialize, Serialize};
 use yangest_core::ast::{BuiltInKeyword, Stmt};
 use yangest_core::compiler::{CompiledModule, ExpansionCtx, ModuleRegistry};
@@ -150,8 +151,15 @@ fn latest_revision(header: &Stmt) -> Option<String> {
 
 /// The `-f bundle-imports` plugin: emit the [`BundleReport`] for the module set
 /// yangest was given, as pretty JSON.
+///
+/// Also demonstrates the plugin **CLI-option** and **diagnostics** mechanisms:
+/// the `--bundle-imports-warn-unpinned` flag (declared in [`cli_args`], consumed
+/// in [`configure`]) makes the plugin raise a *warning* for every `import` that
+/// is not revision-pinned. Under `yangest --werror` those warnings fail the run.
 #[derive(Default)]
-pub struct BundleImportsPlugin;
+pub struct BundleImportsPlugin {
+    warn_unpinned: bool,
+}
 
 impl Plugin for BundleImportsPlugin {
     fn name(&self) -> &'static str {
@@ -162,6 +170,19 @@ impl Plugin for BundleImportsPlugin {
         "bundle-imports.json"
     }
 
+    fn cli_args(&self) -> Vec<Arg> {
+        vec![
+            Arg::new("bundle-imports-warn-unpinned")
+                .long("bundle-imports-warn-unpinned")
+                .action(ArgAction::SetTrue)
+                .help("Warn for each import that lacks a revision-date (lint)"),
+        ]
+    }
+
+    fn configure(&mut self, matches: &ArgMatches) {
+        self.warn_unpinned = matches.get_flag("bundle-imports-warn-unpinned");
+    }
+
     /// Whole-bundle output: one JSON document for the entire module set, not one
     /// per module. Uses each compiled module's retained header `stmt`, so it works
     /// even when cross-bundle imports leave the bundle un-resolvable.
@@ -169,9 +190,26 @@ impl Plugin for BundleImportsPlugin {
         &self,
         modules: &[Arc<CompiledModule>],
         _registry: &ModuleRegistry,
-        _ctx: &ExpansionCtx<'_>,
+        ctx: &ExpansionCtx<'_>,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
+        if self.warn_unpinned {
+            if let Some(diags) = ctx.diagnostics() {
+                for header in modules.iter().map(|m| &m.stmt) {
+                    let from = header.arg.clone().unwrap_or_default();
+                    for imp in header.get_substmts(BuiltInKeyword::Import) {
+                        let pinned = imp.get_substmt(BuiltInKeyword::RevisionDate).is_some();
+                        if let (false, Some(target)) = (pinned, imp.arg.as_deref()) {
+                            diags.warning_with_code(
+                                self.name(),
+                                "unpinned-import",
+                                format!("{from}: import of '{target}' is not revision-pinned"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let report = analyze_headers(modules.iter().map(|m| &m.stmt));
         let json = serde_json::to_string_pretty(&report)
             .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
@@ -181,7 +219,7 @@ impl Plugin for BundleImportsPlugin {
 
 inventory::submit! {
     yangest_core::plugin::PluginRegistration {
-        factory: || Box::new(BundleImportsPlugin),
+        factory: || Box::new(BundleImportsPlugin::default()),
     }
 }
 

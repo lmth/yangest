@@ -1,0 +1,5 @@
+module main {
+  namespace "urn:werror:main";
+  prefix m;
+  import base { prefix b; }   // unpinned: no revision-date
+}

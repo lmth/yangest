@@ -1087,6 +1087,7 @@ dependencies = [
 name = "yangest-plugin-bundle-imports"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "inventory",
  "serde",
  "serde_json",

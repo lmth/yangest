@@ -73,6 +73,10 @@ pub struct ExpansionCtx<'a> {
     /// `AugmentEntry` lives in a registry-held `CompiledModule` that outlives the
     /// ctx, so the pointer key is stable.
     augment_cache: RefCell<HashMap<(*const AugmentEntry, String), Arc<Vec<SchemaNode>>>>,
+    /// Optional sink for plugin-raised diagnostics. The host wires this in before
+    /// emit (see [`with_diagnostics`](Self::with_diagnostics)); plugins reach it
+    /// via [`diagnostics`](Self::diagnostics). `None` on the compile path.
+    diagnostics: Option<&'a crate::diagnostics::Diagnostics>,
 }
 
 impl<'a> ExpansionCtx<'a> {
@@ -93,7 +97,21 @@ impl<'a> ExpansionCtx<'a> {
             file_module_overlay: Cell::new(std::ptr::null()),
             cache_keepalive: RefCell::new(Vec::new()),
             augment_cache: RefCell::new(HashMap::new()),
+            diagnostics: None,
         }
+    }
+
+    /// Attach a plugin-diagnostics sink. Called by the host before emit so that
+    /// plugins can raise warnings/errors via [`diagnostics`](Self::diagnostics).
+    pub fn with_diagnostics(mut self, diagnostics: &'a crate::diagnostics::Diagnostics) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    /// The plugin-diagnostics sink, if the host attached one. A plugin raises a
+    /// diagnostic with e.g. `ctx.diagnostics().map(|d| d.warning(self.name(), msg))`.
+    pub fn diagnostics(&self) -> Option<&'a crate::diagnostics::Diagnostics> {
+        self.diagnostics
     }
 
     /// Return the *expanded* children contributed by an augment body, caching the

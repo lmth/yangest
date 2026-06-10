@@ -6,6 +6,7 @@ pub mod ast;
 pub mod compiler;
 pub mod cursor;
 pub mod depgraph;
+pub mod diagnostics;
 pub mod devindex;
 pub mod grammar;
 pub mod parser;

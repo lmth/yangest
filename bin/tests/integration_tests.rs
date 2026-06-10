@@ -905,3 +905,55 @@ fn generate_bundle_lists_latest_revision() {
     assert!(listed("thing@2026-06-07.yang"), "latest revision should be listed\n{stdout}");
     assert!(!listed("thing@2024-01-01.yang"), "older revision must not be listed\n{stdout}");
 }
+
+// ── plugin CLI options + diagnostics + --werror ───────────────────────────────
+
+/// A plugin declares a CLI flag (Part A) which, when set, raises a warning
+/// (Part B). Without the flag the run is clean.
+#[test]
+fn plugin_cli_flag_and_diagnostics() {
+    // Flag off: no warning, exit 0.
+    let (_out, err, code) = run("werror", &["-f", "bundle-imports", "base.yang", "main.yang"]);
+    assert_eq!(code, 0, "clean run\n{err}");
+    assert!(!err.contains("not revision-pinned"), "no warning without the flag\n{err}");
+
+    // Flag on: the plugin raises a warning on stderr but the run still succeeds.
+    let (_out, err, code) = run(
+        "werror",
+        &["-f", "bundle-imports", "--bundle-imports-warn-unpinned", "base.yang", "main.yang"],
+    );
+    assert_eq!(code, 0, "warnings alone do not fail\n{err}");
+    assert!(
+        err.contains("bundle-imports: warning: [unpinned-import]"),
+        "plugin warning is reported\n{err}"
+    );
+    assert!(err.contains("import of 'base' is not revision-pinned"), "{err}");
+}
+
+/// `--werror` promotes the plugin warning to a fatal error (non-zero exit).
+#[test]
+fn werror_promotes_plugin_warning() {
+    let (_out, err, code) = run(
+        "werror",
+        &[
+            "-f",
+            "bundle-imports",
+            "--bundle-imports-warn-unpinned",
+            "--werror",
+            "base.yang",
+            "main.yang",
+        ],
+    );
+    assert_eq!(code, 1, "--werror makes the warning fatal\n{err}");
+    assert!(err.contains("not revision-pinned"), "the warning is still shown\n{err}");
+}
+
+/// `--werror` without any warnings does not fail a clean run.
+#[test]
+fn werror_clean_run_succeeds() {
+    let (_out, _err, code) = run(
+        "werror",
+        &["-f", "bundle-imports", "--werror", "base.yang", "main.yang"],
+    );
+    assert_eq!(code, 0, "no warnings -> --werror is a no-op");
+}
