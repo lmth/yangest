@@ -2043,7 +2043,7 @@ fn expand_children_inner(
                                 lookup_overlay(s, &overlay_path, &materialized.module_name)
                             })
                         });
-                    if !apply_overlay_entry(&mut materialized, entry) {
+                    if !apply_overlay_entry(&mut materialized, entry, ctx) {
                         continue;
                     }
                     if !node_visible(&materialized, ctx) {
@@ -2095,7 +2095,7 @@ pub fn expand_children_all(
                 if ctx.has_any_overlay && !overlay.is_empty() {
                     let overlay_path = overlay_name_path(&[], &materialized.name);
                     let entry = lookup_overlay(overlay, &overlay_path, &materialized.module_name);
-                    if !apply_overlay_entry(&mut materialized, entry) {
+                    if !apply_overlay_entry(&mut materialized, entry, ctx) {
                         continue;
                     }
                 }
@@ -2169,7 +2169,7 @@ pub fn expand_children_and_all(
                     let mut materialized = node.clone();
                     let overlay_path = overlay_name_path(parent_path, &materialized.name);
                     let entry = lookup_overlay(overlay, &overlay_path, &materialized.module_name);
-                    if !apply_overlay_entry(&mut materialized, entry) {
+                    if !apply_overlay_entry(&mut materialized, entry, ctx) {
                         // `not-supported` deviated — exclude from both.
                         continue;
                     }
@@ -2528,7 +2528,11 @@ fn node_visible(node: &SchemaNode, ctx: &ExpansionCtx<'_>) -> bool {
         .all(|expr| ctx.eval_if_feature(expr, &node.module_name))
 }
 
-fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> bool {
+fn apply_overlay_entry(
+    node: &mut SchemaNode,
+    overlay: Option<&NodeOverlay>,
+    ctx: &ExpansionCtx<'_>,
+) -> bool {
     let Some(overlay) = overlay else {
         return true;
     };
@@ -2540,41 +2544,36 @@ fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> 
         return false;
     }
 
+    // The deviate body's extension prefixes (e.g. an explicit-dependency marker on
+    // a `must`) resolve in the *deviating* module's scope. Resolve that module so
+    // its prefix map + the compilation flags reach `apply_node_mutation` — without
+    // it, a deviation-added must/when would drop its explicit_deps/override_auto_deps.
+    let dev_module = overlay
+        .source_module
+        .as_deref()
+        .and_then(|m| ctx.registry.resolve_import(m, None));
+    let dev_prefix_ctx = dev_module.as_ref().map(|m| (m.prefix.as_str(), &m.prefix_map));
+    let dev_flags = Some(&ctx.registry.flags);
+
     let mut ignored_errors = Vec::new();
     for deviate in &overlay.deviate_stmts {
-        match deviate.arg.as_deref() {
-            Some("add") => apply_node_mutation(
-                node,
-                &deviate.substmts,
-                MutationMode::Add,
-                overlay.source_module.as_deref().unwrap_or(""),
-                None,
-                false, // deviation, not refine
-                false, // if-feature parsing is refine-only; unused for deviations
-                &mut ignored_errors,
-            ),
-            Some("replace") => apply_node_mutation(
-                node,
-                &deviate.substmts,
-                MutationMode::Replace,
-                overlay.source_module.as_deref().unwrap_or(""),
-                None,
-                false, // deviation, not refine
-                false, // if-feature parsing is refine-only; unused for deviations
-                &mut ignored_errors,
-            ),
-            Some("delete") => apply_node_mutation(
-                node,
-                &deviate.substmts,
-                MutationMode::Delete,
-                overlay.source_module.as_deref().unwrap_or(""),
-                None,
-                false, // deviation, not refine
-                false, // if-feature parsing is refine-only; unused for deviations
-                &mut ignored_errors,
-            ),
-            _ => {}
-        }
+        let mode = match deviate.arg.as_deref() {
+            Some("add") => MutationMode::Add,
+            Some("replace") => MutationMode::Replace,
+            Some("delete") => MutationMode::Delete,
+            _ => continue,
+        };
+        apply_node_mutation(
+            node,
+            &deviate.substmts,
+            mode,
+            overlay.source_module.as_deref().unwrap_or(""),
+            dev_prefix_ctx,
+            false, // deviation, not refine
+            false, // if-feature parsing is refine-only; unused for deviations
+            dev_flags,
+            &mut ignored_errors,
+        );
     }
 
     // Inject annotation extension instances and apply when/must from annotations.
@@ -2587,7 +2586,7 @@ fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> 
         let source = ann.source_module.as_str();
         let source_rev = ann.source_revision.clone();
         for when in &ann.when_stmts {
-            mutate_when_exprs(&mut node.when, when, MutationMode::Add, source, source_rev.clone());
+            mutate_when_exprs(&mut node.when, when, MutationMode::Add, source, source_rev.clone(), None, None);
         }
         match &mut node.kind {
             SchemaNodeKind::Container { musts, .. }
@@ -2599,7 +2598,7 @@ fn apply_overlay_entry(node: &mut SchemaNode, overlay: Option<&NodeOverlay>) -> 
             | SchemaNodeKind::AnyXml { musts, .. }
             | SchemaNodeKind::AnyData { musts, .. } => {
                 for must in &ann.must_stmts {
-                    mutate_must_exprs(musts, must, MutationMode::Add, source, source_rev.clone());
+                    mutate_must_exprs(musts, must, MutationMode::Add, source, source_rev.clone(), None, None);
                 }
             }
             _ => {}
@@ -2758,6 +2757,7 @@ fn expand_uses_lazy(
                 module_name,
                 prefix_ctx,
                 ctx.registry.flags.ignore_unknown_features,
+                Some(&ctx.registry.flags),
                 &mut ignored_errors,
             );
         }
@@ -2887,6 +2887,7 @@ fn expand_uses_lazy(
             module_name,
             prefix_ctx2,
             ctx.registry.flags.ignore_unknown_features,
+            Some(&ctx.registry.flags),
             &mut ignored_errors,
         );
     }
@@ -3104,6 +3105,7 @@ fn apply_refine_stmt(
     source_module_name: &str,
     prefix_ctx: Option<(&str, &PrefixMap)>,
     ignore_unknown: bool,
+    flags: Option<&CompilationFlags>,
     module_errors: &mut Vec<YError>,
 ) {
     let Some(path) = parse_relative_schema_path(
@@ -3135,6 +3137,7 @@ fn apply_refine_stmt(
         prefix_ctx,
         true, // refine: `must`/`if-feature` are additive (RFC 7950 §7.13.2)
         ignore_unknown,
+        flags,
         module_errors,
     );
 }
@@ -3238,7 +3241,7 @@ fn apply_augment_status(node: &mut SchemaNode, aug_status: Status) {
 fn apply_deviations(
     key: &ModuleKey,
     children: &mut Vec<SchemaNode>,
-    _registry: &ModuleRegistry,
+    registry: &ModuleRegistry,
     dev_index: &DeviationIndex,
     module_errors: &mut Vec<YError>,
     overlay: &mut NodeOverlayMap,
@@ -3248,6 +3251,20 @@ fn apply_deviations(
             if !deviation_targets_module(deviation, key) {
                 continue;
             }
+
+            // Prefix scope of the deviating module, so a deviate-added `must`/`when`
+            // resolves its dependency / override-auto-deps extensions (the deviating
+            // module isn't compiled yet at this point — it imports the target — so
+            // use the import map captured in the PendingDeviation, not a registry
+            // lookup). `own_prefix` is "" because the deviation references the marker
+            // extension through an import prefix, never the deviating module's own.
+            let dev_prefix_map: PrefixMap = deviation
+                .prefix_map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let dev_prefix_ctx = Some(("", &dev_prefix_map));
+            let dev_flags = Some(&registry.flags);
 
             let Some(target_path) =
                 parse_path_internal(&deviation.target_path, true, &deviation.pos, module_errors)
@@ -3289,6 +3306,8 @@ fn apply_deviations(
                         &deviate.substmts,
                         MutationMode::Add,
                         deviation.from_module.name.as_str(),
+                        dev_prefix_ctx,
+                        dev_flags,
                         &deviation.pos,
                         module_errors,
                     ),
@@ -3298,6 +3317,8 @@ fn apply_deviations(
                         &deviate.substmts,
                         MutationMode::Replace,
                         deviation.from_module.name.as_str(),
+                        dev_prefix_ctx,
+                        dev_flags,
                         &deviation.pos,
                         module_errors,
                     ),
@@ -3307,6 +3328,8 @@ fn apply_deviations(
                         &deviate.substmts,
                         MutationMode::Delete,
                         deviation.from_module.name.as_str(),
+                        dev_prefix_ctx,
+                        dev_flags,
                         &deviation.pos,
                         module_errors,
                     ),
@@ -3395,7 +3418,7 @@ fn apply_annotation_to_node(node: &mut SchemaNode, ann: &PendingAnnotation) {
     let source = ann.from_module.name.as_str();
     let source_rev = ann.from_module.revision.clone();
     for when in &ann.when_stmts {
-        mutate_when_exprs(&mut node.when, when, MutationMode::Add, source, source_rev.clone());
+        mutate_when_exprs(&mut node.when, when, MutationMode::Add, source, source_rev.clone(), None, None);
     }
     match &mut node.kind {
         SchemaNodeKind::Container { musts, .. }
@@ -3407,7 +3430,7 @@ fn apply_annotation_to_node(node: &mut SchemaNode, ann: &PendingAnnotation) {
         | SchemaNodeKind::AnyXml { musts, .. }
         | SchemaNodeKind::AnyData { musts, .. } => {
             for must in &ann.must_stmts {
-                mutate_must_exprs(musts, must, MutationMode::Add, source, source_rev.clone());
+                mutate_must_exprs(musts, must, MutationMode::Add, source, source_rev.clone(), None, None);
             }
         }
         _ => {}
@@ -3538,6 +3561,8 @@ fn apply_deviation_edit(
     stmts: &[Stmt],
     mode: MutationMode,
     source_module_name: &str,
+    prefix_ctx: Option<(&str, &PrefixMap)>,
+    flags: Option<&CompilationFlags>,
     pos: &Pos,
     module_errors: &mut Vec<YError>,
 ) {
@@ -3551,7 +3576,17 @@ fn apply_deviation_edit(
         return;
     };
 
-    apply_node_mutation(target, stmts, mode, source_module_name, None, false, false, module_errors);
+    apply_node_mutation(
+        target,
+        stmts,
+        mode,
+        source_module_name,
+        prefix_ctx,
+        false, // deviation, not refine
+        false, // if-feature parsing is refine-only; unused for deviations
+        flags,
+        module_errors,
+    );
 }
 
 fn apply_node_mutation(
@@ -3568,6 +3603,10 @@ fn apply_node_mutation(
     // (treated as disabled) rather than reported. Only consulted on the refine
     // path; deviations never parse `if-feature` here.
     ignore_unknown: bool,
+    // Compilation flags, used (with `prefix_ctx`) to resolve dependency /
+    // override-auto-deps extensions inside a `must`/`when` body. `None` when the
+    // caller has no flag context.
+    flags: Option<&CompilationFlags>,
     module_errors: &mut Vec<YError>,
 ) {
     for stmt in stmts {
@@ -3588,7 +3627,9 @@ fn apply_node_mutation(
             Some(BuiltInKeyword::Reference) => {
                 apply_opt_string(mode, &mut node.reference, stmt.arg.clone())
             }
-            Some(BuiltInKeyword::When) => mutate_when_exprs(&mut node.when, stmt, mode, source_module_name, None),
+            Some(BuiltInKeyword::When) => {
+                mutate_when_exprs(&mut node.when, stmt, mode, source_module_name, None, prefix_ctx, flags)
+            }
             Some(BuiltInKeyword::IfFeature) => {
                 if is_refine {
                     // RFC 7950 §7.13.2: a refine adds `if-feature` expressions to
@@ -3627,7 +3668,7 @@ fn apply_node_mutation(
                     | SchemaNodeKind::Notification { musts, .. }
                     | SchemaNodeKind::AnyXml { musts, .. }
                     | SchemaNodeKind::AnyData { musts, .. } => {
-                        mutate_must_exprs(musts, stmt, must_mode, source_module_name, None)
+                        mutate_must_exprs(musts, stmt, must_mode, source_module_name, None, prefix_ctx, flags)
                     }
                     _ => {}
                 }
@@ -3750,7 +3791,26 @@ fn apply_node_mutation(
     }
 }
 
-fn mutate_when_exprs(list: &mut Vec<WhenExpr>, stmt: &Stmt, mode: MutationMode, source_module_name: &str, source_revision: Option<String>) {
+fn mutate_when_exprs(
+    list: &mut Vec<WhenExpr>,
+    stmt: &Stmt,
+    mode: MutationMode,
+    source_module_name: &str,
+    source_revision: Option<String>,
+    // Prefix scope + flags of the module that authored `stmt` (a refine's using
+    // module, or a deviation's deviating module). When both are present, the
+    // configured dependency / override-auto-deps extensions in the statement
+    // body are resolved into the expression — exactly as the direct compile path
+    // does. Annotation-injected whens have no prefix context and pass `None`.
+    prefix_ctx: Option<(&str, &PrefixMap)>,
+    flags: Option<&CompilationFlags>,
+) {
+    let (explicit_deps, override_auto_deps) = match (prefix_ctx, flags) {
+        (Some((own_prefix, prefix_map)), Some(flags)) => {
+            collect_explicit_deps(&stmt.substmts, own_prefix, source_module_name, prefix_map, flags)
+        }
+        _ => (Vec::new(), false),
+    };
     let entry = WhenExpr {
         xpath: stmt.arg.clone().unwrap_or_default(),
         description: opt_substmt_arg(stmt, BuiltInKeyword::Description),
@@ -3758,11 +3818,8 @@ fn mutate_when_exprs(list: &mut Vec<WhenExpr>, stmt: &Stmt, mode: MutationMode, 
         source_module: source_module_name.to_string(),
         source_revision,
         non_local: false,
-        // Mirrors `mutate_must_exprs`: explicit-dependency sub-statements from
-        // annotation-injected whens are not resolved in the mutate path
-        // (no own_prefix/prefix_map context). Leave empty.
-        explicit_deps: vec![],
-        override_auto_deps: false,
+        explicit_deps,
+        override_auto_deps,
     };
     match mode {
         MutationMode::Add => list.push(entry),
@@ -3774,7 +3831,24 @@ fn mutate_when_exprs(list: &mut Vec<WhenExpr>, stmt: &Stmt, mode: MutationMode, 
     }
 }
 
-fn mutate_must_exprs(list: &mut Vec<MustExpr>, stmt: &Stmt, mode: MutationMode, source_module_name: &str, source_revision: Option<String>) {
+fn mutate_must_exprs(
+    list: &mut Vec<MustExpr>,
+    stmt: &Stmt,
+    mode: MutationMode,
+    source_module_name: &str,
+    source_revision: Option<String>,
+    // See [`mutate_when_exprs`]: prefix scope + flags of the module that authored
+    // `stmt`, used to resolve dependency / override-auto-deps extensions in its
+    // body. `None` for annotation-injected musts (no prefix context).
+    prefix_ctx: Option<(&str, &PrefixMap)>,
+    flags: Option<&CompilationFlags>,
+) {
+    let (explicit_deps, override_auto_deps) = match (prefix_ctx, flags) {
+        (Some((own_prefix, prefix_map)), Some(flags)) => {
+            collect_explicit_deps(&stmt.substmts, own_prefix, source_module_name, prefix_map, flags)
+        }
+        _ => (Vec::new(), false),
+    };
     let entry = MustExpr {
         xpath: stmt.arg.clone().unwrap_or_default(),
         error_message: opt_substmt_arg(stmt, BuiltInKeyword::ErrorMessage),
@@ -3782,11 +3856,8 @@ fn mutate_must_exprs(list: &mut Vec<MustExpr>, stmt: &Stmt, mode: MutationMode, 
         description: opt_substmt_arg(stmt, BuiltInKeyword::Description),
         source_module: source_module_name.to_string(),
         source_revision,
-        // explicit-dependency sub-statements from annotation-injected musts are not
-        // available in the mutate path (no own_prefix/prefix_map). Leave empty;
-        // callers can fix this up if needed.
-        explicit_deps: vec![],
-        override_auto_deps: false,
+        explicit_deps,
+        override_auto_deps,
     };
     match mode {
         MutationMode::Add => list.push(entry),
@@ -4545,6 +4616,249 @@ module example {
         assert_eq!(compiled.yang_version, YangVersion::V11);
         assert_eq!(compiled.namespace, "urn:example");
         assert_eq!(compiled.prefix, "ex");
+    }
+
+    /// Find the resolved `must`s on leaf `c/x` after expanding `c`'s children.
+    #[cfg(test)]
+    fn musts_on_c_x<'a>(
+        module: &'a CompiledModule,
+        ctx: &ExpansionCtx<'_>,
+    ) -> Vec<(String, Vec<String>, bool)> {
+        let c = module
+            .children
+            .iter()
+            .find(|n| n.name == "c")
+            .expect("container c");
+        let kids = c.children(ctx);
+        let x = kids.iter().find(|n| n.name == "x").expect("leaf x");
+        match &x.kind {
+            SchemaNodeKind::Leaf { musts, .. } => musts
+                .iter()
+                .map(|m| (m.xpath.clone(), m.explicit_deps.clone(), m.override_auto_deps))
+                .collect(),
+            other => panic!("expected leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refine_must_preserves_explicit_deps() {
+        // A `dependency` extension marks an explicit dependency path inside a must.
+        // When that must is introduced through a `refine`, the resolved MustExpr
+        // must still carry explicit_deps (the same way a direct must does) — the
+        // mutate path used to drop it.
+        let deps_ext = parse_module(
+            r#"
+module example-deps {
+  namespace "urn:example:deps";
+  prefix ed;
+  extension dependency { argument path; }
+}
+"#,
+        );
+        let model = parse_module(
+            r#"
+module example-bug {
+  namespace "urn:example:bug";
+  prefix eb;
+  import example-deps { prefix ed; }
+  grouping g {
+    leaf x { type string; }
+  }
+  container c {
+    uses g {
+      refine "x" {
+        must "../sibling" {
+          ed:dependency "../sibling";
+        }
+      }
+    }
+    leaf sibling { type string; }
+  }
+}
+"#,
+        );
+
+        let mut reg = ModuleRegistry::new();
+        reg.flags.dependency_extension = Some(("example-deps".into(), "dependency".into()));
+        let deps_compiled = compile_module(
+            &ModuleKey::latest("example-deps"),
+            deps_ext,
+            &reg,
+            &DeviationIndex::default(),
+            &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
+        );
+        reg.insert(Arc::new(deps_compiled));
+        let model_compiled = compile_module(
+            &ModuleKey::latest("example-bug"),
+            model,
+            &reg,
+            &DeviationIndex::default(),
+            &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
+        );
+        assert!(model_compiled.errors.is_empty(), "errors: {:?}", model_compiled.errors);
+        reg.insert(Arc::new(model_compiled));
+
+        let module = reg.resolve_import("example-bug", None).unwrap();
+        let ctx = ExpansionCtx::all_features(&reg);
+        let musts = musts_on_c_x(&module, &ctx);
+        assert_eq!(
+            musts,
+            vec![("../sibling".to_string(), vec!["../sibling".to_string()], false)],
+            "refine-introduced must must keep its explicit_deps"
+        );
+    }
+
+    #[test]
+    fn deviation_must_preserves_override_auto_deps() {
+        // The override-auto-deps marker on a deviate-added must must survive the
+        // mutate path (deviating module's prefix scope is used to resolve it).
+        let deps_ext = parse_module(
+            r#"
+module example-deps {
+  namespace "urn:example:deps";
+  prefix ed;
+  extension no-auto-deps { }
+}
+"#,
+        );
+        let base = parse_module(
+            r#"
+module example-base {
+  namespace "urn:example:base";
+  prefix eb;
+  container c {
+    leaf x { type string; }
+    leaf sibling { type string; }
+  }
+}
+"#,
+        );
+        let dev = parse_module(
+            r#"
+module example-dev {
+  namespace "urn:example:dev";
+  prefix ev;
+  import example-base { prefix eb; }
+  import example-deps { prefix ed; }
+  deviation "/eb:c/eb:x" {
+    deviate add {
+      must "../sibling" {
+        ed:no-auto-deps;
+      }
+    }
+  }
+}
+"#,
+        );
+
+        let dev_index = DeviationIndex::build(&[
+            (ModuleKey::latest("example-dev"), dev.clone()),
+        ]);
+        let mut reg = ModuleRegistry::new();
+        reg.flags.override_auto_deps_extension =
+            Some(("example-deps".into(), "no-auto-deps".into()));
+        for (name, stmt) in [("example-deps", deps_ext), ("example-base", base)] {
+            let compiled = compile_module(
+                &ModuleKey::latest(name),
+                stmt,
+                &reg,
+                &dev_index,
+                &AnnotationIndex::default(),
+                &AstAnnotationIndex::default(),
+            );
+            reg.insert(Arc::new(compiled));
+        }
+
+        let module = reg.resolve_import("example-base", None).unwrap();
+        let ctx = ExpansionCtx::all_features(&reg);
+        let musts = musts_on_c_x(&module, &ctx);
+        assert_eq!(
+            musts,
+            vec![("../sibling".to_string(), Vec::<String>::new(), true)],
+            "deviate-added must must keep override_auto_deps set"
+        );
+    }
+
+    #[test]
+    fn deferred_deviation_must_preserves_explicit_deps() {
+        // Deviation target is a node introduced via `uses`, so it does not exist in
+        // the raw tree at compile time and is deferred to the node overlay; the
+        // must is materialised later by `apply_overlay_entry` at expansion. Its
+        // explicit_deps must survive that path too (the deviating module's prefix
+        // scope is resolved from the registry there).
+        let deps_ext = parse_module(
+            r#"
+module example-deps {
+  namespace "urn:example:deps";
+  prefix ed;
+  extension dependency { argument path; }
+}
+"#,
+        );
+        let base = parse_module(
+            r#"
+module example-base {
+  namespace "urn:example:base";
+  prefix eb;
+  grouping g {
+    leaf x { type string; }
+  }
+  container c {
+    uses g;
+    leaf sibling { type string; }
+  }
+}
+"#,
+        );
+        let dev = parse_module(
+            r#"
+module example-dev {
+  namespace "urn:example:dev";
+  prefix ev;
+  import example-base { prefix eb; }
+  import example-deps { prefix ed; }
+  deviation "/eb:c/eb:x" {
+    deviate add {
+      must "../sibling" {
+        ed:dependency "../sibling";
+      }
+    }
+  }
+}
+"#,
+        );
+
+        let dev_index = DeviationIndex::build(&[(ModuleKey::latest("example-dev"), dev.clone())]);
+        let mut reg = ModuleRegistry::new();
+        reg.flags.dependency_extension = Some(("example-deps".into(), "dependency".into()));
+        // The deviating module must also be compiled into the registry: the
+        // deferred-deviation path resolves its prefix scope from there at expansion.
+        for (name, stmt) in [
+            ("example-deps", deps_ext),
+            ("example-base", base),
+            ("example-dev", dev),
+        ] {
+            let compiled = compile_module(
+                &ModuleKey::latest(name),
+                stmt,
+                &reg,
+                &dev_index,
+                &AnnotationIndex::default(),
+                &AstAnnotationIndex::default(),
+            );
+            reg.insert(Arc::new(compiled));
+        }
+
+        let module = reg.resolve_import("example-base", None).unwrap();
+        let ctx = ExpansionCtx::all_features(&reg);
+        let musts = musts_on_c_x(&module, &ctx);
+        assert_eq!(
+            musts,
+            vec![("../sibling".to_string(), vec!["../sibling".to_string()], false)],
+            "deviate-added must on a uses-introduced node must keep its explicit_deps"
+        );
     }
 
     #[test]
