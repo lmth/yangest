@@ -2511,13 +2511,18 @@ pub fn walk_path_collecting_intermediates(
                     if rest.is_empty() {
                         return Some((node.clone(), vec![]));
                     }
-                    if let Some(children) = raw_children_of_kind(&node.kind) {
-                        let (terminal, mut intermediates) =
-                            walk_path_collecting_intermediates(rest, children, ctx)?;
-                        intermediates.insert(0, node.clone());
-                        return Some((terminal, intermediates));
-                    }
-                    return None;
+                    // Descend through the node's *expanded* children rather than
+                    // its raw ones: `children()` applies the module overlay,
+                    // including deviations that targeted a node under a `uses` and
+                    // were deferred to the overlay at compile time. Walking raw
+                    // children (with `expand_uses_lazy` + an empty overlay) would
+                    // return the un-deviated grouping body — the asymmetry this
+                    // walker had with the main expansion path.
+                    let children = node.children(ctx);
+                    let (terminal, mut intermediates) =
+                        walk_path_collecting_intermediates(rest, &children, ctx)?;
+                    intermediates.insert(0, node.clone());
+                    return Some((terminal, intermediates));
                 }
             }
         }
@@ -4980,6 +4985,94 @@ module example-status-pos {
             None,
             "implicit `current` status carries no position"
         );
+    }
+
+    #[test]
+    fn walker_sees_deviation_through_uses() {
+        // A deviation targets a node reached through a `uses`, so it can't be
+        // applied at compile time and is deferred to the module overlay. The
+        // no-clone walkers (used e.g. for leafref-target resolution) must observe
+        // the deviated node, not the raw grouping body — i.e. the same tree the
+        // main expansion path produces.
+        let target = parse_module(
+            r#"
+module target {
+  namespace "urn:example:target";
+  prefix t;
+  grouping g {
+    list item {
+      key id;
+      leaf id { type uint32 { range "1..512"; } }
+    }
+  }
+  container root { uses g; }
+}
+"#,
+        );
+        let dev = parse_module(
+            r#"
+module target-deviation {
+  namespace "urn:example:target-deviation";
+  prefix td;
+  import target { prefix t; }
+  deviation "/t:root/t:item/t:id" {
+    deviate replace {
+      type uint32 { range "1..64"; }
+    }
+  }
+}
+"#,
+        );
+
+        let dev_index =
+            DeviationIndex::build(&[(ModuleKey::latest("target-deviation"), dev.clone())]);
+        let mut reg = ModuleRegistry::new();
+        // The deviating module must be in the registry: the deferred-overlay owner
+        // is resolved from there, mirroring a real bundle.
+        for (name, stmt) in [("target", target), ("target-deviation", dev)] {
+            reg.insert(Arc::new(compile_module(
+                &ModuleKey::latest(name),
+                stmt,
+                &reg,
+                &dev_index,
+                &AnnotationIndex::default(),
+                &AstAnnotationIndex::default(),
+            )));
+        }
+
+        let module = reg.resolve_import("target", None).unwrap();
+        let ctx = ExpansionCtx::all_features(&reg);
+
+        let path = |s: &str| -> Vec<PathStep> {
+            s.split('/')
+                .filter(|p| !p.is_empty())
+                .map(|name| PathStep { prefix: None, name: name.to_string() })
+                .collect()
+        };
+
+        let range_of = |n: &SchemaNode| match &n.kind {
+            SchemaNodeKind::Leaf { type_stmt, .. } => type_stmt
+                .get_substmt(BuiltInKeyword::Range)
+                .and_then(|s| s.arg.clone())
+                .expect("range present"),
+            other => panic!("expected leaf, got {other:?}"),
+        };
+
+        // 1) The walker sees the deviated range.
+        let (terminal, _) =
+            walk_path_collecting_intermediates(&path("root/item/id"), &module.children, &ctx)
+                .expect("path resolves");
+        assert_eq!(
+            range_of(&terminal),
+            "1..64",
+            "the walker must see the deviated range, not the original 1..512"
+        );
+
+        // 2) Parity: the main expansion path produces the same deviated range.
+        let root = module.children.iter().find(|n| n.name == "root").unwrap();
+        let item = root.children(&ctx).into_iter().find(|n| n.name == "item").unwrap();
+        let id = item.children(&ctx).into_iter().find(|n| n.name == "id").unwrap();
+        assert_eq!(range_of(&id), "1..64", "main path also deviated (sanity)");
     }
 
     #[test]
