@@ -810,6 +810,7 @@ fn compile_schema_children(
                 if let Some(node) = compile_uses_node(
                     stmt,
                     key,
+                    source_module_name,
                     yang_version,
                     own_prefix,
                     prefix_map,
@@ -831,6 +832,13 @@ fn compile_schema_children(
 fn compile_uses_node(
     uses_stmt: &Stmt,
     key: &ModuleKey,
+    // Module that authored the enclosing statements (the caller's
+    // `source_module_name`). For a `uses` written in a submodule's grouping body
+    // this is the submodule, not `key.name` (the parent being compiled) — so
+    // `when`/`if-feature` on the `uses` itself, and on its inline `augment`s, are
+    // attributed correctly. Distinct from the local `source_module_name` below,
+    // which is the *referenced grouping's* source (for resolution/locating).
+    enclosing_module_name: &str,
     yang_version: YangVersion,
     own_prefix: &str,
     prefix_map: &PrefixMap,
@@ -870,7 +878,7 @@ fn compile_uses_node(
         let nodes = compile_schema_children(
             &augment.substmts,
             key,
-            key.name.as_str(),
+            enclosing_module_name,
             yang_version,
             own_prefix,
             prefix_map,
@@ -882,11 +890,11 @@ fn compile_uses_node(
         local_augments.push(LocalAugmentEntry {
             target_path: target_path.into_iter().map(|step| step.name).collect(),
             nodes,
-            when: collect_when_exprs(augment, own_prefix, prefix_map, key.name.as_str(), module_errors, &registry.flags),
+            when: collect_when_exprs(augment, own_prefix, prefix_map, enclosing_module_name, module_errors, &registry.flags),
             if_features: collect_if_features(
                 augment,
                 own_prefix,
-                &key.name,
+                enclosing_module_name,
                 prefix_map,
                 module_errors,
                 ignore_unknown,
@@ -918,11 +926,11 @@ fn compile_uses_node(
                     .cloned()
                     .collect(),
                 local_augments,
-                when: collect_when_exprs(uses_stmt, own_prefix, prefix_map, key.name.as_str(), module_errors, &registry.flags),
+                when: collect_when_exprs(uses_stmt, own_prefix, prefix_map, enclosing_module_name, module_errors, &registry.flags),
                 if_features: collect_if_features(
                     uses_stmt,
                     own_prefix,
-                    &key.name,
+                    enclosing_module_name,
                     prefix_map,
                     module_errors,
                     ignore_unknown,
@@ -1194,6 +1202,7 @@ fn compile_choice_cases(
                     Some(BuiltInKeyword::Uses) => compile_uses_node(
                         sub,
                         key,
+                        source_module_name,
                         yang_version,
                         own_prefix,
                         prefix_map,
@@ -5613,6 +5622,7 @@ module overlay {
             r#"
 submodule par-sub {
   belongs-to par { prefix p; }
+  grouping h { leaf z { type string; } }
   grouping g {
     grouping inner {
       container cc {
@@ -5622,6 +5632,7 @@ submodule par-sub {
       }
     }
     uses inner;
+    uses h { when "1 = 1"; }   // when on the `uses` itself (RFC 7950 §7.13.2)
   }
 }
 "#,
@@ -5676,6 +5687,20 @@ module cons {
         };
         assert_eq!(musts.len(), 1);
         assert_eq!(musts[0].source_module, "par-sub", "submodule `must` likewise");
+
+        // `when` written on the `uses h` statement itself (not inside h's body) is
+        // also attributed to the authoring submodule — it propagates onto h's
+        // top-level nodes during expansion.
+        let z = use_it
+            .children(&ctx)
+            .into_iter()
+            .find(|n| n.name == "z")
+            .expect("z reached via `uses h` with a when");
+        assert_eq!(z.when.len(), 1);
+        assert_eq!(
+            z.when[0].source_module, "par-sub",
+            "`when` on a `uses` in a submodule grouping must attribute to the submodule"
+        );
     }
 
     #[test]
