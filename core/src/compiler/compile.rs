@@ -2492,6 +2492,16 @@ where
 /// Returns `None` if any step in the path cannot be found.
 ///
 /// Handles `Uses` expansion transparently (same as `walk_path_with_siblings`).
+///
+/// Each level is materialised exactly as the main expansion path
+/// ([`expand_children_inner`]) does — expanding `uses` *and* applying the
+/// deviation/annotation overlay with correct path keys — so a deviation deferred
+/// past a `uses` (stashed in the module overlay because `apply_deviations`
+/// couldn't descend into the `Uses` node) is observed identically to the cs
+/// records the main path emits. An earlier version special-cased `Uses` with an
+/// empty overlay and an untracked parent path, so the overlay key for a node
+/// reached through a `uses` lost its ancestor prefix and the deferred deviation
+/// never matched.
 pub fn walk_path_collecting_intermediates(
     path: &[PathStep],
     raw: &[SchemaNode],
@@ -2500,48 +2510,68 @@ pub fn walk_path_collecting_intermediates(
     if path.is_empty() {
         return None;
     }
+    let empty_overlay = NodeOverlayMap::new();
+    // Seed from the module the walk is rooted in (the consuming module that owns
+    // any deviation deferred past a `uses`), mirroring `CompiledModule::children`:
+    // `raw` is that module's child slice. This rooted overlay is threaded as the
+    // *secondary* at every level so a deferred deviation is still found after the
+    // descent crosses into a foreign grouping body (whose own module overlay is
+    // empty) — the same role `file_module_overlay` plays for the main path.
+    let root_owner = raw
+        .first()
+        .and_then(|n| ctx.registry.resolve_import(&n.module_name, None));
+    let root_overlay = root_owner.as_ref().map(|m| &m.overlay).unwrap_or(&empty_overlay);
+    walk_collecting_overlay(path, raw, root_overlay, root_overlay, &[], ctx)
+}
+
+/// Inner driver for [`walk_path_collecting_intermediates`] that threads the active
+/// `primary` overlay (the current level's residence-module overlay), the rooted
+/// `deferred` overlay (secondary, where deviations stashed past a `uses` live),
+/// and the accumulated `parent_path` — matching `SchemaNode::children` semantics.
+fn walk_collecting_overlay(
+    path: &[PathStep],
+    raw: &[SchemaNode],
+    primary: &NodeOverlayMap,
+    deferred: &NodeOverlayMap,
+    parent_path: &[PathStep],
+    ctx: &ExpansionCtx<'_>,
+) -> Option<(SchemaNode, Vec<SchemaNode>)> {
     let first = &path[0];
     let rest = &path[1..];
     let empty_overlay = NodeOverlayMap::new();
 
-    for node in raw {
-        match &node.kind {
-            SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay, was_unprefixed: _ } => {
-                let expanded = expand_uses_lazy(
-                    grouping,
-                    source_module_name.as_deref(),
-                    uses_overlay,
-                    &node.module_prefix,
-                    &node.module_name,
-                    &empty_overlay,
-                    ctx,
-                );
-                if let Some(r) = walk_path_collecting_intermediates(path, &expanded, ctx) {
-                    return Some(r);
-                }
-            }
-            _ => {
-                if node.name == first.name && node_visible(node, ctx) {
-                    if rest.is_empty() {
-                        return Some((node.clone(), vec![]));
-                    }
-                    // Descend through the node's *expanded* children rather than
-                    // its raw ones: `children()` applies the module overlay,
-                    // including deviations that targeted a node under a `uses` and
-                    // were deferred to the overlay at compile time. Walking raw
-                    // children (with `expand_uses_lazy` + an empty overlay) would
-                    // return the un-deviated grouping body — the asymmetry this
-                    // walker had with the main expansion path.
-                    let children = node.children(ctx);
-                    let (terminal, mut intermediates) =
-                        walk_path_collecting_intermediates(rest, &children, ctx)?;
-                    intermediates.insert(0, node.clone());
-                    return Some((terminal, intermediates));
-                }
-            }
-        }
+    // Secondary overlay: prefer an explicitly-set `file_module_overlay` (the
+    // emitter's contract), else fall back to the rooted `deferred` overlay so the
+    // walker is correct stand-alone.
+    let fallback_ptr = ctx.file_module_overlay.get();
+    let secondary: &NodeOverlayMap = if fallback_ptr.is_null() {
+        deferred
+    } else {
+        // SAFETY: same contract as `SchemaNode::children` — the pointer is set by the
+        // emitter immediately before walking and points to a `CompiledModule` overlay
+        // that outlives this call.
+        unsafe { &*fallback_ptr }
+    };
+
+    // Materialise this level the way the main path does: `uses` expanded
+    // transparently, overlay applied per node with `parent_path`-derived keys.
+    let level = expand_children_inner(raw, "", "", primary, Some(secondary), parent_path, ctx);
+    let node = level.into_iter().find(|n| n.name == first.name)?;
+    if rest.is_empty() {
+        return Some((node, vec![]));
     }
-    None
+    let raw_children = node.raw_children()?;
+    // Next level's primary overlay = the matched node's residence-module overlay,
+    // and `parent_path` = its (now-attached) schema path — both as `children` does.
+    let next_owner = ctx.registry.resolve_import(&node.module_name, None);
+    let next_primary = next_owner.as_ref().map(|m| &m.overlay).unwrap_or(&empty_overlay);
+    let next_parent = node.schema_path().unwrap_or_else(|| {
+        vec![PathStep { prefix: Some(node.module_prefix.clone()), name: node.name.clone() }]
+    });
+    let (terminal, mut intermediates) =
+        walk_collecting_overlay(rest, raw_children, next_primary, deferred, &next_parent, ctx)?;
+    intermediates.insert(0, node);
+    Some((terminal, intermediates))
 }
 
 fn node_visible(node: &SchemaNode, ctx: &ExpansionCtx<'_>) -> bool {
@@ -5335,6 +5365,211 @@ module target-deviation {
         let item = root.children(&ctx).into_iter().find(|n| n.name == "item").unwrap();
         let id = item.children(&ctx).into_iter().find(|n| n.name == "id").unwrap();
         assert_eq!(range_of(&id), "1..64", "main path also deviated (sanity)");
+    }
+
+    #[test]
+    fn walker_sees_deviation_through_nested_uses() {
+        // Like `walker_sees_deviation_through_uses`, but the descent crosses a
+        // `uses` at an *intermediate* level (inside a grouping body reached via an
+        // outer `uses`). The `_` arm descends via `children()` (overlay-correct),
+        // but the residual `Uses` arm expanded with an empty overlay — so a
+        // deferred deviation under the nested `uses` was lost only on the walker's
+        // path, while the main expansion path applied it.
+        let target = parse_module(
+            r#"
+module target {
+  namespace "urn:example:target";
+  prefix t;
+  grouping inner {
+    list item {
+      key id;
+      leaf id { type uint32 { range "1..512"; } }
+    }
+  }
+  grouping outer {
+    container holder { uses inner; }
+  }
+  container root { uses outer; }
+}
+"#,
+        );
+        let dev = parse_module(
+            r#"
+module target-deviation {
+  namespace "urn:example:target-deviation";
+  prefix td;
+  import target { prefix t; }
+  deviation "/t:root/t:holder/t:item/t:id" {
+    deviate replace {
+      type uint32 { range "1..64"; }
+    }
+  }
+}
+"#,
+        );
+
+        let dev_index =
+            DeviationIndex::build(&[(ModuleKey::latest("target-deviation"), dev.clone())]);
+        let mut reg = ModuleRegistry::new();
+        for (name, stmt) in [("target", target), ("target-deviation", dev)] {
+            reg.insert(Arc::new(compile_module(
+                &ModuleKey::latest(name),
+                stmt,
+                &reg,
+                &dev_index,
+                &AnnotationIndex::default(),
+                &AstAnnotationIndex::default(),
+            )));
+        }
+
+        let module = reg.resolve_import("target", None).unwrap();
+        let ctx = ExpansionCtx::all_features(&reg);
+
+        let path = |s: &str| -> Vec<PathStep> {
+            s.split('/')
+                .filter(|p| !p.is_empty())
+                .map(|name| PathStep { prefix: None, name: name.to_string() })
+                .collect()
+        };
+        let range_of = |n: &SchemaNode| match &n.kind {
+            SchemaNodeKind::Leaf { type_stmt, .. } => type_stmt
+                .get_substmt(BuiltInKeyword::Range)
+                .and_then(|s| s.arg.clone())
+                .expect("range present"),
+            other => panic!("expected leaf, got {other:?}"),
+        };
+
+        // Main path applies the deviation (sanity).
+        let root = module.children.iter().find(|n| n.name == "root").unwrap();
+        let holder = root.children(&ctx).into_iter().find(|n| n.name == "holder").unwrap();
+        let item = holder.children(&ctx).into_iter().find(|n| n.name == "item").unwrap();
+        let id = item.children(&ctx).into_iter().find(|n| n.name == "id").unwrap();
+        assert_eq!(range_of(&id), "1..64", "main path deviated (sanity)");
+
+        // The walker must agree, even crossing the nested `uses`.
+        let (terminal, _) =
+            walk_path_collecting_intermediates(&path("root/holder/item/id"), &module.children, &ctx)
+                .expect("path resolves");
+        assert_eq!(
+            range_of(&terminal),
+            "1..64",
+            "the walker must see the deviated range across a nested uses, not 1..512"
+        );
+    }
+
+    #[test]
+    fn walker_sees_deviation_through_cross_module_uses() {
+        // The real-world shape: the grouping lives in a *different* module from the
+        // one that `uses` it and carries the deviation. Grouping-expanded nodes keep
+        // the grouping host's `module_name`, so `SchemaNode::children` resolves the
+        // host's (empty) overlay rather than the consuming module's — where the
+        // deferred deviation actually lives.
+        let common = parse_module(
+            r#"
+module common {
+  namespace "urn:common"; prefix c;
+  grouping g {
+    container holder {
+      list item {
+        key id;
+        leaf id { type uint32 { range "1..512"; } }
+      }
+    }
+  }
+}
+"#,
+        );
+        let native = parse_module(
+            r#"
+module native {
+  namespace "urn:native"; prefix n;
+  import common { prefix c; }
+  container root { uses c:g; }
+}
+"#,
+        );
+        let dev = parse_module(
+            r#"
+module native-deviation {
+  namespace "urn:native-deviation"; prefix nd;
+  import native { prefix n; }
+  deviation "/n:root/n:holder/n:item/n:id" {
+    deviate replace {
+      type uint32 { range "1..64"; }
+    }
+  }
+}
+"#,
+        );
+
+        let dev_index =
+            DeviationIndex::build(&[(ModuleKey::latest("native-deviation"), dev.clone())]);
+        let mut reg = ModuleRegistry::new();
+        for (name, stmt) in
+            [("common", common), ("native", native), ("native-deviation", dev)]
+        {
+            reg.insert(Arc::new(compile_module(
+                &ModuleKey::latest(name),
+                stmt,
+                &reg,
+                &dev_index,
+                &AnnotationIndex::default(),
+                &AstAnnotationIndex::default(),
+            )));
+        }
+
+        let module = reg.resolve_import("native", None).unwrap();
+        let ctx = ExpansionCtx::all_features(&reg);
+
+        let path = |s: &str| -> Vec<PathStep> {
+            s.split('/')
+                .filter(|p| !p.is_empty())
+                .map(|name| PathStep { prefix: None, name: name.to_string() })
+                .collect()
+        };
+        let range_of = |n: &SchemaNode| match &n.kind {
+            SchemaNodeKind::Leaf { type_stmt, .. } => type_stmt
+                .get_substmt(BuiltInKeyword::Range)
+                .and_then(|s| s.arg.clone())
+                .expect("range present"),
+            other => panic!("expected leaf, got {other:?}"),
+        };
+
+        // The walker is self-sufficient: it threads the rooted (consuming-module)
+        // overlay as the secondary, so it finds the deferred deviation even though
+        // the descent crosses into `common`'s grouping body (whose own overlay is
+        // empty). No emitter context needed.
+        let (terminal, _) = walk_path_collecting_intermediates(
+            &path("root/holder/item/id"),
+            &module.children,
+            &ctx,
+        )
+        .expect("path resolves");
+        assert_eq!(
+            range_of(&terminal),
+            "1..64",
+            "the walker must see the deviated range across a cross-module uses, not 1..512"
+        );
+
+        // Parity with the cs/main path under the emitter contract: with
+        // `file_module_overlay` set to the consuming module's overlay (as the
+        // emitter does), the level-by-level `children()` descent also deviates, and
+        // the walker agrees.
+        let native_mod = reg.resolve_import("native", None).unwrap();
+        let emit_ctx =
+            ExpansionCtx::all_features(&reg).with_file_module_overlay(&native_mod.overlay);
+        let root = module.children.iter().find(|n| n.name == "root").unwrap();
+        let holder = root.children(&emit_ctx).into_iter().find(|n| n.name == "holder").unwrap();
+        let item = holder.children(&emit_ctx).into_iter().find(|n| n.name == "item").unwrap();
+        let id = item.children(&emit_ctx).into_iter().find(|n| n.name == "id").unwrap();
+        assert_eq!(range_of(&id), "1..64", "main path deviated under emitter contract");
+        let (terminal2, _) = walk_path_collecting_intermediates(
+            &path("root/holder/item/id"),
+            &module.children,
+            &emit_ctx,
+        )
+        .expect("path resolves");
+        assert_eq!(range_of(&terminal2), "1..64", "walker matches the cs/main path");
     }
 
     #[test]
