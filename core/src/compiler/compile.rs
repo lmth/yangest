@@ -2770,15 +2770,90 @@ fn expand_uses_lazy(
     let Some(ann) = ctx.annotation_index() else {
         return expanded;
     };
-    // Only clone+filter when something actually needs dropping; otherwise keep the
-    // shared Arc. The scan is the cost the flag opts into.
-    if expanded
-        .iter()
-        .any(|n| node_has_foreign_annotation(n, module_name, ann))
-    {
+    // The scan of a grouping's expansion is a pure function of the grouping and the
+    // consuming module, so memoise it (keyed by grouping pointer) instead of
+    // re-walking the whole expanded tree on every call. Two levels:
+    //   - `has_any`: does the grouping carry ANY annotation-injected statement?
+    //     Computed once per grouping; false for the vast majority, which then skip
+    //     all per-call work and keep the shared Arc.
+    //   - `foreign`: for grouping bodies that do, whether a statement foreign to
+    //     this consuming module is present — memoised per consuming module.
+    let gptr = Arc::as_ptr(grouping) as usize;
+
+    let has_any = ctx.ann_scope_cache.borrow().get(&gptr).map(|v| v.has_any);
+    let has_any = has_any.unwrap_or_else(|| {
+        let v = expanded
+            .iter()
+            .any(|n| node_has_annotation_injected(n, ann));
+        ctx.ann_scope_cache.borrow_mut().entry(gptr).or_default().has_any = v;
+        v
+    });
+    if !has_any {
+        return expanded;
+    }
+
+    let foreign = ctx
+        .ann_scope_cache
+        .borrow()
+        .get(&gptr)
+        .and_then(|v| v.foreign.get(module_name).copied());
+    let foreign = foreign.unwrap_or_else(|| {
+        let v = expanded
+            .iter()
+            .any(|n| node_has_foreign_annotation(n, module_name, ann));
+        ctx.ann_scope_cache
+            .borrow_mut()
+            .entry(gptr)
+            .or_default()
+            .foreign
+            .insert(module_name.to_string(), v);
+        v
+    });
+    if foreign {
         Arc::new(filter_foreign_annotations(&expanded, module_name, ann))
     } else {
         expanded
+    }
+}
+
+/// Recursively scan for any annotation-injected `must`/`when`/extension,
+/// regardless of which module it targets. Target-independent companion to
+/// [`node_has_foreign_annotation`]; used to compute `GroupingScopeVerdict::has_any`.
+fn node_has_annotation_injected(node: &SchemaNode, ann: &AstAnnotationIndex) -> bool {
+    if node
+        .when
+        .iter()
+        .any(|w| ann.is_annotation_module(&w.source_module))
+        || node
+            .extensions
+            .iter()
+            .any(|e| ann.module_key_for_file(e.pos.orig_file()).is_some())
+    {
+        return true;
+    }
+    let musts_injected =
+        |musts: &[MustExpr]| musts.iter().any(|m| ann.is_annotation_module(&m.source_module));
+    let kids_injected =
+        |kids: &[SchemaNode]| kids.iter().any(|k| node_has_annotation_injected(k, ann));
+    match &node.kind {
+        SchemaNodeKind::Container { children, musts, .. }
+        | SchemaNodeKind::Notification { children, musts, .. }
+        | SchemaNodeKind::List { children, musts, .. } => {
+            musts_injected(musts) || kids_injected(children)
+        }
+        SchemaNodeKind::Leaf { musts, .. }
+        | SchemaNodeKind::LeafList { musts, .. }
+        | SchemaNodeKind::AnyXml { musts, .. }
+        | SchemaNodeKind::AnyData { musts, .. } => musts_injected(musts),
+        SchemaNodeKind::Rpc { input, output, musts, .. } => {
+            musts_injected(musts) || kids_injected(input) || kids_injected(output)
+        }
+        SchemaNodeKind::Action { input, output } => {
+            kids_injected(input) || kids_injected(output)
+        }
+        SchemaNodeKind::Case { children } => kids_injected(children),
+        SchemaNodeKind::Choice { cases, .. } => kids_injected(cases),
+        SchemaNodeKind::Uses { .. } => false,
     }
 }
 

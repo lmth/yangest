@@ -82,6 +82,25 @@ pub struct ExpansionCtx<'a> {
     /// annotation-injected `must`/`when` constraints to their target module during
     /// `uses` expansion.
     annotation_index: Option<&'a crate::astannindex::AstAnnotationIndex>,
+    /// Memoised annotation-scope verdicts, used only under
+    /// `scope_grouping_annotations_to_target`. Keyed by grouping pointer (the
+    /// annotation content of a grouping body is intrinsic to the grouping, so it
+    /// does not depend on the using prefix). Avoids re-walking a grouping's whole
+    /// expansion on every `expand_uses_lazy` call — see `GroupingScopeVerdict`.
+    pub(crate) ann_scope_cache: RefCell<HashMap<usize, GroupingScopeVerdict>>,
+}
+
+/// Cached annotation-scope verdict for one grouping (keyed by its pointer in
+/// [`ExpansionCtx::ann_scope_cache`]).
+#[derive(Default)]
+pub(crate) struct GroupingScopeVerdict {
+    /// Whether the grouping's expansion contains *any* annotation-injected
+    /// `must`/`when`/extension (target-independent). When false, no consuming
+    /// module ever needs filtering — the expansion is returned untouched.
+    pub(crate) has_any: bool,
+    /// Per-consuming-module memo: whether a *foreign* annotation-injected
+    /// statement is present (so the expansion must be cloned and filtered).
+    pub(crate) foreign: HashMap<String, bool>,
 }
 
 impl<'a> ExpansionCtx<'a> {
@@ -104,6 +123,7 @@ impl<'a> ExpansionCtx<'a> {
             augment_cache: RefCell::new(HashMap::new()),
             diagnostics: None,
             annotation_index: None,
+            ann_scope_cache: RefCell::new(HashMap::new()),
         }
     }
 
