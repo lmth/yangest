@@ -5735,6 +5735,91 @@ module consumer {
     }
 
     #[test]
+    fn submodule_must_be_in_ann_index_slice_for_parent_attribution() {
+        // Regression guard mirroring the bundle-CLI pipeline. An
+        // `annotate-module "<submodule>"` overlay is recognised as ALSO targeting the
+        // submodule's *parent* (which `include`s and merges its groupings) only if the
+        // submodule is present in `AstAnnotationIndex::build`'s slice — that's where its
+        // `belongs-to` parent is read. In the bundle CLI, submodules arrive as
+        // search-path deps and are NOT in `input_modules`, so `bin/src/main.rs` feeds
+        // submodules into the index explicitly. Without them, `submodule_parents` is
+        // empty, the parent is never added to `ann_effective_targets`, and the parent's
+        // `uses` expansion wrongly filters the injected extension as foreign (the
+        // `is_foreign_annotation_ext` path under `scope_grouping_annotations_to_target`).
+        //
+        // This pins the exact hinge the caller fix relies on; the end-to-end "extension
+        // survives" half is covered by `scope_grouping_annotations_recognises_submodule_target`.
+        use crate::plugin::{AstOverlayDescriptor, ExtensionId};
+
+        let parse = |name: &str, src: &str| {
+            let (stmts, errs) = parse_yang(src, Arc::from(format!("{name}.yang").as_str()));
+            assert!(errs.is_empty(), "parse {name}: {errs:?}");
+            (ModuleKey::latest(name), stmts.into_iter().next().unwrap())
+        };
+
+        let iface = parse(
+            "base-iface",
+            r#"
+submodule base-iface {
+  belongs-to base { prefix b; }
+  grouping threshold-pair {
+    leaf falling-threshold { type uint32; }
+  }
+}
+"#,
+        );
+        let base = parse(
+            "base",
+            r#"
+module base {
+  namespace "urn:base"; prefix b;
+  include base-iface;
+  container native { uses threshold-pair; }
+}
+"#,
+        );
+        let ann = parse(
+            "base-ann",
+            r#"
+module base-ann {
+  yang-version 1.1;
+  namespace "urn:base-ann"; prefix bann;
+  import acme-ext { prefix acme; }
+  import base-iface { prefix bi; }
+  acme:annotate-module "base-iface" {
+    acme:annotate-statement "grouping[name='threshold-pair']" {
+      acme:annotate-statement "leaf[name='falling-threshold']" {
+        acme:cli-hidden "deprecated";
+      }
+    }
+  }
+}
+"#,
+        );
+        let descs = vec![AstOverlayDescriptor {
+            module_selector: ExtensionId { module: "acme-ext", name: "annotate-module" },
+            stmt_selector: ExtensionId { module: "acme-ext", name: "annotate-statement" },
+        }];
+
+        // Pre-fix bundle pipeline: submodule absent from the slice. The literal target
+        // (the submodule) is still recognised, but the parent is NOT.
+        let without = AstAnnotationIndex::build(&[base.clone(), ann.clone()], &descs);
+        assert!(without.annotation_targets("base-ann", "base-iface"));
+        assert!(
+            !without.annotation_targets("base-ann", "base"),
+            "without the submodule in the slice, the parent is unknown — the bug the \
+             foreign-filter then acts on"
+        );
+
+        // What `bin/src/main.rs` now feeds: submodule included → parent recognised.
+        let with = AstAnnotationIndex::build(&[iface, base, ann], &descs);
+        assert!(
+            with.annotation_targets("base-ann", "base"),
+            "with the submodule in the slice, the parent is an effective target"
+        );
+    }
+
+    #[test]
     fn when_must_in_submodule_grouping_attributed_to_submodule() {
         // A `when`/`must` written in a grouping inside a *submodule*, reached from
         // another module via the parent's prefix, must be attributed to the

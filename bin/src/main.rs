@@ -398,13 +398,23 @@ fn main() {
         .iter()
         .flat_map(|p| p.ast_overlay_extensions().iter().cloned())
         .collect();
-    let ast_ann_index = Arc::new(AstAnnotationIndex::build(
-        &input_modules
-            .iter()
-            .map(|(k, s)| (k.clone(), s.clone()))
-            .collect::<Vec<_>>(),
-        &ast_overlay_descs,
-    ));
+    // Unlike deviations / legacy annotations (applied selectively from
+    // `input_modules` only), the AST annotation index also needs every *submodule*
+    // in its slice — not for their selectors (submodules declare no
+    // `annotate-module`) but so it can read each submodule's `belongs-to` parent.
+    // An `annotate-module "<submodule>"` overlay must also be recognised as
+    // targeting the parent that `include`s it; without the submodule here,
+    // `submodule_parents` is empty and the parent's `uses` expansion wrongly
+    // filters the injected statements as foreign. Submodules arrive as search-path
+    // deps (tag 0), so they are absent from `input_modules` — pull them back in.
+    let ast_ann_input: Vec<(ModuleKey, ast::Stmt)> = modules
+        .iter()
+        .filter(|(k, s)| {
+            input_keys.contains(k) || s.keyword.is_builtin(ast::BuiltInKeyword::Submodule)
+        })
+        .map(|(k, s)| (k.clone(), s.clone()))
+        .collect();
+    let ast_ann_index = Arc::new(AstAnnotationIndex::build(&ast_ann_input, &ast_overlay_descs));
 
     let mut stmt_map: HashMap<ModuleKey, ast::Stmt> = modules.into_iter().collect();
     let mut initial_registry = ModuleRegistry::new();
