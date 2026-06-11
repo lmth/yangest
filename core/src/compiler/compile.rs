@@ -750,7 +750,12 @@ fn compile_schema_children(
             .filter(|s| s.keyword.is_builtin(BuiltInKeyword::Grouping)),
         own_prefix,
         prefix_map,
-        &key.name,
+        // The definer of an inline grouping is the module authoring the enclosing
+        // statements (`source_module_name`) — which, inside a grouping body compiled
+        // for a `uses`, is the grouping's definer (e.g. a submodule), not the module
+        // currently being compiled (`key.name`, the parent). Using `key.name` here
+        // mis-attributes `when`/`must` written in a submodule's nested grouping.
+        source_module_name,
         module_errors,
     );
     let merged;
@@ -3094,7 +3099,13 @@ fn expand_uses_lazy_inner(
         let mut nodes = compile_schema_children(
             &instantiated_children,
             &current_key,
-            source_module_name.unwrap_or(module_name),
+            // Attribute `when`/`must` in the grouping body to the module that
+            // *defined* the grouping (a submodule, say), not the callsite's
+            // prefix-derived module — matching the precompiled path
+            // (`grouping_children`) and yanger's per-statement Pos attribution.
+            // `source_module_name` is the parent when a submodule grouping is
+            // reached via the parent's prefix, so it would mis-attribute.
+            &grouping.definer_module_name,
             current_module
                 .as_ref()
                 .map(|m| m.yang_version)
@@ -5582,6 +5593,89 @@ module overlay {
             .unwrap();
         assert_eq!(leaf_musts(&of), 0, "foreign reuse still drops the must");
         assert_eq!(hidden(&of), 0, "foreign reuse still drops the extension");
+    }
+
+    #[test]
+    fn when_must_in_submodule_grouping_attributed_to_submodule() {
+        // A `when`/`must` written in a grouping inside a *submodule*, reached from
+        // another module via the parent's prefix, must be attributed to the
+        // submodule that authored it — not the parent it was reached through. The
+        // tricky case is a nested/inline grouping (forces the fallback recompile
+        // path), where the attribution used to collapse to the parent.
+        let parse = |name: &str, src: &str| {
+            let (stmts, errs) = parse_yang(src, Arc::from(format!("{name}.yang").as_str()));
+            assert!(errs.is_empty(), "parse {name}: {errs:?}");
+            (ModuleKey::latest(name), stmts.into_iter().next().unwrap())
+        };
+
+        let sub = parse(
+            "par-sub",
+            r#"
+submodule par-sub {
+  belongs-to par { prefix p; }
+  grouping g {
+    grouping inner {
+      container cc {
+        when "true()";
+        leaf x { type string; must "../y"; }
+        leaf y { type string; }
+      }
+    }
+    uses inner;
+  }
+}
+"#,
+        );
+        let par = parse(
+            "par",
+            r#"module par { namespace "urn:par"; prefix p; include par-sub; }"#,
+        );
+        let cons = parse(
+            "cons",
+            r#"
+module cons {
+  namespace "urn:cons"; prefix c;
+  import par { prefix p; }
+  container use-it { uses p:g; }
+}
+"#,
+        );
+
+        let mut reg = ModuleRegistry::new();
+        for (k, st) in [sub, par, cons] {
+            let comp = compile_module(
+                &k,
+                st,
+                &reg,
+                &DeviationIndex::default(),
+                &AnnotationIndex::default(),
+                &AstAnnotationIndex::default(),
+            );
+            reg.insert(Arc::new(comp));
+        }
+        let ctx = ExpansionCtx::all_features(&reg);
+        let cmod = reg.resolve_import("cons", None).unwrap();
+        let use_it = cmod.children.iter().find(|n| n.name == "use-it").unwrap();
+        let cc = use_it
+            .children(&ctx)
+            .into_iter()
+            .find(|n| n.name == "cc")
+            .expect("cc reached via nested submodule grouping");
+
+        // `when` on the container is attributed to the submodule.
+        assert_eq!(cc.when.len(), 1);
+        assert_eq!(
+            cc.when[0].source_module, "par-sub",
+            "submodule `when` must not collapse to the parent"
+        );
+        // `must` on the leaf likewise.
+        let x = cc.children(&ctx).into_iter().find(|n| n.name == "x").unwrap();
+        let musts = match &x.kind {
+            SchemaNodeKind::Leaf { musts, .. } => musts.clone(),
+            other => panic!("expected leaf, got {other:?}"),
+        };
+        assert_eq!(musts.len(), 1);
+        assert_eq!(musts[0].source_module, "par-sub", "submodule `must` likewise");
     }
 
     #[test]
