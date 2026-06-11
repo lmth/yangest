@@ -5605,6 +5605,136 @@ module overlay {
     }
 
     #[test]
+    fn annotation_targeting_parent_reaches_grouping_in_submodule() {
+        // A `annotate-module "<parent>"` whose selectors descend into a grouping
+        // that is actually defined in a *submodule* of that parent. The parent's
+        // direct AST has no such grouping (it lives in the included submodule), so
+        // the selector used to miss entirely and the injected must/extension were
+        // lost on *every* expanded copy. The fix: a submodule also applies its
+        // parent's selectors, since the named definition lives wherever it lives.
+        use crate::plugin::{AstOverlayDescriptor, ExtensionId};
+
+        let parse = |name: &str, src: &str| {
+            let (stmts, errs) = parse_yang(src, Arc::from(format!("{name}.yang").as_str()));
+            assert!(errs.is_empty(), "parse {name}: {errs:?}");
+            (ModuleKey::latest(name), stmts.into_iter().next().unwrap())
+        };
+
+        let iface = parse(
+            "base-iface",
+            r#"
+submodule base-iface {
+  belongs-to base { prefix b; }
+  grouping threshold-pair {
+    leaf rising-threshold { type uint32; }
+    leaf falling-threshold { type uint32; }
+  }
+}
+"#,
+        );
+        let base = parse(
+            "base",
+            r#"
+module base {
+  namespace "urn:base"; prefix b;
+  include base-iface;
+  container native { uses threshold-pair; }
+}
+"#,
+        );
+        // Annotation targets the PARENT module name, not the submodule.
+        let ann = parse(
+            "base-ann",
+            r#"
+module base-ann {
+  yang-version 1.1;
+  namespace "urn:base-ann"; prefix bann;
+  import acme-ext { prefix acme; }
+  import base { prefix b; }
+  acme:annotate-module "base" {
+    acme:annotate-statement "grouping[name='threshold-pair']" {
+      acme:annotate-statement "leaf[name='falling-threshold']" {
+        must "../rising-threshold" { error-message "needs rising"; }
+        acme:cli-hidden "deprecated";
+      }
+    }
+  }
+}
+"#,
+        );
+        let consumer = parse(
+            "consumer",
+            r#"
+module consumer {
+  namespace "urn:consumer"; prefix c;
+  import base { prefix b; }
+  augment "/b:native" {
+    container also-here { uses b:threshold-pair; }
+  }
+}
+"#,
+        );
+
+        let descs = vec![AstOverlayDescriptor {
+            module_selector: ExtensionId { module: "acme-ext", name: "annotate-module" },
+            stmt_selector: ExtensionId { module: "acme-ext", name: "annotate-statement" },
+        }];
+        let ast_ann = AstAnnotationIndex::build(
+            &[iface.clone(), base.clone(), ann.clone(), consumer.clone()],
+            &descs,
+        );
+
+        let leaf_musts = |node: &SchemaNode| match &node.kind {
+            SchemaNodeKind::Leaf { musts, .. } => musts.len(),
+            other => panic!("expected leaf, got {other:?}"),
+        };
+        let hidden = |node: &SchemaNode| {
+            node.extensions.iter().filter(|e| e.name == "cli-hidden").count()
+        };
+
+        let mut reg = ModuleRegistry::new();
+        // Submodule before parent (parent merges its groupings via the registry).
+        for (key, stmt) in [iface, base, consumer] {
+            let patched = ast_ann.apply(stmt, &key.name);
+            let compiled = compile_module(
+                &key,
+                patched,
+                &reg,
+                &DeviationIndex::default(),
+                &AnnotationIndex::default(),
+                &ast_ann,
+            );
+            reg.insert(Arc::new(compiled));
+        }
+        let ctx = ExpansionCtx::all_features(&reg).with_annotation_index(&ast_ann);
+
+        // base/native/falling-threshold — the parent's own use of the submodule
+        // grouping carries the injected must + extension.
+        let base_m = reg.resolve_import("base", None).unwrap();
+        let native = base_m.children.iter().find(|n| n.name == "native").unwrap();
+        let bf = native
+            .children(&ctx)
+            .into_iter()
+            .find(|n| n.name == "falling-threshold")
+            .unwrap();
+        assert_eq!(leaf_musts(&bf), 1, "parent-targeted must rides into base's use");
+        assert_eq!(hidden(&bf), 1, "parent-targeted extension rides into base's use");
+
+        // consumer augment reusing the grouping via `uses` — the expanded copy in
+        // the consuming module also carries the injected must + extension.
+        let consumer_m = reg.resolve_import("consumer", None).unwrap();
+        let body = ctx.expand_augment_body(&consumer_m, &consumer_m.augments[0]);
+        let also = body.iter().find(|n| n.name == "also-here").unwrap();
+        let cf = also
+            .children(&ctx)
+            .into_iter()
+            .find(|n| n.name == "falling-threshold")
+            .unwrap();
+        assert_eq!(leaf_musts(&cf), 1, "cross-module uses carries the must");
+        assert_eq!(hidden(&cf), 1, "cross-module uses carries the extension");
+    }
+
+    #[test]
     fn when_must_in_submodule_grouping_attributed_to_submodule() {
         // A `when`/`must` written in a grouping inside a *submodule*, reached from
         // another module via the parent's prefix, must be attributed to the

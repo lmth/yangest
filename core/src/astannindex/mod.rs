@@ -148,12 +148,34 @@ impl AstAnnotationIndex {
     /// If no patches target `module_name` this is a no-op and the original
     /// `stmt` is returned unchanged.
     pub fn apply(&self, mut stmt: Stmt, module_name: &str) -> Stmt {
-        let Some(ann) = self.by_module.get(module_name) else {
-            return stmt;
+        // A submodule's definitions belong to its parent's schema, so a parent
+        // annotation's *selectors* (e.g. `grouping[name='g']/…`) may target a
+        // grouping/typedef actually defined in this submodule. Resolve the parent
+        // up-front (immutable borrow) before mutating `stmt.substmts` below.
+        let parent = if stmt.keyword.is_builtin(BuiltInKeyword::Submodule) {
+            stmt.get_substmt(BuiltInKeyword::BelongsTo)
+                .and_then(|bt| bt.arg.clone())
+        } else {
+            None
         };
-        stmt.substmts.extend(ann.direct_injections.iter().cloned());
-        for sel in &ann.selectors {
-            apply_selector(&mut stmt.substmts, sel);
+
+        // This module's own annotations: direct module-body injections + selectors.
+        if let Some(ann) = self.by_module.get(module_name) {
+            stmt.substmts.extend(ann.direct_injections.iter().cloned());
+            for sel in &ann.selectors {
+                apply_selector(&mut stmt.substmts, sel);
+            }
+        }
+
+        // For a submodule, also apply the parent's *selectors* (its direct module
+        // injections belong to the parent module statement, applied when the
+        // parent itself is processed). A selector matches wherever the named
+        // definition lives, so this is a no-op unless the parent annotation
+        // targets something defined in this submodule.
+        if let Some(ann) = parent.as_deref().and_then(|p| self.by_module.get(p)) {
+            for sel in &ann.selectors {
+                apply_selector(&mut stmt.substmts, sel);
+            }
         }
         stmt
     }
