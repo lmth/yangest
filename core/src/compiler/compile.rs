@@ -268,6 +268,14 @@ pub fn compile_module(
         if is_self {
             inline_augment_into(&aug.target_path, aug.nodes, &mut children);
         } else {
+            // Remote (cross-module) augment: stamp its whole body so backends can
+            // tell augment-grafted nodes from uses-expanded ones (which also carry
+            // a foreign `module_name`). Done on the stored source nodes so every
+            // materialisation path inherits it via the node clone. Mirrors the
+            // reference's `apply_remote_augments` scope (self-augments, inlined
+            // above, are not rewritten).
+            let mut aug = aug;
+            mark_augment_injected(&mut aug.nodes);
             augments.push(aug);
         }
     }
@@ -937,6 +945,7 @@ fn compile_uses_node(
                 ),
             },
         },
+        is_augment_injected: false,
         pmap: HashMap::new(),
     })
 }
@@ -1154,6 +1163,7 @@ fn compile_schema_node(
         reference: common.reference,
         extensions: common.extensions,
         kind,
+        is_augment_injected: false,
         pmap: HashMap::new(),
     })
 }
@@ -1246,6 +1256,7 @@ fn compile_choice_cases(
                     reference: None,
                     extensions: Vec::new(),
                     kind: SchemaNodeKind::Case { children: Arc::new(children) },
+                    is_augment_injected: false,
                     pmap: HashMap::new(),
                 });
             }
@@ -3278,6 +3289,7 @@ fn inline_local_augment_into(
                                 reference: None,
                                 extensions: Vec::new(),
                                 kind: SchemaNodeKind::Case { children: Arc::new(vec![node]) },
+                                is_augment_injected: false,
                                 pmap: HashMap::new(),
                             };
                             cases.push(implicit_case);
@@ -3292,6 +3304,32 @@ fn inline_local_augment_into(
 
 /// Used after grouping expansion to ensure nodes carry the using module's prefix
 /// rather than the grouping definer's prefix (for tree-diagram display).
+/// Recursively flag every node in a remote-augment body as augment-injected.
+/// A `uses` placeholder among them is flagged but its (deferred) expansion is
+/// not — see `SchemaNode::is_augment_injected`.
+fn mark_augment_injected(nodes: &mut [SchemaNode]) {
+    for node in nodes {
+        node.is_augment_injected = true;
+        match &mut node.kind {
+            SchemaNodeKind::Container { children, .. }
+            | SchemaNodeKind::List { children, .. }
+            | SchemaNodeKind::Notification { children, .. }
+            | SchemaNodeKind::Case { children } => {
+                mark_augment_injected(Arc::make_mut(children).as_mut_slice());
+            }
+            SchemaNodeKind::Choice { cases, .. } => {
+                mark_augment_injected(Arc::make_mut(cases).as_mut_slice());
+            }
+            SchemaNodeKind::Rpc { input, output, .. }
+            | SchemaNodeKind::Action { input, output } => {
+                mark_augment_injected(Arc::make_mut(input).as_mut_slice());
+                mark_augment_injected(Arc::make_mut(output).as_mut_slice());
+            }
+            _ => {}
+        }
+    }
+}
+
 fn fix_module_prefix(node: &mut SchemaNode, module_name: &str, new_prefix: &str) {
     if node.module_name == module_name {
         node.module_prefix = new_prefix.to_string();
@@ -5570,6 +5608,66 @@ module native-deviation {
         )
         .expect("path resolves");
         assert_eq!(range_of(&terminal2), "1..64", "walker matches the cs/main path");
+    }
+
+    #[test]
+    fn is_augment_injected_distinguishes_remote_augment_from_uses() {
+        // A remote (cross-module) augment's grafted nodes — including deep ones —
+        // are flagged `is_augment_injected`, while cross-module grouping-use
+        // children (same foreign `module_name`) are not. This is the signal a
+        // backend needs to qualify leafref-path steps the way the reference does.
+        let host = parse_module(
+            r#"
+module host {
+  namespace "urn:host"; prefix h;
+  grouping g { leaf used { type string; } }
+  container root { uses g; }
+}
+"#,
+        );
+        let aug = parse_module(
+            r#"
+module aug-mod {
+  namespace "urn:aug"; prefix a;
+  import host { prefix h; }
+  augment "/h:root" {
+    container injected {
+      leaf deep { type string; }
+    }
+  }
+}
+"#,
+        );
+
+        let mut reg = ModuleRegistry::new();
+        for (name, stmt) in [("host", host), ("aug-mod", aug)] {
+            reg.insert(Arc::new(compile_module(
+                &ModuleKey::latest(name),
+                stmt,
+                &reg,
+                &DeviationIndex::default(),
+                &AnnotationIndex::default(),
+                &AstAnnotationIndex::default(),
+            )));
+        }
+        let ctx = ExpansionCtx::all_features(&reg);
+
+        // Remote augment: the whole grafted body is flagged, recursively.
+        let aug_m = reg.resolve_import("aug-mod", None).unwrap();
+        assert_eq!(aug_m.augments.len(), 1, "augment is external");
+        let body = ctx.expand_augment_body(&aug_m, &aug_m.augments[0]);
+        let injected = body.iter().find(|n| n.name == "injected").unwrap();
+        assert!(injected.is_augment_injected, "augment graft is flagged");
+        let deep = injected.children(&ctx).into_iter().find(|n| n.name == "deep").unwrap();
+        assert!(deep.is_augment_injected, "deep augment node is flagged too");
+
+        // Uses expansion (cross-module-style: foreign-grouping child) is NOT
+        // flagged, even though it shares the host's tree.
+        let host_m = reg.resolve_import("host", None).unwrap();
+        let root = host_m.children.iter().find(|n| n.name == "root").unwrap();
+        assert!(!root.is_augment_injected, "own-tree node is not flagged");
+        let used = root.children(&ctx).into_iter().find(|n| n.name == "used").unwrap();
+        assert!(!used.is_augment_injected, "uses-expanded node is not flagged");
     }
 
     #[test]

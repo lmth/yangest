@@ -248,6 +248,22 @@ pub struct SchemaNode {
     /// Extension statements applied to this node, in declaration order.
     pub extensions: Vec<ExtensionInstance>,
     pub kind: SchemaNodeKind,
+    /// True when this node was grafted into the host tree by a remote
+    /// (cross-module) `augment`, as opposed to a `uses` expansion or the
+    /// module's own data tree. `module_name`/`origin_module` alone cannot tell
+    /// these apart — a cross-module grouping use also leaves `module_name` as a
+    /// foreign module. Backends use this to reproduce the reference compiler's
+    /// per-step module qualification of leafref paths (yanger's
+    /// `set_module_name_and_config`, called only from `apply_remote_augments`):
+    /// augment-grafted steps are qualified `{module, name}`, while uses-expanded
+    /// and own-tree steps stay bare.
+    ///
+    /// Set at compile time on the stored augment body (`AugmentEntry::nodes`) so
+    /// every materialisation path inherits it through the node clone. A `uses`
+    /// nested *inside* an augment body leaves its expanded children unmarked (the
+    /// expansion is deferred past compile); the reference rewrites those too, but
+    /// no observed case needs it.
+    pub is_augment_injected: bool,
     pub pmap: PMap,
 }
 
@@ -267,6 +283,7 @@ impl std::fmt::Debug for SchemaNode {
             .field("reference", &self.reference)
             .field("extensions", &self.extensions)
             .field("kind", &self.kind)
+            .field("is_augment_injected", &self.is_augment_injected)
             .finish()
     }
 }
@@ -288,6 +305,7 @@ impl Clone for SchemaNode {
             reference: self.reference.clone(),
             extensions: self.extensions.clone(),
             kind: self.kind.clone(),
+            is_augment_injected: self.is_augment_injected,
             pmap: HashMap::new(), // pmap holds renderer-private data; not cloned
         }
     }
