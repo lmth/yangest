@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use super::compile::{expand_children, expand_children_all, expand_children_and_all, expand_children_with_secondary, find_child_in_raw, mark_augment_injected};
+use super::compile::{expand_children, expand_children_all, expand_children_and_all, expand_children_with_secondary, find_child_in_raw};
 use super::{
     AugmentEntry, CompiledModule, Grouping, IfFeatureExpr, ModuleRegistry, NodeOverlayMap, PathStep,
     SchemaNode, SchemaNodeKind, SchemaPath, Status,
@@ -180,7 +180,11 @@ impl<'a> ExpansionCtx<'a> {
         if let Some(cached) = self.augment_cache.borrow().get(&key) {
             return Arc::clone(cached);
         }
-        let mut expanded = expand_children(
+        // The augment body's `is_augment_injected` flags ride in from the stamped
+        // source `aug.nodes` (set in `compile_module`); a `uses` grafted inside the
+        // augment propagates the flag onto its expansion in `expand_children_inner`.
+        // So the composed body is already fully flagged — no stamp needed here.
+        let expanded = expand_children(
             &aug.nodes,
             &module.prefix,
             &module.key.name,
@@ -188,13 +192,6 @@ impl<'a> ExpansionCtx<'a> {
             &aug.target_path,
             self,
         );
-        // Flag the whole grafted subtree as augment-injected — including nodes a
-        // `uses` inside the augment contributed (the reference's
-        // `set_module_name_and_config` rewrites those too). `expand_children`
-        // returns freshly-cloned nodes and `mark_augment_injected` clones any
-        // still-shared children before mutating, so the grouping cache is
-        // untouched; the stamp is amortised by the `augment_cache` below.
-        mark_augment_injected(&mut expanded);
         let arc = Arc::new(expanded);
         self.augment_cache.borrow_mut().insert(key, Arc::clone(&arc));
         arc

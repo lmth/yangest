@@ -268,10 +268,15 @@ pub fn compile_module(
         if is_self {
             inline_augment_into(&aug.target_path, aug.nodes, &mut children);
         } else {
-            // Remote (cross-module) augment: kept as compiled. The
-            // `is_augment_injected` flag is stamped on the *expanded* body at
-            // materialisation time (`expand_augment_body`), so nodes contributed
-            // by a `uses` inside the augment are flagged too.
+            // Remote (cross-module) augment: stamp the whole body — direct nodes
+            // and nested `uses` placeholders — on the stored *source*, so the flag
+            // is present on every materialisation path (the `expand_augment_body`
+            // cache, the tree plugin's own `expand_children`, and a leafref walk
+            // re-resolving through it), not just the cached composed copy. A flagged
+            // `uses` placeholder then propagates the flag onto its grouping-cache
+            // expansion in `expand_children_inner`.
+            let mut aug = aug;
+            mark_augment_injected(&mut aug.nodes);
             augments.push(aug);
         }
     }
@@ -2040,7 +2045,7 @@ fn expand_children_inner(
                     overlay,
                     ctx,
                 );
-                result.extend(expand_children_inner(
+                let mut kids = expand_children_inner(
                     &expanded,
                     &node.module_prefix,
                     &node.module_name,
@@ -2048,7 +2053,19 @@ fn expand_children_inner(
                     secondary_overlay,
                     parent_path,
                     ctx,
-                ));
+                );
+                // A `uses` grafted by a remote augment carries the augment flag (its
+                // placeholder is stamped at the source). Propagate it onto the
+                // grouping-cache expansion, which is otherwise shared and unflagged —
+                // so `is_augment_injected` is path-independent rather than living only
+                // on the `expand_augment_body` copy. `kids` are fresh clones, and
+                // `mark_augment_injected` clones any still-shared children before
+                // mutating, so the grouping cache is untouched. No-op (one branch) on
+                // the common, non-augment hot path.
+                if node.is_augment_injected {
+                    mark_augment_injected(&mut kids);
+                }
+                result.extend(kids);
             }
             _ => {
                 let has_overlay = ctx.has_any_overlay
@@ -5732,6 +5749,90 @@ module aug-mod {
         assert!(!hbox.is_augment_injected, "same grouping outside an augment is bare");
         let hdeep = hbox.children(&ctx).into_iter().find(|n| n.name == "deep").unwrap();
         assert!(!hdeep.is_augment_injected, "deep node outside an augment is bare");
+    }
+
+    #[test]
+    fn augment_injected_flag_reaches_lazily_expanded_descendants() {
+        // The controller/multicast shape: a remote augment grafts via `uses`, and
+        // the leafref *target* sits beyond a container-nested `uses` — i.e. past
+        // what `expand_augment_body` eagerly materialises. The flag must still
+        // reach it (via both `children()` descent and the path walker), otherwise
+        // a backend keying on `target.is_augment_injected` mis-classifies the node.
+        let host = parse_module(
+            r#"
+module host {
+  namespace "urn:host"; prefix h;
+  grouping inner-g {
+    list keyed { key k; leaf k { type string; } }
+  }
+  grouping outer-g {
+    container wrap {
+      uses inner-g;                 // container-nested uses (lazy past one level)
+    }
+  }
+  container target { }
+}
+"#,
+        );
+        let aug = parse_module(
+            r#"
+module aug-mod {
+  namespace "urn:aug"; prefix a;
+  import host { prefix h; }
+  augment "/h:target" {
+    uses h:outer-g;
+  }
+}
+"#,
+        );
+
+        let mut reg = ModuleRegistry::new();
+        for (name, stmt) in [("host", host), ("aug-mod", aug)] {
+            reg.insert(Arc::new(compile_module(
+                &ModuleKey::latest(name),
+                stmt,
+                &reg,
+                &DeviationIndex::default(),
+                &AnnotationIndex::default(),
+                &AstAnnotationIndex::default(),
+            )));
+        }
+        let ctx = ExpansionCtx::all_features(&reg);
+
+        let aug_m = reg.resolve_import("aug-mod", None).unwrap();
+        let body = ctx.expand_augment_body(&aug_m, &aug_m.augments[0]);
+        let wrap = body.iter().find(|n| n.name == "wrap").unwrap();
+        assert!(wrap.is_augment_injected, "augment-grafted container is flagged");
+
+        // Descend past the container-nested uses via children().
+        let keyed = wrap.children(&ctx).into_iter().find(|n| n.name == "keyed").unwrap();
+        assert!(keyed.is_augment_injected, "lazily-expanded list is flagged (children)");
+        let k = keyed.children(&ctx).into_iter().find(|n| n.name == "k").unwrap();
+        assert!(k.is_augment_injected, "deep key leaf is flagged (children)");
+
+        // And via the path walker (what the leafref-target resolver uses).
+        let path = |s: &str| -> Vec<PathStep> {
+            s.split('/')
+                .filter(|p| !p.is_empty())
+                .map(|name| PathStep { prefix: None, name: name.to_string() })
+                .collect()
+        };
+        let (target, _) =
+            walk_path_collecting_intermediates(&path("wrap/keyed/k"), &body, &ctx).unwrap();
+        assert!(target.is_augment_injected, "walker reaches the flag on the deep target");
+
+        // Path-independence: resolving the same target by materialising the augment
+        // *source* (`aug.nodes`) afresh — as a leafref walk that crosses the augment's
+        // `uses` from the grouping cache does — must also see the flag, not just the
+        // `expand_augment_body`/`augment_cache` copy.
+        let aug_nodes = &aug_m.augments[0].nodes;
+        let (fresh_target, _) =
+            walk_path_collecting_intermediates(&path("wrap/keyed/k"), aug_nodes, &ctx).unwrap();
+        assert!(
+            fresh_target.is_augment_injected,
+            "flag is present on a fresh materialisation of the augment source, not only \
+             on the cached expand_augment_body copy"
+        );
     }
 
     #[test]

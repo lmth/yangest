@@ -258,12 +258,14 @@ pub struct SchemaNode {
     /// augment-grafted steps are qualified `{module, name}`, while uses-expanded
     /// and own-tree steps stay bare.
     ///
-    /// Stamped on the *expanded* augment body at materialisation time
-    /// (`ExpansionCtx::expand_augment_body`), recursively over the whole grafted
-    /// subtree — so nodes a `uses` *inside* the augment contributed are flagged
-    /// too (the reference rewrites those as well). Off the grouping-expansion
-    /// cache (the stamp clones any still-shared children first) and amortised by
-    /// the augment cache.
+    /// Stamped at compile time on the stored augment body (`AugmentEntry::nodes`,
+    /// in `compile_module`), so the flag is **path-independent** — present on
+    /// every materialisation of the augment (the `expand_augment_body` cache, the
+    /// tree plugin's own `expand_children`, and a leafref walk re-resolving
+    /// through it). A `uses` grafted inside the augment carries the flag on its
+    /// placeholder and propagates it onto the (otherwise shared, unflagged)
+    /// grouping-cache expansion in `expand_children_inner` — without touching the
+    /// cache, since only the freshly-cloned materialisation is mutated.
     pub is_augment_injected: bool,
     pub pmap: PMap,
 }
