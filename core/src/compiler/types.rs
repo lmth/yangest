@@ -258,11 +258,12 @@ pub struct SchemaNode {
     /// augment-grafted steps are qualified `{module, name}`, while uses-expanded
     /// and own-tree steps stay bare.
     ///
-    /// Set at compile time on the stored augment body (`AugmentEntry::nodes`) so
-    /// every materialisation path inherits it through the node clone. A `uses`
-    /// nested *inside* an augment body leaves its expanded children unmarked (the
-    /// expansion is deferred past compile); the reference rewrites those too, but
-    /// no observed case needs it.
+    /// Stamped on the *expanded* augment body at materialisation time
+    /// (`ExpansionCtx::expand_augment_body`), recursively over the whole grafted
+    /// subtree — so nodes a `uses` *inside* the augment contributed are flagged
+    /// too (the reference rewrites those as well). Off the grouping-expansion
+    /// cache (the stamp clones any still-shared children first) and amortised by
+    /// the augment cache.
     pub is_augment_injected: bool,
     pub pmap: PMap,
 }

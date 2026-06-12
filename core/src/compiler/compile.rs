@@ -268,14 +268,10 @@ pub fn compile_module(
         if is_self {
             inline_augment_into(&aug.target_path, aug.nodes, &mut children);
         } else {
-            // Remote (cross-module) augment: stamp its whole body so backends can
-            // tell augment-grafted nodes from uses-expanded ones (which also carry
-            // a foreign `module_name`). Done on the stored source nodes so every
-            // materialisation path inherits it via the node clone. Mirrors the
-            // reference's `apply_remote_augments` scope (self-augments, inlined
-            // above, are not rewritten).
-            let mut aug = aug;
-            mark_augment_injected(&mut aug.nodes);
+            // Remote (cross-module) augment: kept as compiled. The
+            // `is_augment_injected` flag is stamped on the *expanded* body at
+            // materialisation time (`expand_augment_body`), so nodes contributed
+            // by a `uses` inside the augment are flagged too.
             augments.push(aug);
         }
     }
@@ -3305,9 +3301,11 @@ fn inline_local_augment_into(
 /// Used after grouping expansion to ensure nodes carry the using module's prefix
 /// rather than the grouping definer's prefix (for tree-diagram display).
 /// Recursively flag every node in a remote-augment body as augment-injected.
-/// A `uses` placeholder among them is flagged but its (deferred) expansion is
-/// not — see `SchemaNode::is_augment_injected`.
-fn mark_augment_injected(nodes: &mut [SchemaNode]) {
+/// Applied to the *expanded* augment body (in `expand_augment_body`), so nodes
+/// brought in by a `uses` inside the augment are flagged too. Uses
+/// `Arc::make_mut`, which clones shared children before mutating, so the grouping
+/// expansion cache is never touched — see `SchemaNode::is_augment_injected`.
+pub(crate) fn mark_augment_injected(nodes: &mut [SchemaNode]) {
     for node in nodes {
         node.is_augment_injected = true;
         match &mut node.kind {
@@ -5668,6 +5666,72 @@ module aug-mod {
         assert!(!root.is_augment_injected, "own-tree node is not flagged");
         let used = root.children(&ctx).into_iter().find(|n| n.name == "used").unwrap();
         assert!(!used.is_augment_injected, "uses-expanded node is not flagged");
+    }
+
+    #[test]
+    fn augment_injected_flag_propagates_through_uses_inside_augment() {
+        // The dominant real case: a remote augment contributes its whole subtree
+        // via a `uses` of a cross-module grouping (no direct nodes). The flag must
+        // reach the *expanded* grouping children — not just the `__uses__`
+        // placeholder — or every node the augment actually grafts is unflagged.
+        // The same grouping used *outside* an augment must stay unflagged (the
+        // augment stamp must not leak into the shared grouping cache).
+        let host = parse_module(
+            r#"
+module host {
+  namespace "urn:host"; prefix h;
+  grouping shared {
+    container box {
+      leaf deep { type string; }
+    }
+  }
+  container root { uses shared; }   // own-tree use of the same grouping
+  container target { }              // remote-augment target
+}
+"#,
+        );
+        let aug = parse_module(
+            r#"
+module aug-mod {
+  namespace "urn:aug"; prefix a;
+  import host { prefix h; }
+  augment "/h:target" {
+    uses h:shared;                  // augment grafts entirely via a `uses`
+  }
+}
+"#,
+        );
+
+        let mut reg = ModuleRegistry::new();
+        for (name, stmt) in [("host", host), ("aug-mod", aug)] {
+            reg.insert(Arc::new(compile_module(
+                &ModuleKey::latest(name),
+                stmt,
+                &reg,
+                &DeviationIndex::default(),
+                &AnnotationIndex::default(),
+                &AstAnnotationIndex::default(),
+            )));
+        }
+        let ctx = ExpansionCtx::all_features(&reg);
+
+        // Augment body (only `uses h:shared`): the expanded grouping children are
+        // flagged, all the way down.
+        let aug_m = reg.resolve_import("aug-mod", None).unwrap();
+        let body = ctx.expand_augment_body(&aug_m, &aug_m.augments[0]);
+        let abox = body.iter().find(|n| n.name == "box").unwrap();
+        assert!(abox.is_augment_injected, "uses-in-augment child is flagged");
+        let adeep = abox.children(&ctx).into_iter().find(|n| n.name == "deep").unwrap();
+        assert!(adeep.is_augment_injected, "deep uses-in-augment node is flagged");
+
+        // The very same grouping, used in host's own tree, stays unflagged — the
+        // augment stamp did not leak into the shared grouping cache.
+        let host_m = reg.resolve_import("host", None).unwrap();
+        let root = host_m.children.iter().find(|n| n.name == "root").unwrap();
+        let hbox = root.children(&ctx).into_iter().find(|n| n.name == "box").unwrap();
+        assert!(!hbox.is_augment_injected, "same grouping outside an augment is bare");
+        let hdeep = hbox.children(&ctx).into_iter().find(|n| n.name == "deep").unwrap();
+        assert!(!hdeep.is_augment_injected, "deep node outside an augment is bare");
     }
 
     #[test]
