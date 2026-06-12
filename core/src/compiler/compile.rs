@@ -2307,14 +2307,17 @@ pub fn find_child_in_raw(
     for node in raw {
         match &node.kind {
             SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay, was_unprefixed: _ } => {
-                let expanded = expand_uses_lazy(
-                    grouping,
-                    source_module_name.as_deref(),
-                    uses_overlay,
-                    &node.module_prefix,
-                    &node.module_name,
-                    &empty_overlay,
-                    ctx,
+                let expanded = flag_uses_expansion_if_augment(
+                    node,
+                    expand_uses_lazy(
+                        grouping,
+                        source_module_name.as_deref(),
+                        uses_overlay,
+                        &node.module_prefix,
+                        &node.module_name,
+                        &empty_overlay,
+                        ctx,
+                    ),
                 );
                 if let Some(found) = find_child_in_raw(target_name, &expanded, overlay, ctx) {
                     return Some(found);
@@ -2356,16 +2359,21 @@ pub fn walk_path_no_clone<R>(
     for node in raw {
         match &node.kind {
             SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay, was_unprefixed: _ } => {
-                let expanded = expand_uses_lazy(
-                    grouping,
-                    source_module_name.as_deref(),
-                    uses_overlay,
-                    &node.module_prefix,
-                    &node.module_name,
-                    &empty_overlay,
-                    ctx,
+                let expanded = flag_uses_expansion_if_augment(
+                    node,
+                    expand_uses_lazy(
+                        grouping,
+                        source_module_name.as_deref(),
+                        uses_overlay,
+                        &node.module_prefix,
+                        &node.module_name,
+                        &empty_overlay,
+                        ctx,
+                    ),
                 );
-                // Arc kept alive on the call stack — no clone needed.
+                // Arc kept alive on the call stack — no clone needed (unless the
+                // `uses` is augment-grafted, where the flag is propagated onto a
+                // fresh clone of the expansion).
                 if let Some(r) = walk_path_no_clone(path, &expanded, ctx, f) {
                     return Some(r);
                 }
@@ -2415,14 +2423,17 @@ pub fn walk_path_with_siblings<R>(
     for node in raw {
         match &node.kind {
             SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay, was_unprefixed: _ } => {
-                let expanded = expand_uses_lazy(
-                    grouping,
-                    source_module_name.as_deref(),
-                    uses_overlay,
-                    &node.module_prefix,
-                    &node.module_name,
-                    &empty_overlay,
-                    ctx,
+                let expanded = flag_uses_expansion_if_augment(
+                    node,
+                    expand_uses_lazy(
+                        grouping,
+                        source_module_name.as_deref(),
+                        uses_overlay,
+                        &node.module_prefix,
+                        &node.module_name,
+                        &empty_overlay,
+                        ctx,
+                    ),
                 );
                 if let Some(r) = walk_path_with_siblings(path, &expanded, ctx, f) {
                     return Some(r);
@@ -2473,16 +2484,20 @@ where
     for node in raw {
         match &node.kind {
             SchemaNodeKind::Uses { grouping, source_module_name, overlay: uses_overlay, was_unprefixed: _ } => {
-                let expanded = expand_uses_lazy(
-                    grouping,
-                    source_module_name.as_deref(),
-                    uses_overlay,
-                    &node.module_prefix,
-                    &node.module_name,
-                    &empty_overlay,
-                    ctx,
+                let expanded = flag_uses_expansion_if_augment(
+                    node,
+                    expand_uses_lazy(
+                        grouping,
+                        source_module_name.as_deref(),
+                        uses_overlay,
+                        &node.module_prefix,
+                        &node.module_name,
+                        &empty_overlay,
+                        ctx,
+                    ),
                 );
-                // Arc kept alive on the call stack — no SchemaNode clone needed.
+                // Arc kept alive on the call stack — no SchemaNode clone needed
+                // (unless the `uses` is augment-grafted; see above).
                 if let Some(r) = fold_path_no_clone(path, &expanded, ctx, init, f) {
                     return Some(r);
                 }
@@ -3318,8 +3333,8 @@ fn inline_local_augment_into(
 /// Used after grouping expansion to ensure nodes carry the using module's prefix
 /// rather than the grouping definer's prefix (for tree-diagram display).
 /// Recursively flag every node in a remote-augment body as augment-injected.
-/// Applied to the *expanded* augment body (in `expand_augment_body`), so nodes
-/// brought in by a `uses` inside the augment are flagged too. Uses
+/// Applied to the source augment body at compile time, and to a `uses`
+/// expansion grafted inside an augment whenever it is materialised. Uses
 /// `Arc::make_mut`, which clones shared children before mutating, so the grouping
 /// expansion cache is never touched — see `SchemaNode::is_augment_injected`.
 pub(crate) fn mark_augment_injected(nodes: &mut [SchemaNode]) {
@@ -3343,6 +3358,23 @@ pub(crate) fn mark_augment_injected(nodes: &mut [SchemaNode]) {
             _ => {}
         }
     }
+}
+
+/// Propagate `is_augment_injected` from a `uses` placeholder onto its expansion,
+/// for the no-clone walkers and `find_child_in_raw` (which consume the grouping
+/// cache `Arc` directly rather than through `expand_children_inner`). A no-op that
+/// returns the shared `Arc` untouched unless the placeholder is augment-injected;
+/// when it is, `Arc::make_mut` clones the expansion before marking, so the
+/// grouping cache stays shared and unflagged and the no-clone fast path is
+/// unaffected for the common (non-augment) case.
+fn flag_uses_expansion_if_augment(
+    node: &SchemaNode,
+    mut expanded: Arc<Vec<SchemaNode>>,
+) -> Arc<Vec<SchemaNode>> {
+    if node.is_augment_injected {
+        mark_augment_injected(Arc::make_mut(&mut expanded).as_mut_slice());
+    }
+    expanded
 }
 
 fn fix_module_prefix(node: &mut SchemaNode, module_name: &str, new_prefix: &str) {
@@ -5833,6 +5865,26 @@ module aug-mod {
             "flag is present on a fresh materialisation of the augment source, not only \
              on the cached expand_augment_body copy"
         );
+
+        // The no-clone walkers (what the leafref-target resolver uses) must also
+        // propagate the flag through the augment's `uses`.
+        let no_clone_flag = walk_path_no_clone(
+            &path("wrap/keyed/k"),
+            aug_nodes,
+            &ctx,
+            &|n: &SchemaNode| n.is_augment_injected,
+        )
+        .unwrap();
+        assert!(no_clone_flag, "walk_path_no_clone reaches the flag through the uses");
+
+        let with_siblings_flag = walk_path_with_siblings(
+            &path("wrap/keyed/k"),
+            aug_nodes,
+            &ctx,
+            &|n: &SchemaNode, _siblings: &[SchemaNode]| n.is_augment_injected,
+        )
+        .unwrap();
+        assert!(with_siblings_flag, "walk_path_with_siblings reaches the flag too");
     }
 
     #[test]
