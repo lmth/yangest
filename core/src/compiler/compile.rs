@@ -2132,7 +2132,14 @@ pub fn expand_children_all(
                     overlay,
                     ctx,
                 );
-                result.extend(expand_children_all(&expanded, overlay, ctx));
+                let mut sub = expand_children_all(&expanded, overlay, ctx);
+                // Keep the augment flag consistent with `expand_children_and_all`
+                // (which shares the `all` half): propagate through a uses grafted by
+                // a remote augment.
+                if node.is_augment_injected {
+                    mark_augment_injected(&mut sub);
+                }
+                result.extend(sub);
             }
             _ => {
                 // Include the node regardless of if-feature evaluation.
@@ -2194,6 +2201,14 @@ pub fn expand_children_and_all(
                     parent_path,
                     ctx,
                 );
+                // `enabled` here drives `walk_augments` record emission, whose
+                // vmfas read `is_augment_injected`; propagate through a `uses`
+                // grafted by a remote augment. Fresh clones, so no cache touch;
+                // one branch on the common non-augment path.
+                if node.is_augment_injected {
+                    mark_augment_injected(&mut sub_enabled);
+                    mark_augment_injected(&mut sub_all);
+                }
                 enabled.append(&mut sub_enabled);
                 all.append(&mut sub_all);
             }
@@ -5885,6 +5900,16 @@ module aug-mod {
         )
         .unwrap();
         assert!(with_siblings_flag, "walk_path_with_siblings reaches the flag too");
+
+        // `expand_children_and_all` (the `walk_augments` emission path) must also
+        // flag the uses expansion — the `enabled` half feeds vmfa record emission.
+        let empty = NodeOverlayMap::new();
+        let (enabled, all) =
+            expand_children_and_all(aug_nodes, "h", "host", &empty, &[], &ctx);
+        let ewrap = enabled.iter().find(|n| n.name == "wrap").unwrap();
+        assert!(ewrap.is_augment_injected, "expand_children_and_all flags the uses expansion");
+        let awrap = all.iter().find(|n| n.name == "wrap").unwrap();
+        assert!(awrap.is_augment_injected, "the `all` half is flagged consistently");
     }
 
     #[test]
