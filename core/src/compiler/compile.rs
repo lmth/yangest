@@ -875,6 +875,15 @@ fn compile_uses_node(
         .filter(|prefix| *prefix != own_prefix)
         .and_then(|prefix| prefix_map.get(prefix).cloned());
 
+    // Use-site `status` on the `uses` statement is a property of this
+    // instantiation, not of the grouping definition — captured on the overlay
+    // and applied to the materialised subtree during lazy expansion.
+    let uses_status_stmt = uses_stmt.get_substmt(BuiltInKeyword::Status);
+    let uses_status = uses_status_stmt
+        .map(|s| parse_status_arg(s, module_errors))
+        .unwrap_or(Status::Current);
+    let uses_status_pos = uses_status_stmt.map(|s| s.pos.clone());
+
     let mut local_augments = Vec::new();
     for augment in uses_stmt.get_substmts(BuiltInKeyword::Augment) {
         let Some(target_path) = parse_relative_schema_path(
@@ -944,6 +953,8 @@ fn compile_uses_node(
                     module_errors,
                     ignore_unknown,
                 ),
+                status: uses_status,
+                status_pos: uses_status_pos,
             },
         },
         is_augment_injected: false,
@@ -3122,6 +3133,11 @@ fn expand_uses_lazy_inner(
                 propagate_uses_constraints(node, &uses_overlay.when, &uses_overlay.if_features);
             }
         }
+        if uses_overlay.status != Status::Current {
+            for node in &mut nodes {
+                apply_uses_status(node, uses_overlay.status, &uses_overlay.status_pos);
+            }
+        }
         let _ = overlay;
         return Arc::new(
             nodes
@@ -3256,6 +3272,11 @@ fn expand_uses_lazy_inner(
     if !uses_overlay.when.is_empty() || !uses_overlay.if_features.is_empty() {
         for node in &mut nodes {
             propagate_uses_constraints(node, &uses_overlay.when, &uses_overlay.if_features);
+        }
+    }
+    if uses_overlay.status != Status::Current {
+        for node in &mut nodes {
+            apply_uses_status(node, uses_overlay.status, &uses_overlay.status_pos);
         }
     }
     let _ = overlay;
@@ -3634,6 +3655,52 @@ fn apply_augment_status(node: &mut SchemaNode, aug_status: Status) {
             }
             for child in Arc::make_mut(output) {
                 apply_augment_status(child, aug_status);
+            }
+        }
+        SchemaNodeKind::Leaf { .. }
+        | SchemaNodeKind::LeafList { .. }
+        | SchemaNodeKind::AnyXml { .. }
+        | SchemaNodeKind::AnyData { .. }
+        | SchemaNodeKind::Uses { .. } => {}
+    }
+}
+
+/// Recursively apply use-site `status` from a `uses` statement (RFC 7950
+/// §7.21.2) to a freshly-materialised grouping subtree. Mirrors
+/// [`apply_augment_status`]: status only escalates (`current` < `deprecated` <
+/// `obsolete`), never downgrades, so a node already marked obsolete inside the
+/// grouping stays obsolete. When a node's status is escalated, its `status_pos`
+/// is repointed at the `uses` `status` substatement, since the node's own
+/// position no longer reflects the effective status.
+///
+/// Operates only on the freshly-cloned materialisation (the caller cloned the
+/// cached base before applying the overlay); the `Arc::make_mut` recursion
+/// clones child vectors on write, never touching the shared grouping cache.
+fn apply_uses_status(node: &mut SchemaNode, uses_status: Status, uses_status_pos: &Option<Pos>) {
+    if node.status < uses_status {
+        node.status = uses_status;
+        node.status_pos = uses_status_pos.clone();
+    }
+    match &mut node.kind {
+        SchemaNodeKind::Container { children, .. }
+        | SchemaNodeKind::List { children, .. }
+        | SchemaNodeKind::Case { children }
+        | SchemaNodeKind::Notification { children, .. } => {
+            for child in Arc::make_mut(children) {
+                apply_uses_status(child, uses_status, uses_status_pos);
+            }
+        }
+        SchemaNodeKind::Choice { cases, .. } => {
+            for case in Arc::make_mut(cases) {
+                apply_uses_status(case, uses_status, uses_status_pos);
+            }
+        }
+        SchemaNodeKind::Rpc { input, output, .. } | SchemaNodeKind::Action { input, output } => {
+            for child in Arc::make_mut(input) {
+                apply_uses_status(child, uses_status, uses_status_pos);
+            }
+            for child in Arc::make_mut(output) {
+                apply_uses_status(child, uses_status, uses_status_pos);
             }
         }
         SchemaNodeKind::Leaf { .. }
@@ -5910,6 +5977,87 @@ module aug-mod {
         assert!(ewrap.is_augment_injected, "expand_children_and_all flags the uses expansion");
         let awrap = all.iter().find(|n| n.name == "wrap").unwrap();
         assert!(awrap.is_augment_injected, "the `all` half is flagged consistently");
+    }
+
+    #[test]
+    fn uses_status_propagates_to_materialised_grouping_subtree() {
+        // `status` on a `uses` is a use-site semantic — a property of THIS
+        // instantiation, not of the grouping definition. The materialised subtree
+        // must carry the effective status (escalating, never downgrading, like
+        // `apply_augment_status`), its `status_pos` repointed at the `uses`
+        // `status`, and the shared grouping cache must stay untouched so a second
+        // status-free `uses` of the same grouping is unaffected.
+        let stmt = parse_module(
+            r#"
+module m {
+  yang-version 1.1;
+  namespace "urn:m"; prefix m;
+  grouping g {
+    container c {
+      presence "x";
+      leaf plain { type string; }
+      leaf dep { status deprecated; type string; }
+    }
+  }
+  container with-status {
+    uses g { status obsolete; }
+  }
+  container without-status {
+    uses g;
+  }
+}
+"#,
+        );
+        let mut reg = ModuleRegistry::new();
+        reg.insert(Arc::new(compile_module(
+            &ModuleKey::latest("m"),
+            stmt,
+            &reg,
+            &DeviationIndex::default(),
+            &AnnotationIndex::default(),
+            &AstAnnotationIndex::default(),
+        )));
+        let m = reg.resolve_import("m", None).unwrap();
+        let ctx = ExpansionCtx::all_features(&reg);
+
+        let top = |name: &str| {
+            m.children
+                .iter()
+                .find(|n| n.name == name)
+                .unwrap_or_else(|| panic!("top node {name}"))
+        };
+        let child = |n: &SchemaNode, name: &str| {
+            n.children(&ctx)
+                .into_iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("child {name}"))
+        };
+
+        // The `uses` carries `status obsolete`: the whole materialised subtree is
+        // obsolete, and `status_pos` is repointed at the `uses` `status`.
+        let ws_c = child(top("with-status"), "c");
+        assert_eq!(ws_c.status, Status::Obsolete, "uses-status reaches the container");
+        assert!(ws_c.status_pos.is_some(), "status_pos repointed at the uses status");
+        let ws_plain = child(&ws_c, "plain");
+        assert_eq!(ws_plain.status, Status::Obsolete, "descendant leaf is obsolete");
+        let ws_dep = child(&ws_c, "dep");
+        assert_eq!(
+            ws_dep.status,
+            Status::Obsolete,
+            "an already-deprecated node escalates to obsolete (never downgrades)"
+        );
+
+        // The status-free `uses` of the SAME grouping is unaffected — the shared
+        // grouping cache was not mutated by the obsolete use-site.
+        let wo_c = child(top("without-status"), "c");
+        assert_eq!(wo_c.status, Status::Current, "no use-site status: container stays current");
+        assert_eq!(wo_c.status_pos, None, "implicit current carries no position");
+        assert_eq!(
+            child(&wo_c, "dep").status,
+            Status::Deprecated,
+            "the grouping's own `status deprecated` survives, uncontaminated by the other use"
+        );
+        assert_eq!(child(&wo_c, "plain").status, Status::Current);
     }
 
     #[test]

@@ -454,6 +454,15 @@ pub struct UsesOverlay {
     pub when: Vec<WhenExpr>,
     /// Inherited `if-feature` expressions.
     pub if_features: Vec<IfFeatureExpr>,
+    /// Use-site `status` declared on the `uses` statement itself. `Current` when
+    /// none is declared. Applied to the materialised grouping subtree during
+    /// lazy expansion (escalating, never downgrading) — a use-site semantic that
+    /// belongs to this instantiation, not to the grouping definition globally.
+    pub status: Status,
+    /// Source position of the `uses` `status` substatement, when declared. Used
+    /// to repoint the materialised nodes' `status_pos` so backends ordering
+    /// status against other use-site metadata have a position to use.
+    pub status_pos: Option<Pos>,
 }
 
 impl UsesOverlay {
@@ -462,6 +471,7 @@ impl UsesOverlay {
             && self.local_augments.is_empty()
             && self.when.is_empty()
             && self.if_features.is_empty()
+            && self.status == Status::Current
     }
 }
 
